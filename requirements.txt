@@ -1,0 +1,29 @@
+# ============================================================
+# Maç Analiz ve Oyuncu Takip Sistemi - Bağımlılıklar
+# Kurulum: pip install -r requirements.txt
+# ============================================================
+
+# --- Video işleme ---
+opencv-python==4.10.0.84        # Frame okuma, çizim, video yazma
+opencv-contrib-python==4.10.0.84 # Ekstra OpenCV modülleri (bazı homografi/çizim yardımcıları için)
+
+# --- Nesne Tespiti (YOLO) ---
+ultralytics==8.3.28             # YOLOv8 / YOLOv11 modelleri
+
+# --- Takip (Tracking) - Adım 3 ---
+deep-sort-realtime==1.3.2       # DeepSORT tabanlı takip (appearance + motion)
+torch==2.5.1                    # DeepSORT'un mobilenet embedder'ı için gerekli
+torchvision==0.20.1             # embedder'ın CNN ağırlıkları için gerekli
+
+# --- Sayısal işlem / Veri mühendisliği ---
+numpy==1.26.4
+pandas==2.2.3
+scikit-learn==1.5.2              # K-Means kümeleme (5. adımda kullanılacak)
+
+# --- Veritabanı (SQL) - 6. adımda kullanılacak ---
+# sqlalchemy==2.0.36
+# psycopg2-binary==2.9.10        # PostgreSQL kullanılacaksa
+
+# --- Yardımcı ---
+tqdm==4.67.1                     # İlerleme çubuğu
+PyYAML==6.0.2                    # config dosyaları için

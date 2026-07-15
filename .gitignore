@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# Buyuk dosyalar ve videolar
+*.pt
+*.mp4
+*.avi
