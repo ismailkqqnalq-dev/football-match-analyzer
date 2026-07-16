@@ -165,10 +165,16 @@ class VideoProcessor:
             track_id = det.get("track_id", None)
             team = det.get("team", None)
 
-            # Renk seçimi: top turuncu, takım bilgisi varsa takıma göre,
-            # yoksa varsayılan yeşil renk kullanılır.
+            # Renk seçimi: top turuncu; takım bilgisi varsa (Adım 4'ten sonra
+            # dolar) takıma özel renk; yoksa varsayılan yeşil kullanılır.
             if class_name == "ball":
                 color = config.BBOX_COLOR_BALL
+            elif team == "Team A":
+                color = config.BBOX_COLOR_TEAM_A
+            elif team == "Team B":
+                color = config.BBOX_COLOR_TEAM_B
+            elif team == "Referee":
+                color = config.BBOX_COLOR_REFEREE
             else:
                 color = config.BBOX_COLOR_DEFAULT
 

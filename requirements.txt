@@ -18,7 +18,7 @@ torchvision==0.20.1             # embedder'ın CNN ağırlıkları için gerekli
 # --- Sayısal işlem / Veri mühendisliği ---
 numpy==1.26.4
 pandas==2.2.3
-scikit-learn==1.5.2              # K-Means kümeleme (5. adımda kullanılacak)
+scikit-learn==1.5.2              # K-Means kümeleme (Adım 4: takım sınıflandırma)
 
 # --- Veritabanı (SQL) - 6. adımda kullanılacak ---
 # sqlalchemy==2.0.36

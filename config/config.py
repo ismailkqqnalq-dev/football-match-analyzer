@@ -21,6 +21,24 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INPUT_VIDEO_DIR = os.path.join(BASE_DIR, "data", "input_videos")
 OUTPUT_VIDEO_DIR = os.path.join(BASE_DIR, "data", "output_videos")
 EXPORT_DIR = os.path.join(BASE_DIR, "data", "exports")
+
+# ------------------------------------------------------------------
+# VERİ DIŞA AKTARMA (ADIM 6) AYARLARI
+# ------------------------------------------------------------------
+EXPORT_CSV_FILENAME = "tracking_data.csv"              # ham, kare-kare takip verisi
+EXPORT_SQL_FILENAME = "tracking_data.db"                # aynı veri, SQLite veritabanı olarak
+EXPORT_SQL_TABLE_NAME = "tracking_data"
+EXPORT_DISTANCE_SUMMARY_FILENAME = "player_distance_summary.csv"  # oyuncu başına özet
+
+# Mesafe/hız hesabı (saha koordinatları üzerinden), sadece ARDIŞIK karelerde yapılır.
+# Aradan kare kaçarsa (ör. oyuncu geçici olarak kayboldu) o segment mesafeye
+# KATILMAZ -- aksi halde "ışınlanma" gibi görünen sahte, çok büyük mesafeler hesaplanır.
+DISTANCE_CALC_MAX_FRAME_GAP = 1
+# Kalman filtresinin TAHMİN ettiği (gerçek tespit olmayan) konumlar mesafe
+# hesabına katılmaz -- tahmini konumlar gerçek hareketi yansıtmayabilir.
+DISTANCE_CALC_EXCLUDE_PREDICTED = True
+# Saha dışı (on_pitch=False) sayılan noktalar da mesafeye katılmaz (kalibrasyon
+# hatası ya da kenar çizgisi dışına taşan tespitlerin mesafeyi şişirmesini önler).
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 
 # Örnek varsayılan giriş/çıkış video yolları (main.py içinde override edilebilir)
@@ -105,10 +123,153 @@ TRACKER_EMBEDDER_GPU = False
 BALL_MAX_MISSING_FRAMES = 15  # top bu kadar karede tespit edilmezse "kayıp" sayılır
 
 # ------------------------------------------------------------------
+# TAKIM SINIFLANDIRMA (K-MEANS) AYARLARI
+# ------------------------------------------------------------------
+# Sahadaki 3 grup: Takım A, Takım B, Hakem. Bu yüzden küme sayısı sabit 3.
+TEAM_CLASSIFIER_N_CLUSTERS = 3
+
+# K-Means'i "fit" etmeden (eğitmeden) önce en az kaç FARKLI oyuncunun (track_id)
+# forma rengi örneği toplanmalı? Çok erken fit edersek (örn. sadece 2-3 oyuncu
+# görülmüşken), kümeler yanlış oturur ve tüm maç boyunca yanlış takım
+# etiketleri üretilebilir. Genelde ilk birkaç saniyede her iki takımdan ve
+# hakemden en az birkaç örnek görülmesi yeterlidir.
+TEAM_CLASSIFIER_MIN_UNIQUE_TRACKS = 10
+
+# Her track_id için bellekte tutulacak maksimum forma rengi örneği sayısı.
+# Bu örneklerin ortalaması, o oyuncunun "referans rengi" olarak kullanılır.
+# Çok büyük tutmak gereksiz bellek kullanır, çok küçük tutmak tek bir kötü
+# kareden etkilenmeyi artırır.
+TEAM_COLOR_HISTORY_MAX_SAMPLES = 30
+
+# Forma rengi çıkarılırken bounding box'ın hangi dikey aralığı kullanılsın?
+# (0.0 = kutunun tepesi, 1.0 = kutunun tabanı)
+# Baştaki saçı/kafayı ve alttaki şortu/çorabı dışarıda bırakıp sadece
+# formanın olduğu gövde bölgesini almak için varsayılan olarak 0.15-0.55 arası.
+JERSEY_CROP_TOP_RATIO = 0.15
+JERSEY_CROP_BOTTOM_RATIO = 0.55
+
+# Yatayda da kenarlardaki komşu oyuncu/arka plan sızıntısını azaltmak için
+# kutunun sadece orta genişliğini kullanıyoruz.
+JERSEY_CROP_LEFT_RATIO = 0.2
+JERSEY_CROP_RIGHT_RATIO = 0.8
+
+# ------------------------------------------------------------------
+# KAMERA HAREKETİ TAKİBİ (OPTICAL FLOW) AYARLARI
+# ------------------------------------------------------------------
+# Yayın kamerası maç sırasında pan/tilt/zoom yaptığında, tek bir statik
+# homografi matrisi geçersizleşir. Bu ayarlar, arka plandaki sabit noktaları
+# (çizgiler, reklam panoları vb.) kare-kare takip ederek kamera hareketini
+# tahmin etmemizi ve homografiyi buna göre güncellememizi sağlar.
+
+# goodFeaturesToTrack: takip edilecek "köşe" (corner) noktalarını bulan fonksiyon.
+CAMERA_MOTION_MAX_CORNERS = 300       # aranacak maksimum özellik noktası sayısı
+CAMERA_MOTION_QUALITY_LEVEL = 0.01    # köşe kalitesi eşiği (düşük = daha fazla nokta, daha gürültülü)
+CAMERA_MOTION_MIN_DISTANCE = 15       # iki nokta arası minimum piksel mesafesi
+
+# Oyuncu/top bounding box'larının etrafına eklenen güvenlik payı (piksel).
+# Bu bölgeler "hareketli nesne" sayılıp özellik noktası aranmaz -- sadece
+# SABİT arka plan (çim, çizgiler, reklam panosu) üzerinde nokta ararız.
+PLAYER_MASK_PADDING_PX = 10
+
+# Lucas-Kanade Optical Flow parametreleri
+OPTICAL_FLOW_WIN_SIZE = (21, 21)      # her noktanın izlendiği pencere boyutu
+OPTICAL_FLOW_MAX_LEVEL = 3            # piramit seviyesi (büyük hareketleri yakalamak için)
+OPTICAL_FLOW_CRITERIA_COUNT = 30      # maksimum iterasyon
+OPTICAL_FLOW_CRITERIA_EPS = 0.01      # yakınsama hassasiyeti
+
+# Bir karede güvenilir bir hareket tahmini yapabilmek için gereken minimum
+# eşleşmiş (başarıyla takip edilmiş) nokta sayısı. Bunun altına düşülürse
+# (örn. kamera çok hızlı hareket etti, motion blur oluştu) o karede hareket
+# GÜNCELLENMEZ, son bilinen matris korunur.
+CAMERA_MOTION_MIN_TRACKED_POINTS = 15
+
+# Kare-kare hareket homografisi hesaplanırken RANSAC eşiği (piksel).
+CAMERA_MOTION_RANSAC_THRESHOLD = 3.0
+
+# SAHNE KESMESİ (SCENE CUT) TESPİTİ
+# Yayın başka bir kameraya (tekrar izleme, close-up vb.) aniden geçtiğinde,
+# iki ardışık karenin histogramı çok farklılaşır. Bu korelasyon değerinin
+# ALTINA düşülürse "sahne kesmesi" kabul edilir ve kamera takibi sıfırlanır
+# (o kareden itibaren saha koordinatı üretilmez, yeniden kalibrasyon gerekir).
+SCENE_CUT_CORRELATION_THRESHOLD = 0.5
+
+# ------------------------------------------------------------------
+# PERSPEKTİF DÖNÜŞÜMÜ (HOMOGRAPHY) AYARLARI
+# ------------------------------------------------------------------
+# STANDART FUTBOL SAHASI BOYUTLARI (FIFA/IFAB önerisi, metre cinsinden).
+# Koordinat sistemi: orijin (0,0) sol üst köşe, x ekseni uzun kenar (uzunluk),
+# y ekseni kısa kenar (genişlik) boyunca artar.
+PITCH_LENGTH_M = 105.0
+PITCH_WIDTH_M = 68.0
+
+# Sahadaki, kamerada genelde net görülen sabit referans noktalarının GERÇEK
+# metre cinsinden konumları. Bunlar değişmez -- her sahada aynıdır (standart
+# ölçülere göre). Homografi hesaplamak için bu noktalardan en az 4 tanesinin
+# YAYIN KAMERASINDAKİ piksel karşılığını (SOURCE_CALIBRATION_POINTS) bulmamız
+# gerekiyor.
+PITCH_LANDMARKS_METERS = {
+    "top_left_corner": (0.0, 0.0),
+    "top_right_corner": (105.0, 0.0),
+    "bottom_left_corner": (0.0, 68.0),
+    "bottom_right_corner": (105.0, 68.0),
+    "halfway_top": (52.5, 0.0),
+    "halfway_bottom": (52.5, 68.0),
+    "center_spot": (52.5, 34.0),
+    "left_penalty_spot": (11.0, 34.0),
+    "right_penalty_spot": (94.0, 34.0),
+    "left_penalty_box_top_left": (0.0, 13.84),
+    "left_penalty_box_top_right": (16.5, 13.84),
+    "left_penalty_box_bottom_left": (0.0, 54.16),
+    "left_penalty_box_bottom_right": (16.5, 54.16),
+    "right_penalty_box_top_left": (88.5, 13.84),
+    "right_penalty_box_top_right": (105.0, 13.84),
+    "right_penalty_box_bottom_left": (88.5, 54.16),
+    "right_penalty_box_bottom_right": (105.0, 54.16),
+    "left_six_yard_box_top_left": (0.0, 24.84),
+    "left_six_yard_box_top_right": (5.5, 24.84),
+    "left_six_yard_box_bottom_left": (0.0, 43.16),
+    "left_six_yard_box_bottom_right": (5.5, 43.16),
+    "right_six_yard_box_top_left": (99.5, 24.84),
+    "right_six_yard_box_top_right": (105.0, 24.84),
+    "right_six_yard_box_bottom_left": (99.5, 43.16),
+    "right_six_yard_box_bottom_right": (105.0, 43.16),
+}
+
+# !!! BURASI HER VİDEO/KAMERA AÇISI İÇİN ELLE DOLDURULMALI !!!
+# Yukarıdaki isimlerden seçtiğin en az 4 tanesinin, senin video görüntündeki
+# PİKSEL koordinatlarını buraya gir. utils/calibrate_homography.py aracı,
+# videonun ilk karesini açıp tıkladığın noktaların piksel koordinatlarını
+# ekrana basar -- oradan kopyalayıp buraya yapıştırman yeterli.
+# Format: {"landmark_ismi": (piksel_x, piksel_y), ...}
+# Örnek (kendi videonla değiştirmen gerekir):
+SOURCE_CALIBRATION_POINTS = {
+    # "top_left_corner": (145, 210),
+    # "top_right_corner": (1780, 195),
+    # "left_penalty_box_top_left": (145, 340),
+    # "left_penalty_box_bottom_left": (160, 610),
+}
+
+# findHomography için RANSAC eşiği (piksel). Kalibrasyon noktalarında küçük
+# tıklama hataları olabileceğinden RANSAC, aykırı (outlier) noktaları eleyerek
+# daha sağlam bir dönüşüm matrisi bulmaya yardımcı olur. 4 nokta ile tam
+# çözüm (getPerspectiveTransform) kullanılır; 4'ten fazla nokta girilirse
+# RANSAC devreye girer.
+HOMOGRAPHY_RANSAC_THRESHOLD = 5.0
+
+# Kuş bakışı 2D saha görselleştirmesi (minimap) boyutları (piksel).
+# Saha oranını (105:68) koruyacak şekilde otomatik hesaplanır.
+PITCH_MINIMAP_WIDTH_PX = 600
+PITCH_MINIMAP_HEIGHT_PX = int(PITCH_MINIMAP_WIDTH_PX * (PITCH_WIDTH_M / PITCH_LENGTH_M))
+PITCH_MINIMAP_MARGIN_PX = 20
+
+# ------------------------------------------------------------------
 # VİDEO İŞLEME / ÇİZİM AYARLARI
 # ------------------------------------------------------------------
 BBOX_COLOR_DEFAULT = (0, 255, 0)   # BGR formatında yeşil (henüz takımı bilinmeyen nesneler için)
 BBOX_COLOR_BALL = (0, 165, 255)    # BGR formatında turuncu (top için)
+BBOX_COLOR_TEAM_A = (255, 191, 0)  # canlı mavi
+BBOX_COLOR_TEAM_B = (0, 0, 255)    # kırmızı
+BBOX_COLOR_REFEREE = (0, 255, 255) # sarı
 BBOX_THICKNESS = 2
 ID_FONT_SCALE = 0.6
 ID_FONT_THICKNESS = 2
