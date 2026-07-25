@@ -146,8 +146,9 @@ class VideoProcessor:
             {
                 "bbox": [x1, y1, x2, y2],   # piksel koordinatları
                 "track_id": int veya None,   # takip ID'si (3. adımda doldurulacak)
-                "class_name": "person" / "ball",
-                "team": "A" / "B" / "referee" / None,  # 4. adımda doldurulacak
+                "class_name": "person"/"ball" (COCO modeli) veya
+                              "player"/"goalkeeper"/"referee"/"ball" (fine-tune model),
+                "team": "Team A" / "Team B" / "Referee" / None,  # 4. adımda doldurulacak
                 "confidence": float,
             }
 

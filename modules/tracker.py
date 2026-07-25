@@ -46,7 +46,12 @@ from config import config
 
 class PlayerTracker:
     """
-    Oyuncu/hakem (class_name == "person") tespitlerini DeepSORT ile takip eden sınıf.
+    "İnsan" sayılan (config.HUMAN_CLASS_NAMES'te tanımlı) tespitleri DeepSORT
+    ile takip eden sınıf. Bu isim kümesi, kullanılan YOLO modeline göre değişir:
+        - COCO pretrained model: {"person"} (oyuncu/hakem henüz ayrılmamış)
+        - Fine-tune futbol modeli: {"player", "goalkeeper", "referee"}
+    Bu sayede aynı PlayerTracker kodu, hangi model kullanılırsa kullanılsın
+    değişiklik gerektirmeden çalışır.
 
     Kullanım örneği:
         tracker = PlayerTracker()
@@ -87,8 +92,8 @@ class PlayerTracker:
         Bir karedeki "person" tespitlerini tracker'a besleyip, kalıcı track_id
         atanmış güncel detection listesini döndürür.
 
-        ÖNEMLİ: Bu metod SADECE class_name == "person" olan tespitleri işler.
-        Top, ayrı olarak BallTracker ile yönetilir (aşağıda).
+        ÖNEMLİ: Bu metod SADECE config.HUMAN_CLASS_NAMES içindeki class_name'e
+        sahip tespitleri işler. Top, ayrı olarak BallTracker ile yönetilir (aşağıda).
 
         Parametreler
         ------------
@@ -106,8 +111,10 @@ class PlayerTracker:
             "aday" track'ler bu listede görünmez -- bu, gürültülü/geçici yanlış
             tespitlerin ID almasını engeller.
         """
-        # Sadece kişi (oyuncu/hakem) tespitlerini alıyoruz
-        person_detections = [d for d in detections if d["class_name"] == "person"]
+        # Sadece "insan" sayılan tespitleri alıyoruz (oyuncu/kaleci/hakem --
+        # hangi sınıf isimlerinin buraya dahil olduğu config.HUMAN_CLASS_NAMES
+        # ile TARGET_CLASS_IDS'ten otomatik türetilir, bkz. config.py).
+        person_detections = [d for d in detections if d["class_name"] in config.HUMAN_CLASS_NAMES]
 
         # DeepSORT'un beklediği format: [([left, top, width, height], confidence, class_name), ...]
         # Bizim bbox formatımız [x1, y1, x2, y2] olduğu için width/height'a çeviriyoruz.
@@ -139,10 +146,20 @@ class PlayerTracker:
             l, t, w, h = track.to_ltwh()
             x1, y1, x2, y2 = float(l), float(t), float(l + w), float(t + h)
 
+            # ÖNEMLİ DÜZELTME: Daha önce burası sabit "person" yazıyordu --
+            # bu, fine-tune futbol modeli kullanıldığında "goalkeeper"/"referee"
+            # gibi orijinal sınıf bilgisini SESSİZCE kaybederdi (hepsi "person"
+            # olarak görünürdü). deep_sort_realtime, update_tracks()'e üçüncü
+            # eleman olarak verdiğimiz class_name'i track.det_class üzerinden
+            # geri veriyor -- onu kullanıyoruz. Track'in class'ı hiç
+            # ayarlanmadıysa (teorik olarak olmamalı, ama savunmacı programlama
+            # için) HUMAN_CLASS_NAMES'ten ilk değeri yedek olarak kullanıyoruz.
+            original_class_name = getattr(track, "det_class", None) or next(iter(config.HUMAN_CLASS_NAMES))
+
             tracked_detections.append({
                 "bbox": [x1, y1, x2, y2],
                 "track_id": int(track.track_id),
-                "class_name": "person",
+                "class_name": original_class_name,
                 "confidence": None,  # DeepSORT çıktısı orijinal güven skorunu tutmaz
                 "team": None,        # Adım 4'te (K-Means) doldurulacak
                 "is_predicted": track.time_since_update > 0,  # bu karede gerçek tespit yok, tahmin var
@@ -181,7 +198,7 @@ class BallTracker:
             Topun güncel konumunu içeren tek bir detection sözlüğü, ya da
             top uzun süredir kayıpsa None.
         """
-        ball_detections = [d for d in detections if d["class_name"] == "ball"]
+        ball_detections = [d for d in detections if d["class_name"] == config.BALL_CLASS_NAME]
 
         if ball_detections:
             # Birden fazla "top" tespiti varsa (yanlış pozitif olabilir),

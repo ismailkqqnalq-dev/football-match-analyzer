@@ -35,6 +35,17 @@ GENEL STRATEJİ (neden bu şekilde tasarlandı?)
        ÖNBELLEKLİYORUZ (cache). Bu, aynı oyuncunun farklı karelerde
        "Takım A" iken sonra "Takım B" gibi görünüp titremesini (flickering)
        engelliyor -- ID sabitse takım etiketi de sabit kalır.
+
+NOT -- FİNE-TUNE FUTBOL MODELİYLE ÇALIŞIRKEN (config.USES_FINE_TUNED_FOOTBALL_MODEL):
+    Bazı YOLO modelleri (ör. Roboflow "football-players-detection") hakemi
+    ZATEN kendi sınıfı olarak tanır ("referee"). Bu durumda hakemi renk
+    kümelemesiyle TAHMİN ETMEMİZE gerek kalmaz -- onu doğrudan "Referee"
+    etiketleriz ve renk geçmişine hiç eklemeyiz. Bu iki fayda sağlar:
+        a) Hakem etiketi %100 doğru olur (K-Means'in "en az üyeli küme"
+           sezgisine bağımlı kalmaz).
+        b) K-Means artık SADECE Takım A/Takım B arasında ayrım yapar
+           (config.TEAM_CLASSIFIER_N_CLUSTERS bu modda otomatik 2'ye düşer),
+           bu da hakem formasının iki takımın renk kümesini bozmasını önler.
 """
 
 import os
@@ -176,11 +187,20 @@ class TeamClassifier:
 
     # ----------------------------------------------------------------
     def _get_average_color(self, track_id: int) -> Optional[np.ndarray]:
-        """Bir track_id için biriken tüm renk örneklerinin ortalamasını döndürür."""
+        """
+        Bir track_id için biriken tüm renk örneklerinin ortalamasını döndürür.
+
+        NOT: float64 olarak döndürüyoruz (renk örnekleri extract_jersey_color
+        içinde float32 olarak toplanıyor). scikit-learn'ün KMeans.predict()
+        metodu, fit() sırasında öğrendiği merkezlerle (genelde float64) aynı
+        dtype'ı bekler -- aksi halde Cython arayüzünde "Buffer dtype mismatch"
+        hatası fırlatır. Bu satırı kaldırırsan, model fit edildikten SONRA
+        gelen her yeni oyuncuda predict() çağrısı çökebilir.
+        """
         history = self.color_history.get(track_id)
         if not history:
             return None
-        return np.mean(history, axis=0)
+        return np.mean(history, axis=0).astype(np.float64)
 
     # ----------------------------------------------------------------
     def _try_fit_kmeans(self):
@@ -197,7 +217,7 @@ class TeamClassifier:
 
         # Her track_id için ortalama rengi bir özellik vektörü olarak kullan
         track_ids = list(self.color_history.keys())
-        feature_matrix = np.array([self._get_average_color(tid) for tid in track_ids])
+        feature_matrix = np.array([self._get_average_color(tid) for tid in track_ids], dtype=np.float64)
 
         print(
             f"[TeamClassifier] {len(track_ids)} farklı oyuncudan yeterli renk örneği "
@@ -207,23 +227,39 @@ class TeamClassifier:
         self.kmeans = KMeans(n_clusters=self.n_clusters, n_init=10, random_state=42)
         cluster_labels = self.kmeans.fit_predict(feature_matrix)
 
-        # --- Hangi küme "Hakem"? En az üyeli küme (sahada en az kişi olan grup) ---
         unique, counts = np.unique(cluster_labels, return_counts=True)
         cluster_sizes = dict(zip(unique.tolist(), counts.tolist()))
-        referee_cluster = min(cluster_sizes, key=cluster_sizes.get)
 
-        remaining_clusters = [c for c in cluster_sizes if c != referee_cluster]
-        # Team A / Team B ayrımı keyfi olabilir (hangisinin "A" hangisinin "B"
-        # olduğunun taktiksel bir önemi yok, sadece tutarlı olması önemli).
-        # Kümeleri deterministik olsun diye küme merkezinin toplam parlaklığına
-        # göre sıralıyoruz (koyu forma -> Team A, açık forma -> Team B gibi sabit bir kural).
-        remaining_clusters.sort(key=lambda c: self.kmeans.cluster_centers_[c].sum())
+        if config.USES_FINE_TUNED_FOOTBALL_MODEL:
+            # Fine-tune futbol modelinde hakem ZATEN YOLO sınıfından ayrı
+            # geliyor ve renk geçmişine hiç eklenmiyor (bkz. assign_teams).
+            # Yani burada toplanan renkler SADECE oyunculara/kalecilere ait --
+            # "en az üyeli küme = hakem" sezgisine gerek YOK, iki küme de
+            # doğrudan Takım A / Takım B. Deterministik olsun diye küme
+            # merkezinin toplam parlaklığına göre sıralıyoruz.
+            clusters_by_brightness = sorted(
+                cluster_sizes.keys(), key=lambda c: self.kmeans.cluster_centers_[c].sum()
+            )
+            self.cluster_role_map = {
+                clusters_by_brightness[0]: "Team A",
+                clusters_by_brightness[1]: "Team B",
+            }
+        else:
+            # --- Hangi küme "Hakem"? En az üyeli küme (sahada en az kişi olan grup) ---
+            referee_cluster = min(cluster_sizes, key=cluster_sizes.get)
 
-        self.cluster_role_map = {
-            remaining_clusters[0]: "Team A",
-            remaining_clusters[1]: "Team B",
-            referee_cluster: "Referee",
-        }
+            remaining_clusters = [c for c in cluster_sizes if c != referee_cluster]
+            # Team A / Team B ayrımı keyfi olabilir (hangisinin "A" hangisinin "B"
+            # olduğunun taktiksel bir önemi yok, sadece tutarlı olması önemli).
+            # Kümeleri deterministik olsun diye küme merkezinin toplam parlaklığına
+            # göre sıralıyoruz (koyu forma -> Team A, açık forma -> Team B gibi sabit bir kural).
+            remaining_clusters.sort(key=lambda c: self.kmeans.cluster_centers_[c].sum())
+
+            self.cluster_role_map = {
+                remaining_clusters[0]: "Team A",
+                remaining_clusters[1]: "Team B",
+                referee_cluster: "Referee",
+            }
 
         print(f"[TeamClassifier] Küme boyutları: {cluster_sizes} -> Rol eşlemesi: {self.cluster_role_map}")
 
@@ -239,9 +275,12 @@ class TeamClassifier:
         Bir karedeki takip edilmiş oyuncu listesini alır, her birine "team"
         alanını doldurup geri döndürür.
 
-        NOT: Bu metod SADECE class_name == "person" olan (yani track_id'si
-        DeepSORT'tan gelen) tespitler için anlamlıdır. Top zaten forma
-        giymediği için bu sınıfın kapsamı dışındadır.
+        NOT: Top zaten forma giymediği için bu sınıfın kapsamı dışındadır --
+        çağıran main.py zaten sadece tracked_players'ı (top hariç) burada geçirir.
+
+        Fine-tune futbol modeli kullanılıyorsa (config.USES_FINE_TUNED_FOOTBALL_MODEL),
+        class_name == "referee" olan tespitler renk kümelemesine HİÇ sokulmadan
+        doğrudan "Referee" etiketlenir (bkz. modül başındaki açıklama).
 
         Parametreler
         ------------
@@ -259,6 +298,14 @@ class TeamClassifier:
         for det in tracked_players:
             track_id = det.get("track_id")
             if track_id is None:
+                continue
+
+            # --- 0) Fine-tune modelde hakem zaten YOLO sınıfından biliniyor --
+            # renk kümelemesine hiç sokmadan doğrudan etiketle ve bir sonraki
+            # tespite geç (bu track_id hiçbir zaman color_history'ye girmez). ---
+            if config.USES_FINE_TUNED_FOOTBALL_MODEL and det.get("class_name") == "referee":
+                det["team"] = "Referee"
+                self.team_assignment[track_id] = "Referee"
                 continue
 
             # --- 1) Bu karedeki forma rengini çıkar ve geçmişe ekle ---

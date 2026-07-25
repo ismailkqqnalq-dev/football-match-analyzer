@@ -20,10 +20,22 @@ numpy==1.26.4
 pandas==2.2.3
 scikit-learn==1.5.2              # K-Means kümeleme (Adım 4: takım sınıflandırma)
 
-# --- Veritabanı (SQL) - 6. adımda kullanılacak ---
+# --- Veritabanı (SQL) - Adım 6 ---
+# NOT: sqlite3 Python standart kütüphanesinde hazır gelir, ekstra kurulum
+# gerekmez (bkz. modules/data_exporter.py). Eğer ileride PostgreSQL/MySQL gibi
+# bir sunucu tabanlı veritabanına yazmak istersen, aşağıdakileri açabilirsin:
 # sqlalchemy==2.0.36
 # psycopg2-binary==2.9.10        # PostgreSQL kullanılacaksa
 
 # --- Yardımcı ---
 tqdm==4.67.1                     # İlerleme çubuğu
 PyYAML==6.0.2                    # config dosyaları için
+
+# ============================================================
+# OPSİYONEL: Fine-tune edilmiş (futbola özel) YOLO modeli EĞİTMEK için
+# Bu iki paket sadece utils/train_custom_yolo.py betiğini KENDİ GPU'lu
+# ortamında (Google Colab, kendi makinen vb.) çalıştırırken gerekir --
+# ana pipeline'ı (main.py) çalıştırmak için GEREKLİ DEĞİLDİR.
+#   pip install ultralytics roboflow
+# roboflow==1.1.50
+# ============================================================

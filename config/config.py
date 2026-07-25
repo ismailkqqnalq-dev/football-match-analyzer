@@ -51,11 +51,29 @@ DEFAULT_OUTPUT_VIDEO = os.path.join(OUTPUT_VIDEO_DIR, "match_sample_annotated.mp
 # Not: Standart "yolov8x.pt" COCO veri seti ile eğitilmiştir ve sadece
 # "person" (0) ve "sports ball" (32) sınıflarını tanır. Hakem ile oyuncuyu
 # YOLO seviyesinde ayırt edemez (ikisi de "person"). Hakem/oyuncu/takım
-# ayrımını biz 4. adımda (K-Means forma renk kümeleme) yapacağız.
+# ayrımını biz 4. adımda (K-Means forma renk kümeleme) yapıyoruz.
 #
-# Daha iyi sonuç için Roboflow üzerinde bulunan hazır "football-players-detection"
-# gibi futbola özel fine-tune edilmiş bir YOLO modeli de kullanılabilir
-# (bu modeller genelde player/goalkeeper/referee/ball sınıflarını ayrı verir).
+# --- FİNE-TUNE EDİLMİŞ (FUTBOLA ÖZEL) MODEL KULLANMAK İSTERSEN ---
+# Roboflow Universe'teki halka açık "football-players-detection" veri seti
+# (bkz. https://universe.roboflow.com/roboflow-jvuqo/football-players-detection-3zvbc)
+# ile fine-tune edilmiş bir YOLO modeli kullanabilirsin. Bu veri setinin sınıf
+# sırası: 0=ball, 1=goalkeeper, 2=player, 3=referee. Kendi modelini eğitmek
+# için utils/train_custom_yolo.py betiğini KENDİ GPU'lu ortamında (Google
+# Colab, kendi makinen vb.) çalıştırabilirsin -- bu betik ve fine-tune süreci
+# hakkında ayrıntılı açıklama o dosyanın başında.
+#
+# Fine-tune edilmiş modele geçmek için AŞAĞIDAKİ İKİ DEĞERİ DEĞİŞTİRMEN YETERLİ,
+# başka hiçbir modüle (tracker.py, team_classifier.py, main.py) DOKUNMANA
+# gerek yok -- bu dosyanın altındaki HUMAN_CLASS_NAMES, BALL_CLASS_NAME ve
+# USES_FINE_TUNED_FOOTBALL_MODEL değerleri, TARGET_CLASS_IDS'ten OTOMATİK
+# olarak türetiliyor ve tüm pipeline buna göre kendini ayarlıyor:
+#
+#   YOLO_MODEL_PATH = os.path.join(MODELS_DIR, "football_yolov8_best.pt")
+#   TARGET_CLASS_IDS = {0: "ball", 1: "goalkeeper", 2: "player", 3: "referee"}
+#
+# (Farklı bir Roboflow projesi/veri seti kullanıyorsan, indirdiğin data.yaml
+# dosyasındaki "names:" listesinin SIRASINI birebir buraya kopyala -- sıra
+# yanlışsa sınıf ID'leri yanlış isimlere eşlenir.)
 YOLO_MODEL_PATH = os.path.join(MODELS_DIR, "yolov8x.pt")  # veya kendi fine-tune modelin
 
 # Tespit güven eşiği: Bu değerin altındaki tespitler göz ardı edilir.
@@ -71,6 +89,27 @@ TARGET_CLASS_IDS = {
     0: "person",
     32: "ball",
 }
+
+# --- AŞAĞIDAKİLER TARGET_CLASS_IDS'TEN OTOMATİK TÜRETİLİR, ELLE DEĞİŞTİRME ---
+#
+# Top olarak sayılan sınıf ismi (varsayım: veri setinde her zaman "ball" olarak
+# adlandırılmıştır -- farklıysa TARGET_CLASS_IDS'teki ismi güncelle, burası
+# otomatik uyum sağlar).
+BALL_CLASS_NAME = "ball"
+
+# "İnsan" (oyuncu/kaleci/hakem, her ne olursa olsun top DIŞINDAKİ her şey)
+# sayılan tüm sınıf isimleri. tracker.py'deki PlayerTracker, DeepSORT'a
+# BUNLARI besler -- COCO modelinde bu sadece {"person"}, fine-tune futbol
+# modelinde ise {"player", "goalkeeper", "referee"} olur.
+HUMAN_CLASS_NAMES = {name for name in TARGET_CLASS_IDS.values() if name != BALL_CLASS_NAME}
+
+# Model, hakemi YOLO SEVİYESİNDE ayrı bir sınıf olarak zaten tanıyor mu?
+# (COCO modelinde HAYIR -- hakem/oyuncu ayrımını K-Means renk kümelemesiyle
+# TAHMİN ETMEMİZ gerekiyor. Fine-tune futbol modelinde EVET -- bu durumda
+# team_classifier.py, hakemleri renk kümelemesine hiç sokmadan doğrudan
+# "Referee" etiketler; bu hem daha doğru hem de K-Means'in geriye kalan
+# kümelemeyi SADECE Takım A/Takım B arasında yapmasını sağlar.)
+USES_FINE_TUNED_FOOTBALL_MODEL = "referee" in HUMAN_CLASS_NAMES
 
 # Cihaz seçimi: GPU varsa "cuda", yoksa "cpu" (Apple Silicon için "mps")
 DEVICE = "cuda"  # gerekirse "cpu" olarak değiştir
@@ -125,8 +164,17 @@ BALL_MAX_MISSING_FRAMES = 15  # top bu kadar karede tespit edilmezse "kayıp" sa
 # ------------------------------------------------------------------
 # TAKIM SINIFLANDIRMA (K-MEANS) AYARLARI
 # ------------------------------------------------------------------
-# Sahadaki 3 grup: Takım A, Takım B, Hakem. Bu yüzden küme sayısı sabit 3.
-TEAM_CLASSIFIER_N_CLUSTERS = 3
+# Küme sayısı, hakemin YOLO seviyesinde zaten ayrı bir sınıf olup olmadığına
+# göre OTOMATİK belirlenir:
+#   - COCO modeli (USES_FINE_TUNED_FOOTBALL_MODEL=False): 3 küme gerekir
+#     (Takım A, Takım B, Hakem) -- çünkü hakem/oyuncu ayrımını da K-Means'in
+#     kendisi (en-az-üyeli küme sezgisiyle) TAHMİN etmek zorunda.
+#   - Fine-tune futbol modeli (USES_FINE_TUNED_FOOTBALL_MODEL=True): sadece
+#     2 küme yeterli (Takım A, Takım B) -- hakem zaten YOLO'dan "referee"
+#     sınıfıyla geldiği için hiç renk kümelemesine sokulmuyor (bkz.
+#     team_classifier.py). Bu hem daha az işlem hem de DAHA DOĞRU sonuç
+#     verir çünkü hakem forması artık iki takımın renk kümesini bozmuyor.
+TEAM_CLASSIFIER_N_CLUSTERS = 2 if USES_FINE_TUNED_FOOTBALL_MODEL else 3
 
 # K-Means'i "fit" etmeden (eğitmeden) önce en az kaç FARKLI oyuncunun (track_id)
 # forma rengi örneği toplanmalı? Çok erken fit edersek (örn. sadece 2-3 oyuncu
