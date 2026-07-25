@@ -164,17 +164,41 @@ BALL_MAX_MISSING_FRAMES = 15  # top bu kadar karede tespit edilmezse "kayıp" sa
 # ------------------------------------------------------------------
 # TAKIM SINIFLANDIRMA (K-MEANS) AYARLARI
 # ------------------------------------------------------------------
-# Küme sayısı, hakemin YOLO seviyesinde zaten ayrı bir sınıf olup olmadığına
-# göre OTOMATİK belirlenir:
-#   - COCO modeli (USES_FINE_TUNED_FOOTBALL_MODEL=False): 3 küme gerekir
-#     (Takım A, Takım B, Hakem) -- çünkü hakem/oyuncu ayrımını da K-Means'in
-#     kendisi (en-az-üyeli küme sezgisiyle) TAHMİN etmek zorunda.
-#   - Fine-tune futbol modeli (USES_FINE_TUNED_FOOTBALL_MODEL=True): sadece
-#     2 küme yeterli (Takım A, Takım B) -- hakem zaten YOLO'dan "referee"
-#     sınıfıyla geldiği için hiç renk kümelemesine sokulmuyor (bkz.
-#     team_classifier.py). Bu hem daha az işlem hem de DAHA DOĞRU sonuç
-#     verir çünkü hakem forması artık iki takımın renk kümesini bozmuyor.
-TEAM_CLASSIFIER_N_CLUSTERS = 2 if USES_FINE_TUNED_FOOTBALL_MODEL else 3
+# Bazı görüntülerde (amatör maç, antrenman klibi, drone/stok footage, hakemin
+# sürekli kadraj dışında olduğu kısa klipler vb.) SAHADA GÖRÜNÜR bir hakem
+# olmayabilir ya da forma rengi oyunculardan yeterince AYIRT EDİCİ olmayabilir.
+# Bu durumda K-Means'in "en az üyeli küme = hakem" varsayımı YANLIŞ POZİTİF
+# üretir -- gerçekte hakem OLMAYAN bir grup oyuncuyu "Hakem" diye etiketler
+# (bu tam olarak stok/amatör görüntülerde sık karşılaşılan bir durumdur).
+#
+# Görüntünde net, oyunculardan farklı renkli forma giyen bir hakem YOKSA
+# ya da "Hakem" etiketinin yanlışlıkla oyunculara yapıştığını görüyorsan,
+# bunu False yap -- K-Means artık SADECE 2 küme (Takım A / Takım B) kullanır,
+# hiçbir grup zorla "Hakem" etiketlenmez.
+TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT = True
+
+# (Sadece TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT=True iken kullanılır.)
+# En küçük kümenin GERÇEKTEN bir azınlık (yani muhtemelen hakem) sayılabilmesi
+# için, boyutunun diğer iki kümenin ortalamasının bu ORANDAN küçük olması
+# gerekir. Örn. 0.6 demek: en küçük küme, diğerlerinin ortalamasının
+# %60'ından DAHA BÜYÜKSE, muhtemelen gerçek bir hakem grubu DEĞİLDİR --
+# sadece K-Means'in kusurlu bir renk ayrımıdır. Bu durumda konsola uyarı
+# basılır (ama işlem yine de devam eder, en küçük küme yine "Hakem" sayılır --
+# kalıcı çözüm için yukarıdaki bayrağı False yapmak gerekir).
+TEAM_CLASSIFIER_REFEREE_SIZE_RATIO_THRESHOLD = 0.6
+
+# Küme sayısı, iki farklı sebepten 2'ye düşebilir:
+#   1) Fine-tune futbol modeli kullanılıyorsa (hakem zaten YOLO'dan ayrı sınıf)
+#   2) TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT=False ise (görüntüde ayırt
+#      edilebilir bir hakem yok/olmadığı varsayılıyor)
+# Küme sayısı, iki farklı sebepten 2'ye düşebilir:
+#   1) Fine-tune futbol modeli kullanılıyorsa (hakem zaten YOLO'dan ayrı sınıf)
+#   2) TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT=False ise (görüntüde ayırt
+#      edilebilir bir hakem yok/olmadığı varsayılıyor)
+TEAM_CLASSIFIER_N_CLUSTERS = (
+    2 if USES_FINE_TUNED_FOOTBALL_MODEL
+    else (3 if TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT else 2)
+)
 
 # K-Means'i "fit" etmeden (eğitmeden) önce en az kaç FARKLI oyuncunun (track_id)
 # forma rengi örneği toplanmalı? Çok erken fit edersek (örn. sadece 2-3 oyuncu
@@ -309,6 +333,21 @@ HOMOGRAPHY_RANSAC_THRESHOLD = 5.0
 PITCH_MINIMAP_WIDTH_PX = 600
 PITCH_MINIMAP_HEIGHT_PX = int(PITCH_MINIMAP_WIDTH_PX * (PITCH_WIDTH_M / PITCH_LENGTH_M))
 PITCH_MINIMAP_MARGIN_PX = 20
+
+# ------------------------------------------------------------------
+# TAKTİK GÖRÜNÜM (MİNİMAP) -- ÇIKTI VİDEOSUNA GÖMME AYARLARI
+# ------------------------------------------------------------------
+# NOT: draw_pitch_minimap() daha önce main.py'ye hiç bağlanmamıştı -- sadece
+# perspective_transformer.py'nin kendi test bloğunda kullanılıyordu. Şimdi
+# main.py, kalibrasyon yapılmışsa (transformer.is_calibrated=True) her karede
+# bu minimap'i üretip video_processor.py'nin overlay_minimap() metoduyla
+# çıktı videosunun bir köşesine gömüyor (resim-içinde-resim / "tactical cam" tarzı).
+# Kalibrasyon yapılmamışsa minimap hiç üretilmez/gösterilmez (saha koordinatı
+# olmadan anlamlı bir minimap çizilemez).
+SHOW_TACTICAL_MINIMAP = True
+MINIMAP_OVERLAY_SCALE = 0.3          # video genişliğinin bu oranı kadar küçültülüp yerleştirilir
+MINIMAP_OVERLAY_MARGIN_PX = 20       # video kenarından boşluk (piksel)
+MINIMAP_OVERLAY_POSITION = "bottom_right"  # "bottom_right" | "bottom_left" | "top_right" | "top_left"
 
 # ------------------------------------------------------------------
 # VİDEO İŞLEME / ÇİZİM AYARLARI

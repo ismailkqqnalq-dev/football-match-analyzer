@@ -220,6 +220,71 @@ class VideoProcessor:
         return annotated
 
     # ----------------------------------------------------------------
+    def overlay_minimap(
+        self,
+        frame: np.ndarray,
+        minimap: np.ndarray,
+        position: str = None,
+        scale: float = None,
+        margin: int = None,
+    ) -> np.ndarray:
+        """
+        Kuş bakışı saha minimap'ini (perspective_transformer.draw_pitch_minimap()'ten
+        gelir), ana video karesinin bir köşesine "resim-içinde-resim" (picture-in-
+        picture) olarak gömer -- yayın kanallarındaki "taktik kamera" görünümü gibi.
+
+        Parametreler
+        ------------
+        frame : np.ndarray
+            Üzerine gömme yapılacak ana video karesi (BGR). BU KARE YERİNDE
+            (in-place) DEĞİŞTİRİLİR -- ayrıca dönüş değeri olarak da verilir.
+        minimap : np.ndarray
+            perspective_transformer.draw_pitch_minimap()'ten gelen kuş bakışı görüntü.
+        position, scale, margin : opsiyonel
+            Verilmezse config.py'deki MINIMAP_OVERLAY_* varsayılanları kullanılır.
+
+        Dönüş
+        -----
+        np.ndarray
+            Minimap'i köşesinde taşıyan ana kare.
+        """
+        position = position or config.MINIMAP_OVERLAY_POSITION
+        scale = scale if scale is not None else config.MINIMAP_OVERLAY_SCALE
+        margin = margin if margin is not None else config.MINIMAP_OVERLAY_MARGIN_PX
+
+        frame_h, frame_w = frame.shape[:2]
+        minimap_h, minimap_w = minimap.shape[:2]
+
+        # Minimap'i, video genişliğinin belirli bir oranı kadar olacak şekilde
+        # küçült (en-boy oranını koruyarak).
+        target_w = max(1, int(frame_w * scale))
+        target_h = max(1, int(target_w * minimap_h / minimap_w))
+        resized = cv2.resize(minimap, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+        # Ana videodan görsel olarak ayrışsın diye ince beyaz bir kenarlık ekle.
+        bordered = cv2.copyMakeBorder(resized, 3, 3, 3, 3, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        b_h, b_w = bordered.shape[:2]
+
+        # Köşe konumunu hesapla. Video kareden küçükse (aşırı küçük çıktı
+        # boyutu gibi uç durumlarda) taşmayı önlemek için sınırlıyoruz.
+        if position == "bottom_right":
+            x1, y1 = frame_w - b_w - margin, frame_h - b_h - margin
+        elif position == "bottom_left":
+            x1, y1 = margin, frame_h - b_h - margin
+        elif position == "top_right":
+            x1, y1 = frame_w - b_w - margin, margin
+        else:  # "top_left" (varsayılan/bilinmeyen değer için de güvenli düşüş)
+            x1, y1 = margin, margin
+
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(frame_w, x1 + b_w), min(frame_h, y1 + b_h)
+
+        # Kare, minimap'ten küçükse (nadir ama olası) kırp -- çökmeyi önle.
+        frame[y1:y2, x1:x2] = bordered[: y2 - y1, : x2 - x1]
+
+        return frame
+
+    # ----------------------------------------------------------------
     def write_frame(self, frame: np.ndarray):
         """İşlenmiş tek bir frame'i çıktı videosuna yazar."""
         if self.writer is None:

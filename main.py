@@ -78,7 +78,9 @@ def main():
     if not transformer.is_calibrated:
         print(
             "\n[UYARI] Homografi kalibrasyonu yapılmamış. Saha (metre) koordinatları "
-            "üretilmeyecek. Kalibrasyon için: python utils/calibrate_homography.py\n"
+            "üretilmeyecek VE taktik minimap görünümü çıktı videosuna eklenmeyecek "
+            "(minimap, saha koordinatlarına ihtiyaç duyar). Kalibrasyon için: "
+            "python utils/calibrate_homography.py\n"
         )
 
     # CameraMotionTracker de state taşır (önceki karenin gri tonlaması,
@@ -143,7 +145,14 @@ def main():
                 (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
             )
 
-            # 11) İşlenmiş frame'i çıktı videosuna yaz
+            # 11) Taktik görünüm (kuş bakışı saha minimap'i) -- SADECE kalibrasyon
+            # yapılmışsa üretilir/gömülür (kalibrasyon yoksa pitch_x/y zaten None'dur,
+            # anlamlı bir minimap çizilemez).
+            if config.SHOW_TACTICAL_MINIMAP and transformer.is_calibrated:
+                minimap = transformer.draw_pitch_minimap(all_tracked)
+                annotated_frame = vp.overlay_minimap(annotated_frame, minimap)
+
+            # 12) İşlenmiş frame'i çıktı videosuna yaz
             vp.write_frame(annotated_frame)
 
         # --- Video döngüsü bitti (hâlâ 'with VideoProcessor' bloğunun içindeyiz,

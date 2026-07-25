@@ -230,13 +230,13 @@ class TeamClassifier:
         unique, counts = np.unique(cluster_labels, return_counts=True)
         cluster_sizes = dict(zip(unique.tolist(), counts.tolist()))
 
-        if config.USES_FINE_TUNED_FOOTBALL_MODEL:
-            # Fine-tune futbol modelinde hakem ZATEN YOLO sınıfından ayrı
-            # geliyor ve renk geçmişine hiç eklenmiyor (bkz. assign_teams).
-            # Yani burada toplanan renkler SADECE oyunculara/kalecilere ait --
-            # "en az üyeli küme = hakem" sezgisine gerek YOK, iki küme de
-            # doğrudan Takım A / Takım B. Deterministik olsun diye küme
-            # merkezinin toplam parlaklığına göre sıralıyoruz.
+        if self.n_clusters == 2:
+            # 2 küme, iki farklı sebepten burada olabilir: (a) fine-tune futbol
+            # modelinde hakem zaten YOLO'dan ayrı geldiği için renk geçmişine
+            # hiç girmedi, ya da (b) config.TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT
+            # =False ile kullanıcı bu görüntüde ayırt edilebilir bir hakem
+            # olmadığını belirtti. Her iki durumda da "en az üyeli küme = hakem"
+            # sezgisine gerek YOK -- iki küme de doğrudan Takım A / Takım B.
             clusters_by_brightness = sorted(
                 cluster_sizes.keys(), key=lambda c: self.kmeans.cluster_centers_[c].sum()
             )
@@ -245,8 +245,30 @@ class TeamClassifier:
                 clusters_by_brightness[1]: "Team B",
             }
         else:
-            # --- Hangi küme "Hakem"? En az üyeli küme (sahada en az kişi olan grup) ---
+            # n_clusters == 3: config.TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT=True
+            # ile görüntüde ayrı bir hakem grubu OLDUĞUNU varsayıyoruz.
+            # "En az üyeli küme = hakem" sezgisi kullanılır.
             referee_cluster = min(cluster_sizes, key=cluster_sizes.get)
+
+            # --- GÜVENLİK KONTROLÜ ---
+            # Bu sezgi, hakemin GERÇEKTEN azınlıkta olduğu varsayımına dayanır.
+            # Ama görüntüde hiç hakem yoksa (ör. amatör/stok/antrenman klibi),
+            # "en küçük küme" aslında sadece kusurlu bir renk ayrımı olur --
+            # gerçek oyuncular yanlışlıkla "Hakem" etiketlenir (tam olarak
+            # kullanıcının karşılaştığı sorun budur). Bu yüzden en küçük kümenin
+            # diğerlerine göre GERÇEKTEN küçük olup olmadığını kontrol ediyoruz.
+            other_sizes = [s for c, s in cluster_sizes.items() if c != referee_cluster]
+            avg_other_size = sum(other_sizes) / len(other_sizes) if other_sizes else 0
+
+            if avg_other_size > 0 and cluster_sizes[referee_cluster] >= avg_other_size * config.TEAM_CLASSIFIER_REFEREE_SIZE_RATIO_THRESHOLD:
+                print(
+                    f"\n[TeamClassifier] UYARI: En küçük küme ({cluster_sizes[referee_cluster]} oyuncu) "
+                    f"diğer kümelere ({other_sizes}) göre yeterince küçük DEĞİL. Bu, görüntüde GERÇEK bir "
+                    f"hakem grubu OLMAYABİLECEĞİNİ gösteriyor -- K-Means muhtemelen sadece kusurlu bir "
+                    f"renk ayrımı yaptı ve bazı GERÇEK OYUNCULARI yanlışlıkla 'Hakem' etiketleyecek.\n"
+                    f"                 Eğer görüntüde net, ayırt edici renkli bir hakem YOKSA, "
+                    f"config.py içinde şunu ayarla: TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT = False\n"
+                )
 
             remaining_clusters = [c for c in cluster_sizes if c != referee_cluster]
             # Team A / Team B ayrımı keyfi olabilir (hangisinin "A" hangisinin "B"

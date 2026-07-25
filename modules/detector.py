@@ -20,6 +20,7 @@ import sys
 from typing import List, Dict
 
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -59,9 +60,32 @@ class ObjectDetector:
         """
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
-        self.device = device
 
-        print(f"[ObjectDetector] Model yükleniyor: {model_path} (device={device})")
+        # --- ÖNEMLİ DÜZELTME ---
+        # Daha önce burada "device" parametresi hiç kontrol edilmeden doğrudan
+        # kullanılıyordu -- docstring "GPU yoksa otomatik cpu'ya düşer" diyordu
+        # ama bu DAVRANIŞ HİÇ YAZILMAMIŞTI. Sonuç: config.py'de DEVICE="cuda"
+        # iken CUDA'sız bir makinede çalıştırılınca Ultralytics/torch,
+        # "Invalid CUDA 'device=0' requested" hatasıyla çöküyordu. Şimdi
+        # gerçekten kontrol edip otomatik düşüyoruz.
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            print(
+                f"[ObjectDetector] UYARI: '{device}' istendi ama bu makinede CUDA kullanılamıyor "
+                f"(torch.cuda.is_available() == False). CPU'ya düşülüyor.\n"
+                f"                 CPU'da özellikle yolov8x gibi büyük modeller ÇOK YAVAŞ çalışabilir "
+                f"(kare başına saniyeler sürebilir). İki seçeneğin var:\n"
+                f"                   1) NVIDIA GPU'n varsa CUDA destekli PyTorch kur:\n"
+                f"                      pip uninstall torch torchvision -y\n"
+                f"                      pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121\n"
+                f"                      (kendi CUDA sürücü versiyonuna uygun linki https://pytorch.org/get-started/locally/ adresinden bul)\n"
+                f"                   2) GPU'n yoksa, config.py'de YOLO_MODEL_PATH'i daha küçük/hızlı bir\n"
+                f"                      modele çevir: YOLO_MODEL_PATH = os.path.join(MODELS_DIR, \"yolov8n.pt\")"
+            )
+            self.device = "cpu"
+        else:
+            self.device = device
+
+        print(f"[ObjectDetector] Model yükleniyor: {model_path} (device={self.device})")
 
         # YOLO modelini yüklüyoruz. Ultralytics kütüphanesi hem .pt dosyasını
         # yerelden okur hem de yoksa otomatik indirir.
