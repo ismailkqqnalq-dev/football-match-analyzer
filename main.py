@@ -118,16 +118,32 @@ def main():
                 all_tracked.append(tracked_ball)
 
             # 6) Kamera hareketini (pan/tilt/zoom) tahmin et -- Adım 5 eklentisi
-            motion_matrix = motion_tracker.update(frame, raw_detections)
+            #
+            # ÖNEMLİ: motion_tracker.update() SADECE config.CALIBRATION_FRAME_INDEX
+            # ve SONRASI için çağrılıyor. Neden? CameraMotionTracker, ilk kez
+            # .update() çağrıldığı kareyi "referans kare" (M=birim matris) kabul
+            # eder ve sonraki tüm kareleri BUNA GÖRE hizalar. Kalibrasyonu
+            # (SOURCE_CALIBRATION_POINTS) hangi karede yaptıysan, homografi de o
+            # karenin piksel düzenine göre hesaplanmıştır -- yani kamera hareketi
+            # takibinin referans karesi de BİREBİR AYNI kare olmalı, aksi halde
+            # "efektif homografi" tamamen yanlış bir kareye göre hizalanır.
+            # Bu satır, ilk .update() çağrısının tam olarak kalibrasyon karesinde
+            # gerçekleşmesini garanti ederek bu hizalamayı otomatik sağlıyor.
+            # Kalibrasyon karesinden ÖNCEKİ kareler için saha koordinatı üretilmez.
+            if frame_idx >= config.CALIBRATION_FRAME_INDEX:
+                motion_matrix = motion_tracker.update(frame, raw_detections)
+            else:
+                motion_matrix = None
 
             # 7) Piksel koordinatlarını saha (metre) koordinatlarına çevir -- Adım 5
             if motion_matrix is not None:
                 # Normal durum: kamera hareketi telafili efektif homografi kullanılır
                 all_tracked = transformer.add_pitch_coordinates(all_tracked, camera_motion_matrix=motion_matrix)
             else:
-                # motion_matrix None ise CameraMotionTracker bir SAHNE KESMESİ
-                # tespit etmiştir (ör. tekrar izlemeye geçildi). Yanlış saha
-                # koordinatı üretmektense, bu kare için hiç üretmiyoruz.
+                # motion_matrix None ise ya (a) CALIBRATION_FRAME_INDEX'e henüz
+                # ulaşılmadı, ya da (b) CameraMotionTracker bir SAHNE KESMESİ
+                # tespit etti. Her iki durumda da yanlış saha koordinatı
+                # üretmektense, bu kare için hiç üretmiyoruz.
                 for det in all_tracked:
                     det["pitch_x"], det["pitch_y"], det["on_pitch"] = None, None, None
 

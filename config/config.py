@@ -175,7 +175,7 @@ BALL_MAX_MISSING_FRAMES = 15  # top bu kadar karede tespit edilmezse "kayıp" sa
 # ya da "Hakem" etiketinin yanlışlıkla oyunculara yapıştığını görüyorsan,
 # bunu False yap -- K-Means artık SADECE 2 küme (Takım A / Takım B) kullanır,
 # hiçbir grup zorla "Hakem" etiketlenmez.
-TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT = False
+TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT = True
 
 # (Sadece TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT=True iken kullanılır.)
 # En küçük kümenin GERÇEKTEN bir azınlık (yani muhtemelen hakem) sayılabilmesi
@@ -310,8 +310,9 @@ PITCH_LANDMARKS_METERS = {
 # !!! BURASI HER VİDEO/KAMERA AÇISI İÇİN ELLE DOLDURULMALI !!!
 # Yukarıdaki isimlerden seçtiğin en az 4 tanesinin, senin video görüntündeki
 # PİKSEL koordinatlarını buraya gir. utils/calibrate_homography.py aracı,
-# videonun ilk karesini açıp tıkladığın noktaların piksel koordinatlarını
-# ekrana basar -- oradan kopyalayıp buraya yapıştırman yeterli.
+# --frame-index (ya da --timestamp) ile seçtiğin karedeki tıkladığın
+# noktaların piksel koordinatlarını ekrana basar -- oradan kopyalayıp buraya
+# yapıştırman yeterli.
 # Format: {"landmark_ismi": (piksel_x, piksel_y), ...}
 # Örnek (kendi videonla değiştirmen gerekir):
 SOURCE_CALIBRATION_POINTS = {
@@ -320,6 +321,21 @@ SOURCE_CALIBRATION_POINTS = {
     # "left_penalty_box_top_left": (145, 340),
     # "left_penalty_box_bottom_left": (160, 610),
 }
+
+# --- HANGİ KAREDE KALİBRASYON YAPILDI? ---
+# YUKARIDAKİ SOURCE_CALIBRATION_POINTS'İ HANGİ KAREYE BAKARAK DOLDURDUYSAN,
+# o karenin numarasını (frame_idx) buraya yaz. Videonun İLK karesinde
+# kalibrasyon yapmak ZORUNDA DEĞİLSİN -- video başında saha net görünmüyorsa
+# (intro, tekrar izleme, farklı bir açı vb.) sahanın net göründüğü herhangi
+# bir kareyi seçebilirsin (bkz. utils/calibrate_homography.py --frame-index).
+#
+# ÖNEMLİ: Bu değer, kamera hareketi telafisinin (camera_motion_tracker.py)
+# "referans karesi" ile BİREBİR AYNI OLMAK ZORUNDADIR -- main.py bunu otomatik
+# ayarlar (bkz. main.py'deki ilgili yorum), sen sadece bu sayıyı doğru girmen
+# yeterli. Bu kareden ÖNCEKİ kareler için saha (metre) koordinatı üretilmez
+# (pitch_x/y = None kalır) -- kamera hareketi takibi henüz "referans" almadığı
+# için o kareler için güvenilir bir dönüşüm yoktur.
+CALIBRATION_FRAME_INDEX = 0
 
 # findHomography için RANSAC eşiği (piksel). Kalibrasyon noktalarında küçük
 # tıklama hataları olabileceğinden RANSAC, aykırı (outlier) noktaları eleyerek
