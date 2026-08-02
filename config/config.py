@@ -273,12 +273,20 @@ SCENE_CUT_CORRELATION_THRESHOLD = 0.5
 # y ekseni kısa kenar (genişlik) boyunca artar.
 PITCH_LENGTH_M = 105.0
 PITCH_WIDTH_M = 68.0
+CENTER_CIRCLE_RADIUS_M = 9.15  # FIFA/IFAB standardı
 
 # Sahadaki, kamerada genelde net görülen sabit referans noktalarının GERÇEK
 # metre cinsinden konumları. Bunlar değişmez -- her sahada aynıdır (standart
 # ölçülere göre). Homografi hesaplamak için bu noktalardan en az 4 tanesinin
 # YAYIN KAMERASINDAKİ piksel karşılığını (SOURCE_CALIBRATION_POINTS) bulmamız
 # gerekiyor.
+#
+# NOT -- orta yuvarlağın 4 kritik noktası (üst/alt/sol/sağ):
+# Standart bir yayın kamerası genelde sahanın SADECE ORTA KISMINI net gösterir
+# -- köşe bayrakları, ceza sahaları çoğu zaman kadraj dışında kalır. Orta
+# yuvarlağın orta çizgiyle kesiştiği 4 nokta ise (yarıçap = 9.15m) HEMEN HEMEN
+# HER kamera açısında net görünür. Bu yüzden bunlar, köşe/ceza sahası
+# noktalarından daha PRATİK ve GÜVENİLİR bir kalibrasyon seçimi olabilir.
 PITCH_LANDMARKS_METERS = {
     "top_left_corner": (0.0, 0.0),
     "top_right_corner": (105.0, 0.0),
@@ -287,6 +295,10 @@ PITCH_LANDMARKS_METERS = {
     "halfway_top": (52.5, 0.0),
     "halfway_bottom": (52.5, 68.0),
     "center_spot": (52.5, 34.0),
+    "center_circle_top": (52.5, 34.0 - CENTER_CIRCLE_RADIUS_M),      # (52.5, 24.85)
+    "center_circle_bottom": (52.5, 34.0 + CENTER_CIRCLE_RADIUS_M),   # (52.5, 43.15)
+    "center_circle_left": (52.5 - CENTER_CIRCLE_RADIUS_M, 34.0),     # (43.35, 34.0)
+    "center_circle_right": (52.5 + CENTER_CIRCLE_RADIUS_M, 34.0),    # (61.65, 34.0)
     "left_penalty_spot": (11.0, 34.0),
     "right_penalty_spot": (94.0, 34.0),
     "left_penalty_box_top_left": (0.0, 13.84),
