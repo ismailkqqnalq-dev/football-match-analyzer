@@ -175,7 +175,7 @@ BALL_MAX_MISSING_FRAMES = 15  # top bu kadar karede tespit edilmezse "kayıp" sa
 # ya da "Hakem" etiketinin yanlışlıkla oyunculara yapıştığını görüyorsan,
 # bunu False yap -- K-Means artık SADECE 2 küme (Takım A / Takım B) kullanır,
 # hiçbir grup zorla "Hakem" etiketlenmez.
-TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT = True
+TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT = False
 
 # (Sadece TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT=True iken kullanılır.)
 # En küçük kümenin GERÇEKTEN bir azınlık (yani muhtemelen hakem) sayılabilmesi
