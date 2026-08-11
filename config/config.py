@@ -328,11 +328,10 @@ PITCH_LANDMARKS_METERS = {
 # Format: {"landmark_ismi": (piksel_x, piksel_y), ...}
 # Örnek (kendi videonla değiştirmen gerekir):
 SOURCE_CALIBRATION_POINTS = {
-    "center_spot": (635, 362),
-    "center_circle_bottom": (632, 435),
-    "center_circle_top": (635, 301),
-    "center_circle_right": (913, 365),
-    "center_circle_left": (352, 363),
+    # "top_left_corner": (145, 210),
+    # "top_right_corner": (1780, 195),
+    # "left_penalty_box_top_left": (145, 340),
+    # "left_penalty_box_bottom_left": (160, 610),
 }
 
 # --- HANGİ KAREDE KALİBRASYON YAPILDI? ---
@@ -348,7 +347,7 @@ SOURCE_CALIBRATION_POINTS = {
 # yeterli. Bu kareden ÖNCEKİ kareler için saha (metre) koordinatı üretilmez
 # (pitch_x/y = None kalır) -- kamera hareketi takibi henüz "referans" almadığı
 # için o kareler için güvenilir bir dönüşüm yoktur.
-CALIBRATION_FRAME_INDEX = 637
+CALIBRATION_FRAME_INDEX = 0
 
 # findHomography için RANSAC eşiği (piksel). Kalibrasyon noktalarında küçük
 # tıklama hataları olabileceğinden RANSAC, aykırı (outlier) noktaları eleyerek

@@ -58,16 +58,46 @@ KULLANIM (headless / ekransız ortamda):
     python utils/calibrate_homography.py --input data/input_videos/match_sample.mp4 --frame-index 350 --save-frame-only
     (Bu, sadece seçtiğin kareyi data/exports/calibration_frame.png olarak
      kaydeder; koordinatları başka bir araçla bulman gerekir.)
+
+SAHANIN TAMAMI TEK KAREDE GÖRÜNMÜYORSA -- ÇOKLU KARE MODU:
+    Bazı kamera açıları (ör. sabit orta saha kamerası) sadece sahanın küçük
+    bir bölümünü (ör. orta yuvarlağı) net gösterir; ceza sahaları, köşeler
+    hiç görünmez. Bu durumda TEK bir karede yeterli, YAYILMIŞ nokta bulamazsın
+    -- ki bu, homografinin köşelere/ceza sahalarına doğru güvenilirliğini
+    ciddi şekilde düşürür (kalibrasyon noktalarından uzaklaştıkça hata büyür).
+
+    --multi-frame modu, referans kareden itibaren videoyu ileri doğru "oynatıp"
+    arka planda kamera hareketini (optical flow) takip eder -- böylece
+    videonun SONRAKİ bir anında (örn. bir korner sırasında ceza sahası
+    netleştiğinde) durup oraya da tıklayabilirsin. Araç, o tıklamayı otomatik
+    olarak referans karenin piksel koordinatına çevirir; sonunda hepsi TEK
+    bir SOURCE_CALIBRATION_POINTS sözlüğünde birleşir.
+
+    python utils/calibrate_homography.py --input data/input_videos/match_sample.mp4 --frame-index 637 --multi-frame
+
+    Pencere açılınca:
+    - SPACE       : videoyu oynat / duraklat
+    - d           : (duraklatıldığında) arabellekte ileri git; arabelleğin
+                    sonundaysan bir sonraki kareyi okuyup tek adım ilerler
+    - a           : (duraklatıldığında) arabellekte geri git (son ~5 saniyeyi
+                    gözden geçirmek için -- kamera takibi geri sarılmaz)
+    - SOL TIK     : (SADECE duraklatıldığında) o anki karedeki noktayı işaretle
+    - q           : bitir, config.py formatında çıktı yazdır
+    Video sahne kesmesi (farklı kameraya ani geçiş) içeriyorsa araç bunu
+    otomatik tespit edip durur -- o ana kadar toplanan noktalarla devam edebilirsin.
 """
 
 import argparse
 import os
 import sys
+from collections import deque
 
 import cv2
+import numpy as np
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import config
+from modules.camera_motion_tracker import CameraMotionTracker
 
 
 # Tıklanan noktaları saklamak için global liste (cv2 mouse callback'i başka
@@ -130,6 +160,234 @@ def save_frame_as_image(video_path: str, frame_index: int, output_path: str):
         "config.py -> SOURCE_CALIBRATION_POINTS içine elle girebilirsin.\n"
         f"Unutma: config.py -> CALIBRATION_FRAME_INDEX = {frame_index} olarak da ayarlamalısın."
     )
+
+
+def transform_click_to_reference(px: float, py: float, cumulative_matrix: np.ndarray):
+    """
+    Canlı oynatımda tıklanan bir pikseli, REFERANS karenin piksel koordinat
+    sistemine çevirir. cumulative_matrix, CameraMotionTracker.update()'in o
+    kare için ürettiği M_t matrisidir -- frame_t pikselini referans karenin
+    pikseline eşler (bkz. camera_motion_tracker.py başındaki matematik özeti).
+    """
+    point = np.array([[[px, py]]], dtype=np.float32)
+    transformed = cv2.perspectiveTransform(point, cumulative_matrix)
+    return float(transformed[0][0][0]), float(transformed[0][0][1])
+
+
+def run_multiframe_calibration(video_path: str, reference_frame_index: int):
+    """
+    ÇOKLU KARE KALİBRASYON MODU
+
+    Tek bir karede sahanın sadece küçük bir kısmı (ör. sadece orta yuvarlak)
+    görünüyorsa, homografi o bölgede doğru olsa bile SAHANIN GENELİNDE
+    (özellikle uzak köşe/ceza sahalarında) ciddi hata verebilir -- çünkü
+    homografi, kalibrasyon noktalarından UZAKLAŞTIKÇA daha az güvenilir olur.
+
+    Bu mod, videoyu REFERANS KAREDEN itibaren ileri doğru oynatıp arka planda
+    kamera hareketini (camera_motion_tracker.py, optical flow) sürekli takip
+    eder. Videonun SONRAKİ herhangi bir anında (örn. bir korner sırasında
+    ceza sahası netleştiğinde) durup oraya da tıklayabilirsin -- araç, o
+    tıklamayı OTOMATİK olarak referans karenin piksel koordinatına çevirir.
+    Sonunda hepsi TEK bir SOURCE_CALIBRATION_POINTS sözlüğünde, sahanın çok
+    daha geniş bir bölümünü kapsayacak şekilde birleşir.
+
+    SINIRLAMA: Takip SADECE İLERİ yönde çalışır (optical flow'un doğası
+    gereği). Videoda SAHNE KESMESİ (farklı kameraya ani geçiş, ör. tekrar
+    izleme) olursa oradan sonrası referans kareyle bağlantısını kaybeder --
+    araç bunu tespit edip otomatik durur, o ana kadar toplanan noktalarla
+    devam edebilirsin.
+
+    NOT: Bu araçta oyuncu/top maskeleme (YOLO) ÇALIŞTIRILMIYOR -- optical
+    flow, kareler arasında oyuncular dahil HER YERDE özellik noktası arayabilir.
+    Ana pipeline'daki (main.py) kadar hassas değildir ama kalibrasyon
+    amacıyla (birkaç sabit nokta bulmak) yeterince sağlamdır. Kalabalık/hızlı
+    hareketli anlarda tıklamadan önce videoyu biraz beklet, daha sakin bir
+    anda işaretle.
+
+    Tuşlar:
+        SPACE : oynat / duraklat
+        d     : ileri (duraklatıldığında: arabellekte ileri kaydır ya da
+                canlı uçtaysa yeni kare oku; oynatılırken: hız değişmez)
+        a     : geri (SADECE arabellekteki son ~5 saniyeyi gözden geçirmek
+                için -- kamera takibi geri sarılmaz, sadece daha önce
+                görülmüş kareleri tekrar gösterir)
+        SOL TIK (sadece duraklatıldığında): o anki karedeki noktayı işaretle
+        q     : bitir
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise IOError(f"Video açılamadı: {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    buffer_size = max(30, int(fps * 5))  # ~5 saniyelik "geri gözden geçirme" arabelleği
+
+    ref_frame = read_frame_at(cap, reference_frame_index)
+    if ref_frame is None:
+        raise IOError(f"Referans kare okunamadı (frame_idx={reference_frame_index}): {video_path}")
+
+    motion_tracker = CameraMotionTracker()
+    ref_matrix = motion_tracker.update(ref_frame, [])  # ilk çağrı -> birim matris (referansın kendisi)
+
+    # Arabellek: her eleman (frame_idx, frame_görüntüsü, o karenin_referansa_göre_matrisi)
+    buffer = deque(maxlen=buffer_size)
+    buffer.append((reference_frame_index, ref_frame, ref_matrix))
+    buf_pos = 0  # arabellek içindeki "şu an gösterilen" konum (0 = en eski, len-1 = en yeni/canlı)
+
+    next_read_index = reference_frame_index + 1
+    playing = False
+    scene_cut_hit = False
+
+    # collected_points: {"ref_x", "ref_y", "source_frame_idx", "raw_x", "raw_y"}
+    collected_points = []
+
+    window_name = "Coklu Kare Kalibrasyon - SPACE: oynat/duraklat, a/d: gezin, SOL TIK: nokta, q: bitir"
+    cv2.namedWindow(window_name)
+
+    def current_entry():
+        return buffer[buf_pos]
+
+    def redraw():
+        frame_idx, frame_img, _matrix = current_entry()
+        display = frame_img.copy()
+
+        # Bu KAREDE (frame_idx) daha önce işaretlenmiş noktaları tekrar çiz
+        for p in collected_points:
+            if p["source_frame_idx"] == frame_idx:
+                x, y = int(p["raw_x"]), int(p["raw_y"])
+                cv2.circle(display, (x, y), 5, (0, 0, 255), -1)
+
+        status = "OYNATILIYOR" if playing else "DURAKLATILDI"
+        cut_note = "  |  [SAHNE KESMESİ TESPİT EDİLDİ -- daha fazla ilerlenemez]" if scene_cut_hit else ""
+        info = (
+            f"Kare: {frame_idx} (referans: {reference_frame_index})  |  "
+            f"{status}  |  Toplam nokta: {len(collected_points)}{cut_note}"
+        )
+        cv2.rectangle(display, (0, 0), (display.shape[1], 34), (0, 0, 0), -1)
+        cv2.putText(display, info, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.imshow(window_name, display)
+
+    def on_click(event, x, y, flags, param):
+        if event != cv2.EVENT_LBUTTONDOWN or playing:
+            return  # sadece duraklatıldığında tıklama kabul edilir
+        frame_idx, _frame_img, matrix = current_entry()
+        ref_x, ref_y = transform_click_to_reference(x, y, matrix)
+        collected_points.append({
+            "ref_x": ref_x, "ref_y": ref_y,
+            "source_frame_idx": frame_idx, "raw_x": x, "raw_y": y,
+        })
+        print(
+            f"[{len(collected_points)}] Kare {frame_idx}'te tıklandı (x={x}, y={y}) "
+            f"-> referans kareye çevrildi: (x={ref_x:.1f}, y={ref_y:.1f})"
+        )
+        redraw()
+
+    cv2.setMouseCallback(window_name, on_click)
+    redraw()
+
+    print("\n" + "=" * 70)
+    print("ÇOKLU KARE KALİBRASYON BAŞLADI")
+    print(f"Referans kare: {reference_frame_index}  |  Video: {video_path}")
+    print("SPACE: oynat/duraklat  |  a/d: arabellekte gezin  |  SOL TIK (duraklatıldığında): nokta işaretle")
+    print("Sahanın farklı bölgelerinin (ceza sahası, köşe, taç çizgisi) göründüğü anları bekle,")
+    print("SPACE ile duraklat, tıkla, tekrar SPACE ile devam et. Bitirince 'q'.")
+    print("=" * 70 + "\n")
+
+    while True:
+        key = cv2.waitKey(30) & 0xFF
+
+        if key == ord("q"):
+            break
+        elif key == ord(" "):
+            playing = not playing
+            if playing:
+                buf_pos = len(buffer) - 1  # oynatmaya devam ederken hep canlı uçtan başla
+            redraw()
+        elif key == ord("a") and not playing:
+            buf_pos = max(0, buf_pos - 1)
+            redraw()
+        elif key == ord("d") and not playing:
+            if buf_pos < len(buffer) - 1:
+                buf_pos += 1
+                redraw()
+            # canlı uçtaysak, 'd' bir sonraki kareyi OKUYUP takip eder (aşağıdaki playing bloğuyla ortak mantık)
+            elif not scene_cut_hit and next_read_index < total_frames:
+                playing = True  # bir adım ilerlet, aşağıdaki blok işleyecek
+
+        if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+            break
+
+        # --- Canlı ilerleme: sadece "oynatılıyor" durumundayken yeni kare oku ---
+        if playing and not scene_cut_hit:
+            if next_read_index >= total_frames:
+                print("\nVideo sonuna ulaşıldı, oynatma durduruluyor.")
+                playing = False
+                redraw()
+                continue
+
+            success, frame = cap.read()
+            if not success:
+                print("\nKare okunamadı, oynatma durduruluyor.")
+                playing = False
+                redraw()
+                continue
+
+            matrix = motion_tracker.update(frame, [])
+            if matrix is None:
+                print(
+                    "\n[UYARI] SAHNE KESMESİ tespit edildi -- kamera takibi referans kareyle "
+                    "bağlantısını kaybetti. Buradan sonrası için nokta eklenemez. Şu ana kadar "
+                    "toplanan noktalarla devam edebilirsin ('q' ile bitir)."
+                )
+                scene_cut_hit = True
+                playing = False
+                redraw()
+                continue
+
+            buffer.append((next_read_index, frame, matrix))
+            buf_pos = len(buffer) - 1
+            next_read_index += 1
+            # Tek adım "d" ile gelindiyse otomatik tekrar duraklat
+            if key == ord("d"):
+                playing = False
+            redraw()
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    if not collected_points:
+        print("Hiç nokta tıklanmadı, çıkılıyor.")
+        return
+
+    # --- Kullanıcıdan her tıklanan nokta için hangi landmark'a karşılık geldiğini iste ---
+    print(f"\nReferans kare: {reference_frame_index}. Toplam {len(collected_points)} nokta toplandı "
+          f"(farklı karelerden, hepsi referans kareye çevrildi).")
+    print("Şimdi her nokta için hangi saha noktasına karşılık geldiğini gir.")
+    print(f"Geçerli isimler: {list(config.PITCH_LANDMARKS_METERS.keys())}\n")
+
+    result = {}
+    for idx, p in enumerate(collected_points, start=1):
+        landmark_name = input(
+            f"Nokta {idx} (kare {p['source_frame_idx']}'ten, referansa göre "
+            f"x={p['ref_x']:.1f}, y={p['ref_y']:.1f}) -> landmark ismi: "
+        ).strip()
+        if landmark_name in config.PITCH_LANDMARKS_METERS:
+            result[landmark_name] = (round(p["ref_x"], 1), round(p["ref_y"], 1))
+        else:
+            print(f"  UYARI: '{landmark_name}' tanınmıyor, bu nokta atlanacak.")
+
+    print("\n" + "=" * 70)
+    print("Aşağıdaki İKİ bloğu doğrudan config.py'ye yapıştır:")
+    print("=" * 70)
+    print("1) SOURCE_CALIBRATION_POINTS'i şununla DEĞİŞTİR:")
+    print("SOURCE_CALIBRATION_POINTS = {")
+    for name, (x, y) in result.items():
+        print(f'    "{name}": ({x}, {y}),')
+    print("}")
+    print()
+    print("2) CALIBRATION_FRAME_INDEX'i şununla DEĞİŞTİR (ÖNEMLİ, unutma!):")
+    print(f"CALIBRATION_FRAME_INDEX = {reference_frame_index}")
+    print("=" * 70)
 
 
 def run_interactive_calibration(video_path: str, start_frame_index: int):
@@ -260,6 +518,14 @@ def parse_args():
         "--save-frame-only", action="store_true",
         help="Ekranı olmayan ortamlar için: sadece seçilen kareyi PNG olarak kaydet",
     )
+    parser.add_argument(
+        "--multi-frame", action="store_true",
+        help=(
+            "Referans kareden ileri doğru oynatarak, videonun FARKLI ANLARINDAN "
+            "nokta toplamayı sağlayan gelişmiş mod (bkz. run_multiframe_calibration "
+            "docstring'i). Sahanın tamamı tek bir karede görünmüyorsa kullan."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -283,7 +549,10 @@ if __name__ == "__main__":
             start_index = resolve_start_frame_index(cap, args)
             cap.release()
 
-            run_interactive_calibration(args.input, start_index)
+            if args.multi_frame:
+                run_multiframe_calibration(args.input, start_index)
+            else:
+                run_interactive_calibration(args.input, start_index)
         except cv2.error as e:
             print(f"\nHATA: Ekran açılamadı ({e}).")
             print("Muhtemelen ekranı olmayan (headless) bir ortamdasın.")
