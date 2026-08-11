@@ -33,6 +33,7 @@ from modules.team_classifier import TeamClassifier
 from modules.perspective_transformer import PerspectiveTransformer
 from modules.camera_motion_tracker import CameraMotionTracker
 from modules.data_exporter import DataExporter
+from modules.field_point_tracker import FieldPointTracker
 
 
 def parse_args():
@@ -86,6 +87,11 @@ def main():
     # CameraMotionTracker de state taşır (önceki karenin gri tonlaması,
     # takip noktaları, birikimli hareket matrisi) -- döngü dışında bir kere oluşturuluyor.
     motion_tracker = CameraMotionTracker()
+
+    # --- Adım 7 için: FieldPointTracker, futbol sahası köşelerini otomatik olarak
+    # tespit eder ve sahne kesintilerinde yeniden tespit ederek noktaların
+    # kaymasını (drift) önler. State taşıdığından döngü dışında bir kere oluşturuluyor.
+    field_point_tracker = FieldPointTracker(use_line_detection=True)
 
     # --- Adım 1 için: Video okuma/yazma nesnesini context manager ile aç ---
     # 'with' kullanımı, video dosyalarının işlem bitince (hata olsa bile)
@@ -147,11 +153,30 @@ def main():
                 for det in all_tracked:
                     det["pitch_x"], det["pitch_y"], det["on_pitch"] = None, None, None
 
-            # 8) Bu karenin tüm verisini dışa aktarım için biriktir -- Adım 6
+             # 8) Bu karenin tüm verisini dışa aktarım için biriktir -- Adım 6
             exporter.append_frame_data(frame_idx, all_tracked)
+
+            # 8.5) Futbol sahası noktalarını tespit et ve sahne kesintilerini algıla -- Adım 7
+            #
+            # İLK KARE: Noktaları otomatik olarak tespit et
+            if frame_idx == config.CALIBRATION_FRAME_INDEX:
+                field_points = field_point_tracker.detect_field_points_in_frame(frame, frame_idx)
+                field_point_tracker.field_points.update(field_points)
+                print(f"[Adım 7] İlk karede {len(field_points)} saha noktası tespit edildi.")
+            
+            # DİĞER KARELER: Sahne kesintisini kontrol et
+            elif frame_idx > config.CALIBRATION_FRAME_INDEX:
+                is_scene_cut = field_point_tracker.detect_scene_cut(frame)
+                if is_scene_cut:
+                    # Sahne kesintisi algılandı → Noktaları yeniden tespit et (kayması önle)
+                    field_point_tracker.redetect_points_on_scene_cut(frame, frame_idx)
 
             # 9) Tespitleri frame üzerine görsel olarak çiz
             annotated_frame = vp.draw_detections(frame, all_tracked)
+            
+            # 9.5) Futbol sahası noktalarını frame üzerine çiz (if they have been detected)
+            if frame_idx >= config.CALIBRATION_FRAME_INDEX and len(field_point_tracker.field_points) > 0:
+                annotated_frame = field_point_tracker.draw_field_points(annotated_frame)
 
             # 10) Frame numarasını debug amaçlı sol üste yazalım
             import cv2
@@ -180,6 +205,18 @@ def main():
         exporter.export_to_csv()
         exporter.export_to_sql()
         exporter.export_distance_summary()
+        
+        # --- Adım 7: Futbol sahası noktalarını dışa aktarım ---
+        print("\n" + "=" * 60)
+        print("FUTBOL SAHASI NOKTALARININ DIŞA AKTARIMI (Adım 7)")
+        print("=" * 60)
+        field_points_json_path = os.path.join(config.EXPORT_DIR, "field_points.json")
+        field_points_pickle_path = os.path.join(config.EXPORT_DIR, "field_points.pkl")
+        detection_history_path = os.path.join(config.EXPORT_DIR, "field_point_detection_history.json")
+        
+        field_point_tracker.export_to_json(field_points_json_path)
+        field_point_tracker.export_to_pickle(field_points_pickle_path)
+        field_point_tracker.export_detection_history(detection_history_path)
 
     print("\nİşlem tamamlandı!")
     print(f"Çıktı videosu şurada: {args.output}")
