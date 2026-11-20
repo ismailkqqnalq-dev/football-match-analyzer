@@ -3,7 +3,7 @@ main.py
 -------
 Projenin giriş noktası (entry point).
 
-ŞU ANKİ DURUM (Adım 1 + 2 + 3 + 4 + 5 + 6 tamamlandı):
+ŞU ANKİ DURUM (Adım 1 + 2 + 3 + 4 + 5 + 6 + 7 + 8 tamamlandı):
     Video okunuyor -> YOLO ile oyuncu/top tespiti yapılıyor ->
     DeepSORT ile oyunculara kalıcı ID atanıyor, top ayrıca takip ediliyor ->
     forma renklerine göre K-Means ile Takım A / Takım B / Hakem ayrımı yapılıyor ->
@@ -13,7 +13,9 @@ Projenin giriş noktası (entry point).
     utils/calibrate_homography.py) -> kutular + ID'ler + takım renkleri
     çiziliyor -> yeni video olarak kaydediliyor -> HER KAREDEKİ tüm veri
     (piksel + saha koordinatları, takım, ID) biriktirilip video bitince
-    CSV + SQLite veritabanına ve oyuncu başına mesafe/hız özetine yazılıyor.
+    CSV + SQLite veritabanına, oyuncu mesafe/hız özetine, Adım 7 taktik analiz
+    raporuna ve Adım 8 Taktik & Scouting ML raporlarına (xP/xT, oyuncu rol
+    kümeleme, tempo/anomali tespiti) yazılıyor.
 
 Kullanım:
     python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4
@@ -36,6 +38,7 @@ from modules.perspective_transformer import PerspectiveTransformer
 from modules.camera_motion_tracker import CameraMotionTracker
 from modules.data_exporter import DataExporter
 from modules.match_analytics import MatchAnalyzer
+from modules.ml_analyzer import MLAnalyzer
 
 
 def parse_args():
@@ -61,6 +64,10 @@ def parse_args():
         "--no-analytics", action="store_true",
         help="Video bitiminde Adım 7 taktik analiz ve ısı haritası üretimini atla"
     )
+    parser.add_argument(
+        "--no-ml", action="store_true",
+        help="Video bitiminde Adım 8 taktik ve scouting ML analizini (xP/xT, rol kümeleme, tempo/anomali) atla"
+    )
     return parser.parse_args()
 
 
@@ -68,7 +75,7 @@ def main():
     args = parse_args()
 
     print("=" * 60)
-    print("FUTBOL MAÇ ANALİZ SİSTEMİ - Adım 1-7 Pipeline (dinamik kamera telafili)")
+    print("FUTBOL MAÇ ANALİZ SİSTEMİ - Adım 1-8 Pipeline (dinamik kamera telafili)")
     print("=" * 60)
 
     # --- Adım 2 için: YOLO dedektörünü bir kere yükle (her frame'de yeniden yükleme!) ---
@@ -186,6 +193,7 @@ def main():
         exporter.export_to_sql()
         exporter.export_distance_summary()
 
+        analytics_summary = None
         if config.GENERATE_ANALYTICS_REPORT and not args.no_analytics:
             print("\n" + "=" * 60)
             print("TAKTİK ANALİZ VE ISI HARİTASI (Adım 7)")
@@ -201,6 +209,34 @@ def main():
             print(
                 f"Pas Özeti -> Tamamlanan: {passes['total_completed_passes']} | "
                 f"Top Kaybı: {passes['total_turnovers']}"
+            )
+
+        if config.GENERATE_ML_REPORT and not args.no_ml:
+            print("\n" + "=" * 60)
+            print("TAKTİK VE SCOUTING ML MOTORU (Adım 8)")
+            print("=" * 60)
+            ml_analyzer = MLAnalyzer(
+                exporter.to_dataframe(),
+                fps=vp.fps,
+                analytics_summary=analytics_summary,
+            )
+            ml_summary = ml_analyzer.export_all()
+            xp = ml_summary["xp_modeling"]
+            best_m = next((m for m in xp["models"] if m["model_name"] == xp["selected_model"]), None)
+            cl = ml_summary["player_clustering"]
+            tp = ml_summary["tempo_and_anomalies"]
+            if best_m is not None:
+                print(
+                    f"xP Model ({xp['selected_model']}) -> ROC-AUC: {best_m['test']['roc_auc']} | "
+                    f"PR-AUC: {best_m['test']['pr_auc']} | Brier: {best_m['test']['brier_score']}"
+                )
+            print(
+                f"Rol Kümeleme -> Oyuncu: {cl['eligible_players']} | "
+                f"Optimal k: {cl['optimal_k']} | Silhouette: {cl['best_silhouette']}"
+            )
+            print(
+                f"Tempo & Anomali -> Tempo Düşüşü: {tp['tempo_drop_count']} | "
+                f"Yorgunluk: {tp['fatigue_players_count']} | Anomali: {tp['total_anomalies']}"
             )
 
     print("\nİşlem tamamlandı!")

@@ -18,7 +18,9 @@ torchvision==0.20.1             # embedder'ın CNN ağırlıkları için gerekli
 # --- Sayısal işlem / Veri mühendisliği ---
 numpy==1.26.4
 pandas==2.2.3
-scikit-learn==1.5.2              # K-Means kümeleme (Adım 4: takım sınıflandırma)
+scipy==1.17.1                    # İstatistiksel testler ve konveks örtü (Adım 8: ML motoru)
+scikit-learn==1.5.2              # K-Means, xP sınıflandırma, PCA, IsolationForest (Adım 4 & 8)
+matplotlib==3.10.9               # Taktik ML grafikleri (Adım 8)
 
 # --- Veritabanı (SQL) - Adım 6 ---
 # NOT: sqlite3 Python standart kütüphanesinde hazır gelir, ekstra kurulum

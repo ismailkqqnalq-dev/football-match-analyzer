@@ -30,10 +30,12 @@ Ek CLI seçenekleri:
 - `--batch-size N`: YOLO çıkarımı için batch boyutu (varsayılan: CUDA aktifse `8`, CPU'da `1`).
 - `--max-frames N`: Hızlı test/önizleme için yalnızca ilk `N` kareyi işler.
 - `--no-analytics`: Video bitiminde Adım 7 taktik analiz ve ısı haritası üretimini atlar.
+- `--no-ml`: Video bitiminde Adım 8 taktik ve scouting ML analizini (`xP`/`xT`, rol kümeleme, tempo/anomali) atlar.
 
 Mevcut takip verisinden videoyu tekrar çalıştırmadan bağımsız analiz üretmek için:
 ```bash
 python modules/match_analytics.py --input data/exports/tracking_data.csv
+python modules/ml_analyzer.py --input data/exports/tracking_data.csv
 ```
 
 Çıktılar:
@@ -42,6 +44,7 @@ python modules/match_analytics.py --input data/exports/tracking_data.csv
 - `data/exports/player_distance_summary.csv`  -> oyuncu başına yumuşatılmış mesafe, hız ve FIFA hız bandı / sprint özeti
 - `data/exports/match_analytics_summary.json` ve `possession_timeline.csv` -> topa sahip olma, pas ağı ve takım şekli özeti
 - `data/exports/heatmaps/` -> takım ve öne çıkan oyuncular için 2D ısı haritası PNG görselleri
+- `data/exports/ml_reports/` -> Adım 8 ML çıktıları (`ml_analysis_summary.json`, `ml_analysis_report.md`, `ml_player_profiles.csv`, `ml_tempo_windows.csv`, `ml_anomalies.csv`, `ml_pass_predictions.csv`, `xp_model_comparison.png`, `xt_spatial_heatmap.png`, `player_clusters_pca.png`, `tempo_anomaly_timeline.png`)
 
 ## Pipeline Adımları
 | Adım | Modül | Görev |
@@ -53,8 +56,21 @@ python modules/match_analytics.py --input data/exports/tracking_data.csv
 | 5 | `modules/perspective_transformer.py` + `modules/camera_motion_tracker.py` | Homografi + optical flow ile kamera hareketi telafisi -> saha (metre) koordinatları |
 | 6 | `modules/data_exporter.py` | Pandas ile biriktirme, takım backfill + top interpolasyonu, CSV/SQLite + FIFA hız bantlı özet |
 | 7 | `modules/match_analytics.py` | Topa sahip olma, pas tespiti/ağı, takım şekli ve 2D ısı haritası üretimi |
+| 8 | `modules/ml_analyzer.py` | Taktik & Scouting ML Motoru: `xP` pas başarı olasılığı, `xT` mekansal tehdit, Silhouette + 2B PCA oyuncu rol kümeleme, tempo/yorgunluk ve anomali tespiti |
 
 `config/config.py` tüm sabitleri (yollar, eşik değerleri, model parametreleri) tek yerde toplar.
+
+## Taktik ve Scouting ML Motoru (Adım 8)
+`modules/ml_analyzer.py`, hem kalibre edilmiş (`pitch_x`, `pitch_y` metre) hem de kalibresiz (`pixel_fallback`) takip verilerinde çalışır:
+- **Pas Başarı Olasılığı (`xP`) ve Beklenen Tehdit (`xT`)**: Eksik/NULL değer denetimi (nedensel `team` işleme), ön işlemeden önce kesin kronolojik eğitim/doğrulama/test bölünmesi (sıfır veri sızıntısı), `DummyClassifier` baz çizgisi ile `LogisticRegression`, `RandomForestClassifier` ve `GradientBoostingClassifier` karşılaştırması (F1, ROC-AUC, PR-AUC, Brier skoru, karmaşıklık matrisi, operasyonel ödünleşimler) ve 12×8 Markov `xT` ızgarası.
+- **Oyuncu Rol Kümeleme (`PCA` + `Silhouette`)**: Ortalama pozisyon, konveks örtü kapsama alanı, hız/sprint profili ve top kontrol metrikleriyle aday `k` değerleri arasında Silhouette skorunu ençoklayan kümeleme ve 2B PCA rol görselleştirmesi.
+- **Tempo Düşüşü / Yorgunluk ve Anomali Tespiti**: Kapsam farkındalıklı zaman pencereleri (kamera çıkışlarını yorgunluktan ayırır), oyuncu hız düşüş eğimleri ve `IsolationForest` + dayanıklı MAD z-skoru ile formasyon dışı konum/hız anomalisi tespiti.
+
+Bağımsız çalıştırma seçenekleri:
+```bash
+python modules/ml_analyzer.py --input data/exports/tracking_data.csv --output-dir data/exports/ml_reports
+python modules/ml_analyzer.py --input data/exports/tracking_data.db --no-plots
+```
 
 ## Testler
 Otomatik birim ve entegrasyon testlerini çalıştırmak için:
@@ -111,9 +127,11 @@ football_analysis_system/
 │   ├── perspective_transformer.py   # Adım 5
 │   ├── camera_motion_tracker.py     # Adım 5 eklentisi (kamera hareketi telafisi)
 │   ├── data_exporter.py             # Adım 6
-│   └── match_analytics.py           # Adım 7 (taktik analiz ve ısı haritaları)
+│   ├── match_analytics.py           # Adım 7 (taktik analiz ve ısı haritaları)
+│   └── ml_analyzer.py               # Adım 8 (Taktik & Scouting ML motoru)
 ├── tests/
-│   └── test_pipeline.py             # otomatik birim/entegrasyon testleri
+│   ├── test_pipeline.py             # Adım 1-7 birim/entegrasyon testleri
+│   └── test_ml_analyzer.py          # Adım 8 ML motoru testleri
 ├── utils/
 │   ├── calibrate_homography.py      # homografi kalibrasyon yardımcı aracı
 │   └── train_custom_yolo.py         # (opsiyonel) fine-tune eğitim betiği
