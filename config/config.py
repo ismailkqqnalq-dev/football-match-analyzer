@@ -29,6 +29,9 @@ EXPORT_CSV_FILENAME = "tracking_data.csv"              # ham, kare-kare takip ve
 EXPORT_SQL_FILENAME = "tracking_data.db"                # aynı veri, SQLite veritabanı olarak
 EXPORT_SQL_TABLE_NAME = "tracking_data"
 EXPORT_DISTANCE_SUMMARY_FILENAME = "player_distance_summary.csv"  # oyuncu başına özet
+EXPORT_ANALYTICS_SUMMARY_FILENAME = "match_analytics_summary.json"
+EXPORT_POSSESSION_FILENAME = "possession_timeline.csv"
+EXPORT_HEATMAP_DIR = os.path.join(EXPORT_DIR, "heatmaps")
 
 # Mesafe/hız hesabı (saha koordinatları üzerinden), sadece ARDIŞIK karelerde yapılır.
 # Aradan kare kaçarsa (ör. oyuncu geçici olarak kayboldu) o segment mesafeye
@@ -39,6 +42,18 @@ DISTANCE_CALC_MAX_FRAME_GAP = 1
 DISTANCE_CALC_EXCLUDE_PREDICTED = True
 # Saha dışı (on_pitch=False) sayılan noktalar da mesafeye katılmaz (kalibrasyon
 # hatası ya da kenar çizgisi dışına taşan tespitlerin mesafeyi şişirmesini önler).
+
+# Mesafe ve hız hesaplamasında bbox titremesini azaltmak için yumuşatma ve fiziksel sınırlar
+SPEED_SMOOTHING_WINDOW_FRAMES = 5
+MAX_REALISTIC_PLAYER_SPEED_KMH = 38.0
+
+# FIFA hız bantları (km/saat) ve sprint süresi eşiği
+SPEED_ZONE_WALKING_MAX_KMH = 7.0
+SPEED_ZONE_JOGGING_MAX_KMH = 14.0
+SPEED_ZONE_RUNNING_MAX_KMH = 20.0
+SPEED_ZONE_HSR_MAX_KMH = 25.0
+SPRINT_MIN_DURATION_SEC = 0.5
+
 MODELS_DIR = os.path.join(BASE_DIR, "models")
 
 # Örnek varsayılan giriş/çıkış video yolları (main.py içinde override edilebilir)
@@ -75,6 +90,11 @@ DEFAULT_OUTPUT_VIDEO = os.path.join(OUTPUT_VIDEO_DIR, "match_sample_annotated.mp
 # dosyasındaki "names:" listesinin SIRASINI birebir buraya kopyala -- sıra
 # yanlışsa sınıf ID'leri yanlış isimlere eşlenir.)
 YOLO_MODEL_PATH = os.path.join(MODELS_DIR, "yolov8x.pt")  # veya kendi fine-tune modelin
+
+# YOLO çıkarım (inference) çözünürlüğü, FP16 ve batch ayarları
+DETECTION_IMG_SIZE = 960
+DETECTION_HALF = True
+DETECTION_BATCH_SIZE = 8
 
 # Tespit güven eşiği: Bu değerin altındaki tespitler göz ardı edilir.
 DETECTION_CONFIDENCE_THRESHOLD = 0.3
@@ -148,8 +168,9 @@ TRACKER_NN_BUDGET = 100
 # (Bu embedder torch/torchvision gerektirir.)
 TRACKER_EMBEDDER = "mobilenet"
 
-# GPU varsa embedder'ı hızlandırmak için True yap (torch CUDA gerektirir).
-TRACKER_EMBEDDER_GPU = False
+# GPU varsa embedder'ı hızlandırmak için True yap (CUDA yoksa PlayerTracker otomatik CPU'ya düşer).
+TRACKER_EMBEDDER_GPU = True
+TRACKER_EMBEDDER_HALF = True
 
 # ------------------------------------------------------------------
 # TOP TAKİBİ (BALL TRACKING) AYARLARI
@@ -157,9 +178,11 @@ TRACKER_EMBEDDER_GPU = False
 # Top, oyunculardan farklı olarak DeepSORT'un appearance-embedding mantığıyla
 # takip edilmez (küçük, tekdüze görünümlü bir nesne için görünüm embedding'i
 # güvenilir değildir). Bunun yerine "en yüksek güven skorlu tek top tespiti"
-# + "kayıp karelerde son bilinen konumu kısa süre koru" mantığıyla basit bir
-# tekil (singleton) takip yapıyoruz.
+# + "kayıp karelerde sönümlenen hızla konum tahmini" mantığıyla tekil takip yapıyoruz.
 BALL_MAX_MISSING_FRAMES = 15  # top bu kadar karede tespit edilmezse "kayıp" sayılır
+BALL_VELOCITY_DAMPING = 0.85
+BALL_MAX_VELOCITY_PX_PER_FRAME = 150.0
+BALL_INTERPOLATE_MAX_GAP = 15
 
 # ------------------------------------------------------------------
 # TAKIM SINIFLANDIRMA (K-MEANS) AYARLARI
@@ -191,14 +214,19 @@ TEAM_CLASSIFIER_REFEREE_SIZE_RATIO_THRESHOLD = 0.6
 #   1) Fine-tune futbol modeli kullanılıyorsa (hakem zaten YOLO'dan ayrı sınıf)
 #   2) TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT=False ise (görüntüde ayırt
 #      edilebilir bir hakem yok/olmadığı varsayılıyor)
-# Küme sayısı, iki farklı sebepten 2'ye düşebilir:
-#   1) Fine-tune futbol modeli kullanılıyorsa (hakem zaten YOLO'dan ayrı sınıf)
-#   2) TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT=False ise (görüntüde ayırt
-#      edilebilir bir hakem yok/olmadığı varsayılıyor)
 TEAM_CLASSIFIER_N_CLUSTERS = (
     2 if USES_FINE_TUNED_FOOTBALL_MODEL
     else (3 if TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT else 2)
 )
+
+# Renk uzayı ("LAB" ışık/gölge değişimlerine daha dayanıklıdır, "BGR" klasik mod)
+TEAM_COLOR_SPACE = "LAB"
+# Fit sonrası yeni gelen bir track_id'nin takımını kalıcı olarak önbelleğe
+# kilitlemeden önce görülmesi gereken minimum örnek sayısı
+TEAM_CLASSIFIER_MIN_SAMPLES_FOR_LOCK = 3
+# Video bitiminde K-Means fit edilmeden önceki ilk karelerdeki None takım
+# etiketlerini sonradan öğrenilen track_id -> team eşlemesiyle doldur
+TEAM_CLASSIFIER_BACKFILL_TEAMS = True
 
 # K-Means'i "fit" etmeden (eğitmeden) önce en az kaç FARKLI oyuncunun (track_id)
 # forma rengi örneği toplanmalı? Çok erken fit edersek (örn. sadece 2-3 oyuncu
@@ -380,14 +408,26 @@ MINIMAP_OVERLAY_POSITION = "bottom_right"  # "bottom_right" | "bottom_left" | "t
 # ------------------------------------------------------------------
 # VİDEO İŞLEME / ÇİZİM AYARLARI
 # ------------------------------------------------------------------
-BBOX_COLOR_DEFAULT = (0, 255, 0)   # BGR formatında yeşil (henüz takımı bilinmeyen nesneler için)
-BBOX_COLOR_BALL = (0, 165, 255)    # BGR formatında turuncu (top için)
-BBOX_COLOR_TEAM_A = (255, 191, 0)  # canlı mavi
-BBOX_COLOR_TEAM_B = (0, 0, 255)    # kırmızı
-BBOX_COLOR_REFEREE = (0, 255, 255) # sarı
+BBOX_COLOR_DEFAULT = (0, 255, 0)      # BGR formatında yeşil (henüz takımı bilinmeyen nesneler için)
+BBOX_COLOR_BALL = (0, 165, 255)       # BGR formatında turuncu (top için)
+BBOX_COLOR_TEAM_A = (255, 191, 0)     # canlı mavi
+BBOX_COLOR_TEAM_B = (0, 0, 255)       # kırmızı
+BBOX_COLOR_REFEREE = (0, 255, 255)    # sarı
+BBOX_COLOR_GOALKEEPER = (255, 0, 255) # mor/magenta (kaleci için)
 BBOX_THICKNESS = 2
 ID_FONT_SCALE = 0.6
 ID_FONT_THICKNESS = 2
 
 # Çıkış videosunun codec'i. 'mp4v' çoğu platformda .mp4 için uyumludur.
 VIDEO_CODEC = "mp4v"
+
+# ------------------------------------------------------------------
+# TAKTİK ANALİZ VE ISI HARİTASI (ADIM 7) AYARLARI
+# ------------------------------------------------------------------
+GENERATE_ANALYTICS_REPORT = True
+POSSESSION_MAX_PLAYER_BALL_DIST_M = 2.5
+POSSESSION_MAX_PLAYER_BALL_DIST_PX = 80.0
+POSSESSION_SMOOTHING_FRAMES = 5
+PASS_MAX_GAP_SEC = 4.0
+PASS_MIN_BALL_MOVE_M = 2.0
+PASS_MIN_BALL_MOVE_PX = 35.0

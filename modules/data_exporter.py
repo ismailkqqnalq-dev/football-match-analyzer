@@ -35,6 +35,7 @@ NEDEN BELLEKTE BİRİKTİRİP SONDA YAZIYORUZ (her karede diske yazmak yerine)?
 import os
 import sqlite3
 import sys
+from collections import Counter
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -110,6 +111,185 @@ class DataExporter:
             })
 
     # ----------------------------------------------------------------
+    def backfill_teams(self, team_map: Optional[Dict] = None) -> int:
+        """
+        K-Means fit edilmeden önceki ilk karelerde `team=None` kalan oyuncu
+        satırlarını, sonradan kesinleşen `track_id -> team` eşlemesiyle
+        geriye dönük doldurur.
+
+        Dönüş: doldurulan satır sayısı.
+        """
+        if not self.records:
+            return 0
+
+        # Kayıtlardan her track_id için en sık görülen geçerli takımı çıkar
+        counts_by_tid: Dict[str, Counter] = {}
+        for rec in self.records:
+            if rec.get("class_name") == config.BALL_CLASS_NAME:
+                continue
+            team = rec.get("team")
+            if team is not None and not pd.isna(team):
+                tid_key = str(rec.get("track_id"))
+                counts_by_tid.setdefault(tid_key, Counter())[team] += 1
+
+        lookup: Dict[str, str] = {
+            tid: counter.most_common(1)[0][0]
+            for tid, counter in counts_by_tid.items()
+        }
+
+        if team_map:
+            for tid, team in team_map.items():
+                if team is not None and not pd.isna(team):
+                    lookup[str(tid)] = team
+
+        filled = 0
+        for rec in self.records:
+            if rec.get("class_name") == config.BALL_CLASS_NAME:
+                continue
+            team = rec.get("team")
+            if team is None or pd.isna(team):
+                resolved = lookup.get(str(rec.get("track_id")))
+                if resolved is not None:
+                    rec["team"] = resolved
+                    filled += 1
+
+        return filled
+
+    # ----------------------------------------------------------------
+    def interpolate_ball_positions(self, max_gap: int = config.BALL_INTERPOLATE_MAX_GAP) -> int:
+        """
+        Gerçek top tespitleri (is_predicted=False) arasındaki kısa boşlukları
+        doğrusal olarak interpole eder; mevcut tahmin kayıtlarını günceller veya
+        eksik ara kareler için yeni tahmin kayıtları ekler.
+
+        Dönüş: interpole edilen kare sayısı.
+        """
+        if not self.records or max_gap < 2:
+            return 0
+
+        ball_by_frame: Dict[int, Dict] = {}
+        real_by_frame: Dict[int, Dict] = {}
+        for rec in self.records:
+            if rec.get("class_name") != config.BALL_CLASS_NAME:
+                continue
+            f_idx = int(rec["frame_idx"])
+            if rec.get("is_predicted") is False:
+                real_by_frame[f_idx] = rec
+                ball_by_frame[f_idx] = rec
+            elif f_idx not in ball_by_frame:
+                ball_by_frame[f_idx] = rec
+
+        if len(real_by_frame) < 2:
+            return 0
+
+        real_frames = sorted(real_by_frame.keys())
+        interpolated_count = 0
+
+        for i in range(len(real_frames) - 1):
+            f1 = real_frames[i]
+            f2 = real_frames[i + 1]
+            gap = f2 - f1
+            if not (1 < gap <= max_gap):
+                continue
+
+            r1 = real_by_frame[f1]
+            r2 = real_by_frame[f2]
+
+            has_pitch = (
+                r1.get("pitch_x") is not None and not pd.isna(r1.get("pitch_x"))
+                and r1.get("pitch_y") is not None and not pd.isna(r1.get("pitch_y"))
+                and r2.get("pitch_x") is not None and not pd.isna(r2.get("pitch_x"))
+                and r2.get("pitch_y") is not None and not pd.isna(r2.get("pitch_y"))
+            )
+
+            for f in range(f1 + 1, f2):
+                alpha = (f - f1) / gap
+                bx1 = round(float(r1["bbox_x1"]) + alpha * (float(r2["bbox_x1"]) - float(r1["bbox_x1"])), 1)
+                by1 = round(float(r1["bbox_y1"]) + alpha * (float(r2["bbox_y1"]) - float(r1["bbox_y1"])), 1)
+                bx2 = round(float(r1["bbox_x2"]) + alpha * (float(r2["bbox_x2"]) - float(r1["bbox_x2"])), 1)
+                by2 = round(float(r1["bbox_y2"]) + alpha * (float(r2["bbox_y2"]) - float(r1["bbox_y2"])), 1)
+                foot_x, foot_y = PerspectiveTransformer.get_foot_position([bx1, by1, bx2, by2])
+                pixel_x = round(foot_x, 1)
+                pixel_y = round(foot_y, 1)
+
+                if has_pitch:
+                    px = round(float(r1["pitch_x"]) + alpha * (float(r2["pitch_x"]) - float(r1["pitch_x"])), 2)
+                    py = round(float(r1["pitch_y"]) + alpha * (float(r2["pitch_y"]) - float(r1["pitch_y"])), 2)
+                    margin = 1.0
+                    on_pitch = (
+                        -margin <= px <= config.PITCH_LENGTH_M + margin
+                        and -margin <= py <= config.PITCH_WIDTH_M + margin
+                    )
+                else:
+                    px, py, on_pitch = None, None, None
+
+                ts = round(f / self.fps, 3) if self.fps else None
+
+                if f in ball_by_frame:
+                    target = ball_by_frame[f]
+                    if target.get("is_predicted") is False:
+                        continue
+                    target["timestamp_sec"] = ts
+                    target["confidence"] = None
+                    target["is_predicted"] = True
+                    target["bbox_x1"] = bx1
+                    target["bbox_y1"] = by1
+                    target["bbox_x2"] = bx2
+                    target["bbox_y2"] = by2
+                    target["pixel_x"] = pixel_x
+                    target["pixel_y"] = pixel_y
+                    target["pitch_x"] = px
+                    target["pitch_y"] = py
+                    target["on_pitch"] = on_pitch
+                    interpolated_count += 1
+                else:
+                    new_rec = {
+                        "frame_idx": f,
+                        "timestamp_sec": ts,
+                        "track_id": r1.get("track_id", "ball"),
+                        "class_name": config.BALL_CLASS_NAME,
+                        "team": None,
+                        "confidence": None,
+                        "is_predicted": True,
+                        "bbox_x1": bx1,
+                        "bbox_y1": by1,
+                        "bbox_x2": bx2,
+                        "bbox_y2": by2,
+                        "pixel_x": pixel_x,
+                        "pixel_y": pixel_y,
+                        "pitch_x": px,
+                        "pitch_y": py,
+                        "on_pitch": on_pitch,
+                    }
+                    self.records.append(new_rec)
+                    ball_by_frame[f] = new_rec
+                    interpolated_count += 1
+
+        self.records.sort(key=lambda r: (int(r["frame_idx"]), str(r.get("track_id"))))
+        return interpolated_count
+
+    # ----------------------------------------------------------------
+    def postprocess(self, team_map: Optional[Dict] = None) -> Dict[str, int]:
+        """
+        Video işleme bittikten sonra veriyi temizler: ilk karelerdeki eksik
+        takım etiketlerini geriye dönük doldurur ve top boşluklarını interpole eder.
+        """
+        backfilled = (
+            self.backfill_teams(team_map=team_map)
+            if config.TEAM_CLASSIFIER_BACKFILL_TEAMS
+            else 0
+        )
+        interpolated = self.interpolate_ball_positions()
+        print(
+            f"[DataExporter] Postprocess tamamlandı: {backfilled} takım etiketi "
+            f"dolduruldu, {interpolated} top karesi interpole edildi."
+        )
+        return {
+            "backfilled_teams": backfilled,
+            "interpolated_ball_frames": interpolated,
+        }
+
+    # ----------------------------------------------------------------
     def to_dataframe(self) -> pd.DataFrame:
         """Biriken tüm kayıtları bir pandas DataFrame olarak döndürür."""
         return pd.DataFrame(self.records)
@@ -168,20 +348,12 @@ class DataExporter:
     def export_distance_summary(self, output_path: Optional[str] = None) -> Optional[str]:
         """
         Saha (metre) koordinatlarını kullanarak HER OYUNCU için:
-            - toplam kat edilen mesafe (metre)
-            - ortalama hız (km/saat)
-            - maksimum ANLIK hız (km/saat, iki ardışık kare arası)
+            - toplam kat edilen mesafe (metre, yumuşatılmış + hız filtreli)
+            - aktif takip süresi (saniye)
+            - ortalama ve maksimum hız (km/saat)
+            - FIFA hız bantlarına göre mesafeler (walking/jogging/running/HSR/sprint)
+            - toplam sprint sayısı
         hesaplayıp bir özet CSV'sine yazar.
-
-        NEDEN SADECE ARDIŞIK KARELER KULLANILIYOR:
-        Bir oyuncu birkaç kare kaybolup (ör. başka bir oyuncunun arkasında
-        kalıp) sonra tekrar tespit edilirse, o iki nokta arasındaki "mesafe"
-        gerçek koşu mesafesi DEĞİL, düz bir çizgidir ve kare sayısı azdır --
-        bu da sahte, çok yüksek bir "hız" hesaplanmasına yol açar. Bu yüzden
-        sadece frame_idx farkı config.DISTANCE_CALC_MAX_FRAME_GAP değerine
-        eşit ya da altında olan ardışık satır çiftleri hesaba katılır.
-        Benzer şekilde, Kalman filtresinin TAHMİN ettiği (gerçek tespit
-        olmayan) konumlar da varsayılan ayarla hesaba katılmaz.
 
         Dönüş: yazılan dosyanın tam yolu, ya da hesaplanacak veri yoksa None.
         """
@@ -191,10 +363,8 @@ class DataExporter:
             print("[DataExporter] Özet çıkarılacak veri yok (records boş).")
             return None
 
-        # Sadece oyuncuları al (topun "mesafe koştuğu" kavramsal olarak
-        # anlamlı değil / farklı bir analiz konusu -- top hızını istersen
-        # ayrı bir metodla ekleyebiliriz).
-        players_df = df[df["class_name"] == "person"].copy()
+        # Tüm insan sınıflarını kapsa (COCO: {"person"}, fine-tune: {"player", "goalkeeper", "referee"})
+        players_df = df[df["class_name"].isin(config.HUMAN_CLASS_NAMES)].copy()
 
         # Saha koordinatı olmayan (kalibrasyon yapılmamış / homografi
         # üretilememiş) satırları ayıkla.
@@ -203,8 +373,7 @@ class DataExporter:
         if config.DISTANCE_CALC_EXCLUDE_PREDICTED:
             players_df = players_df[players_df["is_predicted"] != True]  # noqa: E712
 
-        # on_pitch açıkça False olanları ayıkla (None ise -- kalibrasyon
-        # bilgisi eksik demektir, zaten yukarıda dropna ile elenmiş olur).
+        # on_pitch açıkça False olanları ayıkla.
         players_df = players_df[players_df["on_pitch"] != False]  # noqa: E712
 
         if players_df.empty:
@@ -213,43 +382,131 @@ class DataExporter:
 
         players_df = players_df.sort_values(["track_id", "frame_idx"])
 
+        smooth_win = max(1, int(config.SPEED_SMOOTHING_WINDOW_FRAMES))
+        min_sprint_frames = (
+            max(2, int(round(self.fps * config.SPRINT_MIN_DURATION_SEC)))
+            if self.fps
+            else 2
+        )
+
         summary_rows = []
         for track_id, group in players_df.groupby("track_id"):
-            group = group.reset_index(drop=True)
+            group = group.sort_values("frame_idx").drop_duplicates(subset=["frame_idx"]).reset_index(drop=True)
 
-            # Ardışık satırlar arası fark
+            # Sürekli segmentlere böl (arada kayıp kare boşluğu varsa ayrı segment olur)
             frame_diff = group["frame_idx"].diff()
-            dx = group["pitch_x"].diff()
-            dy = group["pitch_y"].diff()
-            dist_segment = (dx ** 2 + dy ** 2) ** 0.5
+            segment_ids = (frame_diff.isna() | (frame_diff > config.DISTANCE_CALC_MAX_FRAME_GAP)).cumsum()
 
-            # Sadece kare farkı izin verilen aralıkta olan (yani ardışık,
-            # arada kayıp kare olmayan) segmentleri say.
-            valid_segment = frame_diff <= config.DISTANCE_CALC_MAX_FRAME_GAP
+            total_distance_m = 0.0
+            active_time_sec = 0.0
+            valid_speeds: List[float] = []
+            walking_m = 0.0
+            jogging_m = 0.0
+            running_m = 0.0
+            hsr_m = 0.0
+            sprint_m = 0.0
+            sprint_count = 0
 
-            total_distance_m = dist_segment[valid_segment].sum()
+            for _, seg in group.groupby(segment_ids):
+                seg = seg.reset_index(drop=True)
+                if len(seg) < 2:
+                    continue
 
-            # Anlık hız (km/saat) hesabı: sadece fps biliniyorsa mümkün.
-            max_speed_kmh = None
-            avg_speed_kmh = None
-            if self.fps:
-                dt_seconds = frame_diff[valid_segment] / self.fps
-                speeds_ms = dist_segment[valid_segment] / dt_seconds  # m/s
-                speeds_kmh = speeds_ms * 3.6
-                speeds_kmh = speeds_kmh.replace([float("inf"), -float("inf")], None).dropna()
-                if len(speeds_kmh) > 0:
-                    max_speed_kmh = round(speeds_kmh.max(), 2)
-                    avg_speed_kmh = round(speeds_kmh.mean(), 2)
+                sx = seg["pitch_x"].astype(float).rolling(
+                    window=smooth_win, center=True, min_periods=1
+                ).mean()
+                sy = seg["pitch_y"].astype(float).rolling(
+                    window=smooth_win, center=True, min_periods=1
+                ).mean()
+
+                seg_fdiff = seg["frame_idx"].diff()
+                dx = sx.diff()
+                dy = sy.diff()
+                dist_step = (dx ** 2 + dy ** 2) ** 0.5
+
+                if self.fps:
+                    dt_step = seg_fdiff / float(self.fps)
+                    speed_kmh = (dist_step / dt_step) * 3.6
+                    valid_step = (
+                        seg_fdiff.notna()
+                        & (seg_fdiff <= config.DISTANCE_CALC_MAX_FRAME_GAP)
+                        & (dt_step > 0)
+                        & speed_kmh.notna()
+                        & (speed_kmh <= config.MAX_REALISTIC_PLAYER_SPEED_KMH)
+                    )
+
+                    valid_dists = dist_step[valid_step]
+                    valid_dts = dt_step[valid_step]
+                    valid_spds = speed_kmh[valid_step]
+
+                    total_distance_m += float(valid_dists.sum())
+                    active_time_sec += float(valid_dts.sum())
+                    valid_speeds.extend(valid_spds.tolist())
+
+                    walking_m += float(valid_dists[valid_spds < config.SPEED_ZONE_WALKING_MAX_KMH].sum())
+                    jogging_m += float(valid_dists[
+                        (valid_spds >= config.SPEED_ZONE_WALKING_MAX_KMH)
+                        & (valid_spds < config.SPEED_ZONE_JOGGING_MAX_KMH)
+                    ].sum())
+                    running_m += float(valid_dists[
+                        (valid_spds >= config.SPEED_ZONE_JOGGING_MAX_KMH)
+                        & (valid_spds < config.SPEED_ZONE_RUNNING_MAX_KMH)
+                    ].sum())
+                    hsr_m += float(valid_dists[
+                        (valid_spds >= config.SPEED_ZONE_RUNNING_MAX_KMH)
+                        & (valid_spds < config.SPEED_ZONE_HSR_MAX_KMH)
+                    ].sum())
+                    sprint_m += float(valid_dists[valid_spds >= config.SPEED_ZONE_HSR_MAX_KMH].sum())
+
+                    # Ardışık sprint adımlarını say
+                    is_sprint = (valid_step & (speed_kmh >= config.SPEED_ZONE_HSR_MAX_KMH)).tolist()
+                    run_len = 0
+                    for flag in is_sprint:
+                        if flag:
+                            run_len += 1
+                        else:
+                            if run_len >= min_sprint_frames:
+                                sprint_count += 1
+                            run_len = 0
+                    if run_len >= min_sprint_frames:
+                        sprint_count += 1
+                else:
+                    valid_step = (
+                        seg_fdiff.notna()
+                        & (seg_fdiff <= config.DISTANCE_CALC_MAX_FRAME_GAP)
+                        & dist_step.notna()
+                    )
+                    total_distance_m += float(dist_step[valid_step].sum())
+
+            if self.fps and valid_speeds:
+                max_speed_kmh = round(max(valid_speeds), 2)
+                avg_speed_kmh = (
+                    round((total_distance_m / active_time_sec) * 3.6, 2)
+                    if active_time_sec > 0
+                    else 0.0
+                )
+            else:
+                max_speed_kmh = None
+                avg_speed_kmh = None
 
             team = group["team"].dropna().iloc[0] if group["team"].notna().any() else None
+            class_name = group["class_name"].dropna().iloc[0] if group["class_name"].notna().any() else None
 
             summary_rows.append({
                 "track_id": track_id,
+                "class_name": class_name,
                 "team": team,
                 "frames_tracked": len(group),
+                "active_time_sec": round(active_time_sec, 2) if self.fps else None,
                 "total_distance_m": round(total_distance_m, 1),
                 "avg_speed_kmh": avg_speed_kmh,
                 "max_speed_kmh": max_speed_kmh,
+                "walking_m": round(walking_m, 1) if self.fps else None,
+                "jogging_m": round(jogging_m, 1) if self.fps else None,
+                "running_m": round(running_m, 1) if self.fps else None,
+                "high_speed_running_m": round(hsr_m, 1) if self.fps else None,
+                "sprint_m": round(sprint_m, 1) if self.fps else None,
+                "sprint_count": sprint_count if self.fps else None,
             })
 
         summary_df = pd.DataFrame(summary_rows).sort_values("total_distance_m", ascending=False)

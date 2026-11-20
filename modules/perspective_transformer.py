@@ -324,6 +324,8 @@ class PerspectiveTransformer:
                 cv2.circle(minimap, (px, py), 6, config.BBOX_COLOR_TEAM_B, -1)
             elif det.get("team") == "Referee":
                 cv2.circle(minimap, (px, py), 6, config.BBOX_COLOR_REFEREE, -1)
+            elif det.get("team") == "Goalkeeper" or det.get("class_name") == "goalkeeper":
+                cv2.circle(minimap, (px, py), 6, config.BBOX_COLOR_GOALKEEPER, -1)
             else:
                 cv2.circle(minimap, (px, py), 6, config.BBOX_COLOR_DEFAULT, -1)
 

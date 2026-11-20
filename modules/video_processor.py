@@ -176,6 +176,8 @@ class VideoProcessor:
                 color = config.BBOX_COLOR_TEAM_B
             elif team == "Referee":
                 color = config.BBOX_COLOR_REFEREE
+            elif team == "Goalkeeper" or class_name == "goalkeeper":
+                color = config.BBOX_COLOR_GOALKEEPER
             else:
                 color = config.BBOX_COLOR_DEFAULT
 

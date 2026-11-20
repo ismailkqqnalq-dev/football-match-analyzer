@@ -13,10 +13,10 @@ YOLO model ağırlığı ilk çalıştırmada otomatik indirilir (internet gerek
 ya da `models/` klasörüne manuel olarak `.pt` dosyası koyabilirsiniz.
 
 ## Çalıştırma öncesi: Homografi kalibrasyonu (Adım 5 için gerekli)
-Saha (metre) koordinatları üretebilmek için, videonun ilk karesinde birkaç
+Saha (metre) koordinatları üretebilmek için, videonun uygun bir karesinde birkaç
 bilinen saha noktasını (köşe, orta yuvarlak vb.) işaretlemeniz gerekiyor:
 ```bash
-python utils/calibrate_homography.py --video data/input_videos/match_sample.mp4
+python utils/calibrate_homography.py --input data/input_videos/match_sample.mp4
 ```
 Bu adımı atlarsanız pipeline yine çalışır, sadece `pitch_x`/`pitch_y` alanları
 `None` kalır (piksel koordinatları ve video çıktısı etkilenmez).
@@ -26,22 +26,41 @@ Bu adımı atlarsanız pipeline yine çalışır, sadece `pitch_x`/`pitch_y` ala
 python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4
 ```
 
+Ek CLI seçenekleri:
+- `--batch-size N`: YOLO çıkarımı için batch boyutu (varsayılan: CUDA aktifse `8`, CPU'da `1`).
+- `--max-frames N`: Hızlı test/önizleme için yalnızca ilk `N` kareyi işler.
+- `--no-analytics`: Video bitiminde Adım 7 taktik analiz ve ısı haritası üretimini atlar.
+
+Mevcut takip verisinden videoyu tekrar çalıştırmadan bağımsız analiz üretmek için:
+```bash
+python modules/match_analytics.py --input data/exports/tracking_data.csv
+```
+
 Çıktılar:
-- `data/output_videos/`  -> kutular + ID + takım renkleriyle işaretlenmiş video
-- `data/exports/tracking_data.csv` ve `.db`  -> kare-kare ham takip verisi
-- `data/exports/player_distance_summary.csv`  -> oyuncu başına mesafe/hız özeti
+- `data/output_videos/`  -> kutular + ID + takım renkleri + (kalibre ise) taktik minimap ile işaretlenmiş video
+- `data/exports/tracking_data.csv` ve `.db`  -> kare-kare ham takip verisi (backfill + top interpolasyonlu)
+- `data/exports/player_distance_summary.csv`  -> oyuncu başına yumuşatılmış mesafe, hız ve FIFA hız bandı / sprint özeti
+- `data/exports/match_analytics_summary.json` ve `possession_timeline.csv` -> topa sahip olma, pas ağı ve takım şekli özeti
+- `data/exports/heatmaps/` -> takım ve öne çıkan oyuncular için 2D ısı haritası PNG görselleri
 
 ## Pipeline Adımları
 | Adım | Modül | Görev |
 |---|---|---|
-| 1 | `modules/video_processor.py` | Video okuma/yazma/çizim |
-| 2 | `modules/detector.py` | YOLO nesne tespiti (oyuncu/top) |
-| 3 | `modules/tracker.py` | DeepSORT ile kalıcı ID takibi |
-| 4 | `modules/team_classifier.py` | K-Means forma renk kümeleme -> Takım A/B/Hakem |
+| 1 | `modules/video_processor.py` | Video okuma/yazma/çizim + minimap bindirme |
+| 2 | `modules/detector.py` | YOLO nesne tespiti (batch + CUDA FP16 destekli oyuncu/top) |
+| 3 | `modules/tracker.py` | DeepSORT (GPU embedder) ile kalıcı ID + sönümlenen hızlı top takibi |
+| 4 | `modules/team_classifier.py` | CIELAB/BGR K-Means forma renk kümeleme + önbellekli Takım A/B/Hakem/Kaleci ayrımı |
 | 5 | `modules/perspective_transformer.py` + `modules/camera_motion_tracker.py` | Homografi + optical flow ile kamera hareketi telafisi -> saha (metre) koordinatları |
-| 6 | `modules/data_exporter.py` | Pandas ile biriktirme, CSV + SQLite'a yazma, mesafe/hız özeti |
+| 6 | `modules/data_exporter.py` | Pandas ile biriktirme, takım backfill + top interpolasyonu, CSV/SQLite + FIFA hız bantlı özet |
+| 7 | `modules/match_analytics.py` | Topa sahip olma, pas tespiti/ağı, takım şekli ve 2D ısı haritası üretimi |
 
 `config/config.py` tüm sabitleri (yollar, eşik değerleri, model parametreleri) tek yerde toplar.
+
+## Testler
+Otomatik birim ve entegrasyon testlerini çalıştırmak için:
+```bash
+pytest -v
+```
 
 ## Varsayılan YOLO modeli hakkında (COCO, sınırlı)
 Şu anki varsayılan `yolov8x.pt`, COCO veri setiyle eğitilmiştir ve sadece
@@ -91,7 +110,10 @@ football_analysis_system/
 │   ├── team_classifier.py           # Adım 4
 │   ├── perspective_transformer.py   # Adım 5
 │   ├── camera_motion_tracker.py     # Adım 5 eklentisi (kamera hareketi telafisi)
-│   └── data_exporter.py             # Adım 6
+│   ├── data_exporter.py             # Adım 6
+│   └── match_analytics.py           # Adım 7 (taktik analiz ve ısı haritaları)
+├── tests/
+│   └── test_pipeline.py             # otomatik birim/entegrasyon testleri
 ├── utils/
 │   ├── calibrate_homography.py      # homografi kalibrasyon yardımcı aracı
 │   └── train_custom_yolo.py         # (opsiyonel) fine-tune eğitim betiği

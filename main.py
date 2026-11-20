@@ -23,6 +23,8 @@ import argparse
 import os
 import sys
 
+import cv2
+
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from config import config
@@ -33,6 +35,7 @@ from modules.team_classifier import TeamClassifier
 from modules.perspective_transformer import PerspectiveTransformer
 from modules.camera_motion_tracker import CameraMotionTracker
 from modules.data_exporter import DataExporter
+from modules.match_analytics import MatchAnalyzer
 
 
 def parse_args():
@@ -46,6 +49,18 @@ def parse_args():
         "--output", type=str, default=config.DEFAULT_OUTPUT_VIDEO,
         help="Kutuların çizileceği çıktı videosunun yolu (.mp4)"
     )
+    parser.add_argument(
+        "--batch-size", type=int, default=None,
+        help="YOLO batch çıkarım boyutu (varsayılan: CUDA'da config.DETECTION_BATCH_SIZE, CPU'da 1)"
+    )
+    parser.add_argument(
+        "--max-frames", type=int, default=None,
+        help="Test için yalnızca ilk N kareyi işle (varsayılan: tüm video)"
+    )
+    parser.add_argument(
+        "--no-analytics", action="store_true",
+        help="Video bitiminde Adım 7 taktik analiz ve ısı haritası üretimini atla"
+    )
     return parser.parse_args()
 
 
@@ -53,63 +68,48 @@ def main():
     args = parse_args()
 
     print("=" * 60)
-    print("FUTBOL MAÇ ANALİZ SİSTEMİ - Adım 1-5 Pipeline (dinamik kamera telafili)")
+    print("FUTBOL MAÇ ANALİZ SİSTEMİ - Adım 1-7 Pipeline (dinamik kamera telafili)")
     print("=" * 60)
 
     # --- Adım 2 için: YOLO dedektörünü bir kere yükle (her frame'de yeniden yükleme!) ---
     detector = ObjectDetector()
+    batch_size = (
+        max(1, args.batch_size)
+        if args.batch_size is not None
+        else (config.DETECTION_BATCH_SIZE if detector.device.startswith("cuda") else 1)
+    )
+    print(f"[Pipeline] YOLO batch_size={batch_size}")
 
     # --- Adım 3 için: Tracker'ları da video döngüsünden ÖNCE, bir kere oluşturuyoruz.
-    # Tracker'lar İÇ DURUM (state) taşır -- yani "geçmiş kareleri hatırlar".
-    # Her karede yeniden oluşturursak hafızaları sıfırlanır ve ID sürekliliği bozulur.
     player_tracker = PlayerTracker()
     ball_tracker = BallTracker()
 
-    # --- Adım 4 için: TeamClassifier de state taşıdığı için (renk geçmişi,
-    # fit edilmiş K-Means modeli) döngü dışında bir kere oluşturuluyor.
+    # --- Adım 4 için: TeamClassifier state taşıdığı için döngü dışında bir kere oluşturuluyor. ---
     team_classifier = TeamClassifier()
 
-    # --- Adım 5 için: PerspectiveTransformer, kalibrasyon noktalarından
-    # homografi matrisini SADECE BİR KERE hesaplar (__init__ içinde).
-    # Kalibrasyon eksikse (config.SOURCE_CALIBRATION_POINTS boşsa) uyarı
-    # verip is_calibrated=False olarak devam eder; pipeline çökmez, sadece
-    # saha koordinatları None olarak kalır.
+    # --- Adım 5 için: PerspectiveTransformer ---
     transformer = PerspectiveTransformer()
     if not transformer.is_calibrated:
         print(
             "\n[UYARI] Homografi kalibrasyonu yapılmamış. Saha (metre) koordinatları "
             "üretilmeyecek VE taktik minimap görünümü çıktı videosuna eklenmeyecek "
             "(minimap, saha koordinatlarına ihtiyaç duyar). Kalibrasyon için: "
-            "python utils/calibrate_homography.py\n"
+            "python utils/calibrate_homography.py --input <video_yolu>\n"
         )
 
-    # CameraMotionTracker de state taşır (önceki karenin gri tonlaması,
-    # takip noktaları, birikimli hareket matrisi) -- döngü dışında bir kere oluşturuluyor.
     motion_tracker = CameraMotionTracker()
 
-    # --- Adım 1 için: Video okuma/yazma nesnesini context manager ile aç ---
-    # 'with' kullanımı, video dosyalarının işlem bitince (hata olsa bile)
-    # otomatik olarak düzgünce kapatılmasını garanti eder.
     with VideoProcessor(args.input, args.output) as vp:
-
-        # --- Adım 6 için: DataExporter, vp.fps'e ihtiyaç duyduğundan (zaman
-        # damgası hesaplamak için) VideoProcessor açıldıktan SONRA, ama video
-        # döngüsünden ÖNCE oluşturuluyor. O da state taşır (biriken kayıt
-        # listesi) -- döngü içinde her seferinde yeniden oluşturulmamalı.
         exporter = DataExporter(fps=vp.fps)
 
-        for frame_idx, frame in vp.read_frames():
-
-            # 1) Bu frame üzerinde nesne tespiti yap (oyuncu + top) -- Adım 2
-            raw_detections = detector.detect_frame(frame)
-
+        def process_frame(frame_idx, frame, raw_detections):
             # 2) Oyuncu/hakem tespitlerine kalıcı track_id ata -- Adım 3
             tracked_players = player_tracker.update(raw_detections, frame)
 
-            # 3) Topu ayrı mantıkla takip et -- Adım 3
-            tracked_ball = ball_tracker.update(raw_detections)
+            # 3) Topu sönümlenen hızlı tekil takipçiyle izle -- Adım 3
+            tracked_ball = ball_tracker.update(raw_detections, frame_shape=frame.shape)
 
-            # 4) Forma rengine göre Takım A / Takım B / Hakem ata -- Adım 4
+            # 4) Forma rengine göre Takım A / Takım B / Hakem / Kaleci ata -- Adım 4
             tracked_players = team_classifier.assign_teams(tracked_players, frame)
 
             # 5) Çizim için oyuncu + top listelerini birleştir
@@ -118,18 +118,6 @@ def main():
                 all_tracked.append(tracked_ball)
 
             # 6) Kamera hareketini (pan/tilt/zoom) tahmin et -- Adım 5 eklentisi
-            #
-            # ÖNEMLİ: motion_tracker.update() SADECE config.CALIBRATION_FRAME_INDEX
-            # ve SONRASI için çağrılıyor. Neden? CameraMotionTracker, ilk kez
-            # .update() çağrıldığı kareyi "referans kare" (M=birim matris) kabul
-            # eder ve sonraki tüm kareleri BUNA GÖRE hizalar. Kalibrasyonu
-            # (SOURCE_CALIBRATION_POINTS) hangi karede yaptıysan, homografi de o
-            # karenin piksel düzenine göre hesaplanmıştır -- yani kamera hareketi
-            # takibinin referans karesi de BİREBİR AYNI kare olmalı, aksi halde
-            # "efektif homografi" tamamen yanlış bir kareye göre hizalanır.
-            # Bu satır, ilk .update() çağrısının tam olarak kalibrasyon karesinde
-            # gerçekleşmesini garanti ederek bu hizalamayı otomatik sağlıyor.
-            # Kalibrasyon karesinden ÖNCEKİ kareler için saha koordinatı üretilmez.
             if frame_idx >= config.CALIBRATION_FRAME_INDEX:
                 motion_matrix = motion_tracker.update(frame, raw_detections)
             else:
@@ -137,13 +125,8 @@ def main():
 
             # 7) Piksel koordinatlarını saha (metre) koordinatlarına çevir -- Adım 5
             if motion_matrix is not None:
-                # Normal durum: kamera hareketi telafili efektif homografi kullanılır
                 all_tracked = transformer.add_pitch_coordinates(all_tracked, camera_motion_matrix=motion_matrix)
             else:
-                # motion_matrix None ise ya (a) CALIBRATION_FRAME_INDEX'e henüz
-                # ulaşılmadı, ya da (b) CameraMotionTracker bir SAHNE KESMESİ
-                # tespit etti. Her iki durumda da yanlış saha koordinatı
-                # üretmektense, bu kare için hiç üretmiyoruz.
                 for det in all_tracked:
                     det["pitch_x"], det["pitch_y"], det["on_pitch"] = None, None, None
 
@@ -154,16 +137,13 @@ def main():
             annotated_frame = vp.draw_detections(frame, all_tracked)
 
             # 10) Frame numarasını debug amaçlı sol üste yazalım
-            import cv2
             cv2.putText(
                 annotated_frame,
                 f"Frame: {frame_idx} | Oyuncu: {len(tracked_players)} | Top: {'Var' if tracked_ball else 'Yok'}",
                 (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
             )
 
-            # 11) Taktik görünüm (kuş bakışı saha minimap'i) -- SADECE kalibrasyon
-            # yapılmışsa üretilir/gömülür (kalibrasyon yoksa pitch_x/y zaten None'dur,
-            # anlamlı bir minimap çizilemez).
+            # 11) Taktik görünüm (kuş bakışı saha minimap'i)
             if config.SHOW_TACTICAL_MINIMAP and transformer.is_calibrated:
                 minimap = transformer.draw_pitch_minimap(all_tracked)
                 annotated_frame = vp.overlay_minimap(annotated_frame, minimap)
@@ -171,15 +151,57 @@ def main():
             # 12) İşlenmiş frame'i çıktı videosuna yaz
             vp.write_frame(annotated_frame)
 
-        # --- Video döngüsü bitti (hâlâ 'with VideoProcessor' bloğunun içindeyiz,
-        # yani vp.fps gibi bilgiler hâlâ erişilebilir). Şimdi Adım 6: biriken
-        # tüm veriyi diske yaz. ---
+        frame_batch = []
+        for frame_idx, frame in vp.read_frames():
+            if args.max_frames is not None and frame_idx >= args.max_frames:
+                break
+
+            frame_batch.append((frame_idx, frame))
+            if len(frame_batch) >= batch_size:
+                if batch_size > 1:
+                    batch_detections = detector.detect_batch([f for _, f in frame_batch])
+                else:
+                    batch_detections = [detector.detect_frame(frame_batch[0][1])]
+
+                for (f_idx, f), raw_detections in zip(frame_batch, batch_detections):
+                    process_frame(f_idx, f, raw_detections)
+                frame_batch.clear()
+
+        if frame_batch:
+            if batch_size > 1 and len(frame_batch) > 1:
+                batch_detections = detector.detect_batch([f for _, f in frame_batch])
+            else:
+                batch_detections = [detector.detect_frame(f) for _, f in frame_batch]
+
+            for (f_idx, f), raw_detections in zip(frame_batch, batch_detections):
+                process_frame(f_idx, f, raw_detections)
+            frame_batch.clear()
+
+        # --- Video döngüsü bitti: Adım 6 dışa aktarım ve Adım 7 taktik analiz ---
         print("\n" + "=" * 60)
         print("VERİ DIŞA AKTARIMI (Adım 6)")
         print("=" * 60)
+        exporter.postprocess(team_map=team_classifier.get_team_map())
         exporter.export_to_csv()
         exporter.export_to_sql()
         exporter.export_distance_summary()
+
+        if config.GENERATE_ANALYTICS_REPORT and not args.no_analytics:
+            print("\n" + "=" * 60)
+            print("TAKTİK ANALİZ VE ISI HARİTASI (Adım 7)")
+            print("=" * 60)
+            analyzer = MatchAnalyzer(exporter.to_dataframe(), fps=vp.fps)
+            analytics_summary = analyzer.export_all()
+            poss = analytics_summary["possession"]
+            passes = analytics_summary["passes"]
+            print(
+                f"Topa Sahip Olma ({poss['mode']}) -> "
+                f"Team A: %{poss['team_a_pct']} | Team B: %{poss['team_b_pct']}"
+            )
+            print(
+                f"Pas Özeti -> Tamamlanan: {passes['total_completed_passes']} | "
+                f"Top Kaybı: {passes['total_turnovers']}"
+            )
 
     print("\nİşlem tamamlandı!")
     print(f"Çıktı videosu şurada: {args.output}")

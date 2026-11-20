@@ -43,6 +43,8 @@ class ObjectDetector:
         confidence_threshold: float = config.DETECTION_CONFIDENCE_THRESHOLD,
         iou_threshold: float = config.DETECTION_IOU_THRESHOLD,
         device: str = config.DEVICE,
+        imgsz: int = config.DETECTION_IMG_SIZE,
+        half: bool = config.DETECTION_HALF,
     ):
         """
         Parametreler
@@ -57,9 +59,14 @@ class ObjectDetector:
             Non-Max Suppression (örtüşen kutuları birleştirme) eşiği.
         device : str
             "cuda" (GPU) veya "cpu". GPU yoksa otomatik "cpu"ya düşer.
+        imgsz : int
+            Çıkarım sırasında kullanılacak giriş görüntü boyutu (piksel).
+        half : bool
+            FP16 yarı duyarlıklı çıkarım (sadece CUDA aktifken etkinleşir).
         """
         self.confidence_threshold = confidence_threshold
         self.iou_threshold = iou_threshold
+        self.imgsz = imgsz
 
         # --- ÖNEMLİ DÜZELTME ---
         # Daha önce burada "device" parametresi hiç kontrol edilmeden doğrudan
@@ -85,7 +92,12 @@ class ObjectDetector:
         else:
             self.device = device
 
-        print(f"[ObjectDetector] Model yükleniyor: {model_path} (device={self.device})")
+        self.half = bool(half and self.device.startswith("cuda"))
+
+        print(
+            f"[ObjectDetector] Model yükleniyor: {model_path} "
+            f"(device={self.device}, imgsz={self.imgsz}, half={self.half})"
+        )
 
         # YOLO modelini yüklüyoruz. Ultralytics kütüphanesi hem .pt dosyasını
         # yerelden okur hem de yoksa otomatik indirir.
@@ -97,6 +109,33 @@ class ObjectDetector:
         self.target_class_ids = config.TARGET_CLASS_IDS
 
         print("[ObjectDetector] Model başarıyla yüklendi.")
+
+    # ----------------------------------------------------------------
+    def _parse_result(self, result) -> List[Dict]:
+        """Tek bir YOLO tahmin sonucunu standart tespit sözlüğü listesine dönüştürür."""
+        detections: List[Dict] = []
+
+        for box in result.boxes:
+            class_id = int(box.cls[0])
+
+            # Sadece bizim ilgilendiğimiz sınıfları (person, ball) alıyoruz.
+            # Örneğin COCO'daki "car", "dog" gibi alakasız sınıfları eliyoruz.
+            if class_id not in self.target_class_ids:
+                continue
+
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            confidence = float(box.conf[0])
+
+            detections.append({
+                "bbox": [x1, y1, x2, y2],
+                "class_id": class_id,
+                "class_name": self.target_class_ids[class_id],
+                "confidence": round(confidence, 4),
+                "track_id": None,   # 3. adımda (Tracking) doldurulacak
+                "team": None,       # 4. adımda (K-Means Team Classification) doldurulacak
+            })
+
+        return detections
 
     # ----------------------------------------------------------------
     def detect_frame(self, frame: np.ndarray) -> List[Dict]:
@@ -128,37 +167,13 @@ class ObjectDetector:
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
             device=self.device,
+            imgsz=self.imgsz,
+            half=self.half,
+            classes=list(self.target_class_ids.keys()),
             verbose=False,
         )
 
-        detections: List[Dict] = []
-
-        # results tek elemanlı bir liste döner (tek frame verdiğimiz için)
-        result = results[0]
-
-        # result.boxes -> tespit edilen tüm kutuların bilgilerini tutan nesne
-        for box in result.boxes:
-            class_id = int(box.cls[0])
-
-            # Sadece bizim ilgilendiğimiz sınıfları (person, ball) alıyoruz.
-            # Örneğin COCO'daki "car", "dog" gibi alakasız sınıfları eliyoruz.
-            if class_id not in self.target_class_ids:
-                continue
-
-            # Bounding box koordinatlarını al (x1, y1, x2, y2 formatında, piksel cinsinden)
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            confidence = float(box.conf[0])
-
-            detections.append({
-                "bbox": [x1, y1, x2, y2],
-                "class_id": class_id,
-                "class_name": self.target_class_ids[class_id],
-                "confidence": round(confidence, 4),
-                "track_id": None,   # 3. adımda (Tracking) doldurulacak
-                "team": None,       # 4. adımda (K-Means Team Classification) doldurulacak
-            })
-
-        return detections
+        return self._parse_result(results[0])
 
     # ----------------------------------------------------------------
     def detect_batch(self, frames: List[np.ndarray]) -> List[List[Dict]]:
@@ -177,38 +192,21 @@ class ObjectDetector:
         List[List[Dict]]
             Her frame için ayrı bir detection listesi içeren liste.
         """
+        if not frames:
+            return []
+
         results = self.model.predict(
             source=frames,
             conf=self.confidence_threshold,
             iou=self.iou_threshold,
             device=self.device,
+            imgsz=self.imgsz,
+            half=self.half,
+            classes=list(self.target_class_ids.keys()),
             verbose=False,
         )
 
-        all_detections: List[List[Dict]] = []
-
-        for result in results:
-            frame_detections: List[Dict] = []
-            for box in result.boxes:
-                class_id = int(box.cls[0])
-                if class_id not in self.target_class_ids:
-                    continue
-
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                confidence = float(box.conf[0])
-
-                frame_detections.append({
-                    "bbox": [x1, y1, x2, y2],
-                    "class_id": class_id,
-                    "class_name": self.target_class_ids[class_id],
-                    "confidence": round(confidence, 4),
-                    "track_id": None,
-                    "team": None,
-                })
-
-            all_detections.append(frame_detections)
-
-        return all_detections
+        return [self._parse_result(result) for result in results]
 
 
 # ----------------------------------------------------------------------

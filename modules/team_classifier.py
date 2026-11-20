@@ -78,15 +78,19 @@ class TeamClassifier:
         n_clusters: int = config.TEAM_CLASSIFIER_N_CLUSTERS,
         min_unique_tracks: int = config.TEAM_CLASSIFIER_MIN_UNIQUE_TRACKS,
         max_history_per_track: int = config.TEAM_COLOR_HISTORY_MAX_SAMPLES,
+        color_space: str = config.TEAM_COLOR_SPACE,
+        min_samples_for_lock: int = config.TEAM_CLASSIFIER_MIN_SAMPLES_FOR_LOCK,
     ):
         self.n_clusters = n_clusters
         self.min_unique_tracks = min_unique_tracks
         self.max_history_per_track = max_history_per_track
+        self.color_space = color_space
+        self.min_samples_for_lock = max(1, min_samples_for_lock)
 
-        # track_id -> [renk_örneği_1, renk_örneği_2, ...] (her biri 3 elemanlı BGR array)
+        # track_id -> [renk_örneği_1, renk_örneği_2, ...] (her biri 3 elemanlı renk vektörü)
         self.color_history: Dict[int, List[np.ndarray]] = defaultdict(list)
 
-        # track_id -> "Team A" / "Team B" / "Referee"  (bir kere hesaplanınca sabitlenir)
+        # track_id -> "Team A" / "Team B" / "Referee" / "Goalkeeper" (kararlı önbellek)
         self.team_assignment: Dict[int, str] = {}
 
         # K-Means modelinin kendisi -- yeterli veri toplanınca bir kere fit edilir
@@ -97,8 +101,9 @@ class TeamClassifier:
         self.cluster_role_map: Dict[int, str] = {}
 
         print(
-            f"[TeamClassifier] Oluşturuldu. En az {min_unique_tracks} farklı oyuncu "
-            f"görülünce K-Means kümeleme otomatik olarak devreye girecek."
+            f"[TeamClassifier] Oluşturuldu (color_space={self.color_space}). "
+            f"En az {min_unique_tracks} farklı oyuncu görülünce K-Means kümeleme "
+            f"otomatik olarak devreye girecek."
         )
 
     # ----------------------------------------------------------------
@@ -147,8 +152,15 @@ class TeamClassifier:
         # --- 2) Hız için küçük sabit boyuta indir (renk kümelemede çözünürlük önemsiz) ---
         jersey_crop = cv2.resize(jersey_crop, (30, 30), interpolation=cv2.INTER_AREA)
 
-        # Pikselleri (N, 3) şekline getir -- her satır bir pikselin BGR değeri
+        if self.color_space.upper() == "LAB":
+            jersey_crop = cv2.cvtColor(jersey_crop, cv2.COLOR_BGR2LAB)
+
+        # Pikselleri (N, 3) şekline getir -- her satır bir pikselin renk vektörü
         pixels = jersey_crop.reshape(-1, 3).astype(np.float32)
+
+        # Tek renkli (uniform) kırpımlarda 2-kümeli K-Means çalıştırmaya gerek yok
+        if len(np.unique(pixels, axis=0)) < 2:
+            return pixels.mean(axis=0)
 
         # --- 3) 2 kümeli K-Means: forma pikselleri vs arka plan pikselleri ---
         # n_init=3 -> farklı başlangıç noktalarıyla 3 kez deneyip en iyisini seç
@@ -156,15 +168,16 @@ class TeamClassifier:
         pixel_kmeans = KMeans(n_clusters=2, n_init=3, random_state=42)
         pixel_labels = pixel_kmeans.fit_predict(pixels)
 
-        # --- 4) Arka plan kümesini köşe piksellerinden tahmin et ---
-        # jersey_crop 30x30 olduğu için köşe indeksleri: (0,0), (0,29), (29,0), (29,29)
+        # --- 4) Arka plan kümesini 4 köşedeki 3x3 blokların çoğunluk oyuyla tahmin et ---
         labels_2d = pixel_labels.reshape(30, 30)
-        corner_labels = [
-            labels_2d[0, 0], labels_2d[0, -1],
-            labels_2d[-1, 0], labels_2d[-1, -1],
-        ]
-        # Köşelerde en sık görülen küme etiketi = muhtemelen arka plan (çim/tribün)
-        background_cluster = max(set(corner_labels), key=corner_labels.count)
+        corner_blocks = np.concatenate([
+            labels_2d[:3, :3].ravel(),
+            labels_2d[:3, -3:].ravel(),
+            labels_2d[-3:, :3].ravel(),
+            labels_2d[-3:, -3:].ravel(),
+        ])
+        counts = np.bincount(corner_blocks, minlength=2)
+        background_cluster = int(np.argmax(counts))
         jersey_cluster = 1 - background_cluster  # diğer küme = forma
 
         # --- 5) Forma kümesine ait piksellerin ortalama rengini hesapla ---
@@ -230,33 +243,32 @@ class TeamClassifier:
         unique, counts = np.unique(cluster_labels, return_counts=True)
         cluster_sizes = dict(zip(unique.tolist(), counts.tolist()))
 
+        def _cluster_brightness(cluster_idx: int) -> float:
+            center = self.kmeans.cluster_centers_[cluster_idx]
+            if self.color_space.upper() == "LAB":
+                return float(center[0])
+            return float(center.sum())
+
         if self.n_clusters == 2:
-            # 2 küme, iki farklı sebepten burada olabilir: (a) fine-tune futbol
-            # modelinde hakem zaten YOLO'dan ayrı geldiği için renk geçmişine
-            # hiç girmedi, ya da (b) config.TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT
-            # =False ile kullanıcı bu görüntüde ayırt edilebilir bir hakem
-            # olmadığını belirtti. Her iki durumda da "en az üyeli küme = hakem"
-            # sezgisine gerek YOK -- iki küme de doğrudan Takım A / Takım B.
-            clusters_by_brightness = sorted(
-                cluster_sizes.keys(), key=lambda c: self.kmeans.cluster_centers_[c].sum()
-            )
+            if len(cluster_sizes) < 2:
+                print("[TeamClassifier] UYARI: Renk örnekleri en az 2 kümeye ayrışamadı; daha fazla veri bekleniyor.")
+                return
+            clusters_by_brightness = sorted(cluster_sizes.keys(), key=_cluster_brightness)
             self.cluster_role_map = {
                 clusters_by_brightness[0]: "Team A",
                 clusters_by_brightness[1]: "Team B",
             }
         else:
+            if len(cluster_sizes) < 2:
+                print("[TeamClassifier] UYARI: Renk örnekleri yeterli kümeye ayrışamadı; daha fazla veri bekleniyor.")
+                return
+
             # n_clusters == 3: config.TEAM_CLASSIFIER_ASSUME_REFEREE_PRESENT=True
             # ile görüntüde ayrı bir hakem grubu OLDUĞUNU varsayıyoruz.
             # "En az üyeli küme = hakem" sezgisi kullanılır.
             referee_cluster = min(cluster_sizes, key=cluster_sizes.get)
 
             # --- GÜVENLİK KONTROLÜ ---
-            # Bu sezgi, hakemin GERÇEKTEN azınlıkta olduğu varsayımına dayanır.
-            # Ama görüntüde hiç hakem yoksa (ör. amatör/stok/antrenman klibi),
-            # "en küçük küme" aslında sadece kusurlu bir renk ayrımı olur --
-            # gerçek oyuncular yanlışlıkla "Hakem" etiketlenir (tam olarak
-            # kullanıcının karşılaştığı sorun budur). Bu yüzden en küçük kümenin
-            # diğerlerine göre GERÇEKTEN küçük olup olmadığını kontrol ediyoruz.
             other_sizes = [s for c, s in cluster_sizes.items() if c != referee_cluster]
             avg_other_size = sum(other_sizes) / len(other_sizes) if other_sizes else 0
 
@@ -271,17 +283,22 @@ class TeamClassifier:
                 )
 
             remaining_clusters = [c for c in cluster_sizes if c != referee_cluster]
-            # Team A / Team B ayrımı keyfi olabilir (hangisinin "A" hangisinin "B"
-            # olduğunun taktiksel bir önemi yok, sadece tutarlı olması önemli).
-            # Kümeleri deterministik olsun diye küme merkezinin toplam parlaklığına
-            # göre sıralıyoruz (koyu forma -> Team A, açık forma -> Team B gibi sabit bir kural).
-            remaining_clusters.sort(key=lambda c: self.kmeans.cluster_centers_[c].sum())
+            # Kümeleri deterministik olsun diye parlaklığa göre sıralıyoruz.
+            remaining_clusters.sort(key=_cluster_brightness)
 
-            self.cluster_role_map = {
-                remaining_clusters[0]: "Team A",
-                remaining_clusters[1]: "Team B",
-                referee_cluster: "Referee",
-            }
+            if len(remaining_clusters) < 2:
+                # Örnekler yalnızca 2 belirgin renk kümesine çöktüyse güvenli biçimde Team A / Team B ata
+                clusters_by_brightness = sorted(cluster_sizes.keys(), key=_cluster_brightness)
+                self.cluster_role_map = {
+                    clusters_by_brightness[0]: "Team A",
+                    clusters_by_brightness[1]: "Team B",
+                }
+            else:
+                self.cluster_role_map = {
+                    remaining_clusters[0]: "Team A",
+                    remaining_clusters[1]: "Team B",
+                    referee_cluster: "Referee",
+                }
 
         print(f"[TeamClassifier] Küme boyutları: {cluster_sizes} -> Rol eşlemesi: {self.cluster_role_map}")
 
@@ -322,24 +339,31 @@ class TeamClassifier:
             if track_id is None:
                 continue
 
-            # --- 0) Fine-tune modelde hakem zaten YOLO sınıfından biliniyor --
+            # --- 0) Fine-tune modelde hakem ve kaleci zaten YOLO sınıfından biliniyor --
             # renk kümelemesine hiç sokmadan doğrudan etiketle ve bir sonraki
-            # tespite geç (bu track_id hiçbir zaman color_history'ye girmez). ---
-            if config.USES_FINE_TUNED_FOOTBALL_MODEL and det.get("class_name") == "referee":
-                det["team"] = "Referee"
-                self.team_assignment[track_id] = "Referee"
-                continue
+            # tespite geç (bu track_id'ler hiçbir zaman color_history'ye girmez). ---
+            if config.USES_FINE_TUNED_FOOTBALL_MODEL:
+                cls_name = det.get("class_name")
+                if cls_name == "referee":
+                    det["team"] = "Referee"
+                    self.team_assignment[track_id] = "Referee"
+                    continue
+                if cls_name == "goalkeeper":
+                    det["team"] = "Goalkeeper"
+                    self.team_assignment[track_id] = "Goalkeeper"
+                    continue
 
-            # --- 1) Bu karedeki forma rengini çıkar ve geçmişe ekle ---
-            color = self.extract_jersey_color(frame, det["bbox"])
-            if color is not None:
-                self._collect_sample(track_id, color)
-
-            # --- 2) Eğer bu oyuncu için daha önce nihai bir takım kararı verildiyse,
-            #        onu doğrudan kullan (kararlılık için -- tekrar hesaplamıyoruz) ---
+            # --- 1) ÖNBELLEK KONTROLÜ (KRİTİK HIZ OPTİMİZASYONU) ---
+            # Bu oyuncu için daha önce nihai karar verildiyse bir daha
+            # extract_jersey_color / K-Means çalıştırmadan doğrudan etiketi kullan.
             if track_id in self.team_assignment:
                 det["team"] = self.team_assignment[track_id]
                 continue
+
+            # --- 2) Henüz sabitlenmediyse bu karedeki forma rengini çıkar ve geçmişe ekle ---
+            color = self.extract_jersey_color(frame, det["bbox"])
+            if color is not None:
+                self._collect_sample(track_id, color)
 
             # --- 3) Henüz kesin karar yoksa, model fit edilmeye hazır mı diye dene ---
             self._try_fit_kmeans()
@@ -348,20 +372,48 @@ class TeamClassifier:
                 # _try_fit_kmeans() az önce bu oyuncuyu da etiketlemiş olabilir
                 det["team"] = self.team_assignment[track_id]
             elif self.is_fitted:
-                # Model zaten fit edilmiş ama bu track_id yeni görülüyor (henüz
-                # geçmişte yoktu) -- mevcut ortalama rengiyle SADECE predict yap,
-                # yeniden fit ETME. Sonucu bu track_id için önbellekle.
+                # Model zaten fit edilmiş ama bu track_id henüz kilitlenmedi --
+                # mevcut ortalama rengiyle SADECE predict yap; min_samples_for_lock
+                # eşiğine ulaşınca önbelleğe kilitle.
                 avg_color = self._get_average_color(track_id)
                 if avg_color is not None:
                     predicted_cluster = self.kmeans.predict([avg_color])[0]
                     label = self.cluster_role_map[predicted_cluster]
-                    self.team_assignment[track_id] = label
                     det["team"] = label
+                    if len(self.color_history[track_id]) >= self.min_samples_for_lock:
+                        self.team_assignment[track_id] = label
+                else:
+                    det["team"] = None
             else:
                 # Model henüz fit edilmedi (yeterli çeşitlilik yok) -- takım bilgisi yok
                 det["team"] = None
 
+        # Aynı kare içinde K-Means ilk kez fit edildiyse, döngünün başındaki
+        # oyuncuların etiketlerini de yeni dolan team_assignment'tan tamamla.
+        if self.is_fitted:
+            for det in tracked_players:
+                if det.get("team") is None:
+                    tid = det.get("track_id")
+                    if tid in self.team_assignment:
+                        det["team"] = self.team_assignment[tid]
+
         return tracked_players
+
+    # ----------------------------------------------------------------
+    def get_team_map(self) -> Dict[int, str]:
+        """
+        Bilinen tüm track_id -> team eşlemelerini döndürür. Henüz min_samples_for_lock
+        eşiğini doldurmamış ama model fit edilmiş track'leri de predict ederek ekler.
+        """
+        team_map = dict(self.team_assignment)
+        if self.is_fitted and self.kmeans is not None:
+            for track_id in self.color_history:
+                if track_id not in team_map:
+                    avg_color = self._get_average_color(track_id)
+                    if avg_color is not None:
+                        predicted_cluster = self.kmeans.predict([avg_color])[0]
+                        team_map[track_id] = self.cluster_role_map[predicted_cluster]
+        return team_map
 
 
 # ----------------------------------------------------------------------
