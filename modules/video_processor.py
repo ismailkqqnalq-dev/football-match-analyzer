@@ -23,6 +23,7 @@ from tqdm import tqdm
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import config
+from modules.security import SecurityViolationError
 
 
 class VideoProcessor:
@@ -69,6 +70,27 @@ class VideoProcessor:
         self.frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # Decompression bomb ve sahte aşırı çözünürlük saldırılarına karşı güvenlik sınırları
+        max_w = int(getattr(config, "SECURITY_MAX_VIDEO_WIDTH", 4096))
+        max_h = int(getattr(config, "SECURITY_MAX_VIDEO_HEIGHT", 2304))
+        max_fps = float(getattr(config, "SECURITY_MAX_VIDEO_FPS", 120.0))
+        if (
+            self.frame_width <= 0
+            or self.frame_height <= 0
+            or self.frame_width > max_w
+            or self.frame_height > max_h
+        ):
+            self.cap.release()
+            raise SecurityViolationError(
+                f"Video çözünürlüğü güvenlik sınırları dışında: "
+                f"{self.frame_width}x{self.frame_height} (maks: {max_w}x{max_h})."
+            )
+        if self.fps is not None and np.isfinite(self.fps) and self.fps > max_fps:
+            self.cap.release()
+            raise SecurityViolationError(
+                f"Video FPS değeri güvenlik sınırını aşıyor: {self.fps:.2f} > {max_fps:.2f}."
+            )
 
         print(
             f"[VideoProcessor] Video yüklendi: {os.path.basename(input_path)} | "

@@ -494,3 +494,39 @@ ML_ANOMALY_CONTAMINATION = 0.08
 ML_ANOMALY_MAD_Z_THRESHOLD = 3.5
 ML_PIXEL_MAX_SPEED_PX_PER_SEC = 800.0
 
+# ------------------------------------------------------------------
+# GÜVENLİK VE ÜRETİM (PRODUCTION API) AYARLARI
+# ------------------------------------------------------------------
+# Yüklenen video dosyaları için kaynak tükenmesi (DoS) ve sahte dosya sınırları
+SECURITY_MAX_VIDEO_SIZE_MB = 4096
+SECURITY_MAX_VIDEO_WIDTH = 4096
+SECURITY_MAX_VIDEO_HEIGHT = 2304
+SECURITY_MAX_VIDEO_DURATION_SEC = 7500.0
+SECURITY_MAX_VIDEO_FPS = 120.0
+SECURITY_MIN_VIDEO_FPS = 1.0
+SECURITY_ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv"}
+
+# YOLO ağırlık (Pickle / RCE) güvenliği ve bütünlük doğrulaması
+SECURITY_ENFORCE_MODEL_DIR_WHITELIST = True
+SECURITY_MODEL_SHA256 = os.environ.get("FOOTBALL_MODEL_SHA256") or None
+SECURITY_ALLOWED_OFFICIAL_YOLO_BASENAMES = {
+    "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
+    "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
+}
+
+# API iş kuyruğu, hız sınırı ve kimlik doğrulama ayarları (gizli anahtarlar YALNIZCA env'den okunur)
+API_JOBS_DIR = os.environ.get("FOOTBALL_JOBS_DIR") or os.path.join(BASE_DIR, "data", "jobs")
+API_MAX_CONCURRENT_GPU_JOBS = 1
+API_MAX_QUEUED_JOBS = 16
+API_RATE_LIMIT_REQUESTS_PER_MIN = 30
+API_UPLOAD_RATE_LIMIT_PER_MIN = 5
+API_JWT_TTL_SECONDS = 3600
+API_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get(
+        "FOOTBALL_ALLOWED_ORIGINS",
+        "http://localhost:3000,http://127.0.0.1:3000",
+    ).split(",")
+    if origin.strip()
+]
+

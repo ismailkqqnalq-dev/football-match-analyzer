@@ -92,8 +92,25 @@ Remove-Item Env:ROBOFLOW_API_KEY -ErrorAction SilentlyContinue
 - **Skorbord Maskeleme ve Uzun Çekim Kararlılığı**: Sabit TV skorbord/logo bölgeleri ve oyuncu kutuları maskelenir, ayrıca periyodik anahtar kare doğrulaması ile uzun çekimlerde birikimli kayma (drift) sınırlandırılır.
 
 ## Testler
-Otomatik birim, stres ve uçtan uca (E2E) testlerini çalıştırmak için:
+Otomatik birim, güvenlik ve uçtan uca (E2E) testlerini çalıştırmak için:
 ```powershell
 $env:YOLO_CONFIG_DIR="$env:TEMP\ultralytics_cfg"
 pytest -v
+```
+
+## Güvenlik Mimarisi ve Üretim (API / Docker) Yayını
+Proje dış dünyaya/müşteriye bir servis olarak açıldığında olası saldırılara karşı **5 katmanlı stadyum güvenlik çemberi** ile korunur:
+1. **Kimlik Doğrulama ve Hız Sınırı (`api/app.py`, `modules/security.py`)**: `POST /api/v1/auth/token` üzerinden sabit zamanlı (`hmac.compare_digest`) `X-API-Key` kontrolüyle kısa ömürlü JWT bileti üretir.
+   Bellek sınırlandırmalı `TokenBucketRateLimiter` brute-force ve DDoS saldırılarını `429 Too Many Requests` ile durdurur.
+2. **Derin Video Denetçisi (`validate_video_file`)**: Yalnızca `.mp4` uzantısına bakmaz; ilk baytlardaki konteyner imzasını (`magic bytes`), 4 GB boyut sınırını, `<= 4K` çözünürlüğü (decompression bomb koruması), FPS ve süre (`<= 125 dk`) sınırlarını doğrular; yüklenen dosyayı izole `UUIDv4` klasörüne kaydeder.
+3. **Model Bütünlük ve Pickle/RCE Koruması (`validate_model_weight_path`)**: PyTorch `.pt` dosyalarının yalnızca salt-okunur `models/` dizininden (veya resmi YOLO temel isimlerinden) yüklenmesini zorunlu kılar; `FOOTBALL_MODEL_SHA256` tanımlanırsa yükleme öncesi SHA-256 doğrulaması yapar.
+4. **Enjeksiyon ve Yol Gezinme Kalkanı (`resolve_safe_path`, `validate_sql_identifier`, `sanitize_csv_value`)**: SQLite tablo adlarını doğrular, parametrik SQL sorguları kullanır, CSV dışa aktarımlarında Excel formül enjeksiyonunu (`=`, `+`, `-`, `@`) zararsızlaştırır ve `../../` dizin gezinme girişimlerini engeller.
+5. **Konteyner İzolasyonu ve Sıralı GPU Kuyruğu (`Dockerfile`, `docker-compose.yml`)**: `BoundedJobQueue` ekran kartının aynı anda fazla istekle kilitlenmesini önler; Docker konteyneri yetkisiz `analyzer` kullanıcısı (`UID 10001`), salt-okunur kök dosya sistemi (`read_only: true`), `cap_drop: [ALL]` ve `8 GB` RAM / `256` PID sınırıyla çalışır.
+
+Yerel üretim API'sini güvenli şekilde başlatmak için:
+```powershell
+$env:FOOTBALL_API_KEY = "GUCLU_RASTGELE_API_ANAHTARINIZ"
+$env:FOOTBALL_JWT_SECRET = "EN_AZ_32_KARAKTERLIK_GIZLI_ANAHTAR"
+$env:YOLO_CONFIG_DIR = "$env:TEMP\ultralytics_cfg"
+uvicorn api.app:app --host 127.0.0.1 --port 8000 --workers 1
 ```

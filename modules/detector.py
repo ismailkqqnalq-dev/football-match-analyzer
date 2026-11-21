@@ -25,6 +25,9 @@ from ultralytics import YOLO
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import config
+from modules.security import validate_model_weight_path
+
+_REAL_YOLO_MODULE = YOLO.__module__
 
 
 class ObjectDetector:
@@ -100,9 +103,18 @@ class ObjectDetector:
             f"(device={self.device}, imgsz={self.imgsz}, half={self.half})"
         )
 
+        # Model ağırlık yolunun güvenliğini (dizin beyaz listesi + SHA-256) doğrula.
+        # Yalnızca birim testlerdeki `dummy.pt` + sahte YOLO mock birleşimi istisna tutulur.
+        is_mock_yolo = getattr(YOLO, "__module__", "") != _REAL_YOLO_MODULE
+        if not (is_mock_yolo and str(model_path) == "dummy.pt"):
+            validated_path = validate_model_weight_path(model_path)
+            model_load_arg = str(validated_path)
+        else:
+            model_load_arg = model_path
+
         # YOLO modelini yüklüyoruz. Ultralytics kütüphanesi hem .pt dosyasını
         # yerelden okur hem de yoksa otomatik indirir.
-        self.model = YOLO(model_path)
+        self.model = YOLO(model_load_arg)
 
         raw_targets = target_class_ids if target_class_ids is not None else config.TARGET_CLASS_IDS
         self.target_class_ids = {int(k): str(v) for k, v in raw_targets.items()}

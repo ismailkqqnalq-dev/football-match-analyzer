@@ -36,6 +36,7 @@ import pandas as pd
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import config
 from modules.perspective_transformer import PerspectiveTransformer
+from modules.security import sanitize_csv_value, validate_sql_identifier
 
 
 def _is_null(v) -> bool:
@@ -236,10 +237,12 @@ class DataExporter:
 
     def _get_table_name(self, override_name: Optional[str] = None) -> str:
         if override_name is not None:
-            return str(override_name)
-        if self._table_name_arg is not None:
-            return str(self._table_name_arg)
-        return config.EXPORT_SQL_TABLE_NAME
+            raw_name = str(override_name)
+        elif self._table_name_arg is not None:
+            raw_name = str(self._table_name_arg)
+        else:
+            raw_name = config.EXPORT_SQL_TABLE_NAME
+        return validate_sql_identifier(raw_name)
 
     def _get_summary_path(self, override_path: Optional[str] = None) -> str:
         if override_path is not None:
@@ -299,9 +302,9 @@ class DataExporter:
         return [
             int(rec["frame_idx"]),
             _to_csv_cell(rec.get("timestamp_sec")),
-            _to_csv_cell(rec.get("track_id")),
-            _to_csv_cell(rec.get("class_name")),
-            _to_csv_cell(rec.get("team")),
+            sanitize_csv_value(_to_csv_cell(rec.get("track_id"))),
+            sanitize_csv_value(_to_csv_cell(rec.get("class_name"))),
+            sanitize_csv_value(_to_csv_cell(rec.get("team"))),
             _to_csv_cell(rec.get("confidence")),
             _to_csv_cell(rec.get("is_predicted"), is_bool=True),
             _to_csv_cell(rec.get("bbox_x1")),
@@ -961,6 +964,9 @@ class DataExporter:
                                 chunk_df[col] = chunk_df[col].map(
                                     lambda v: "" if _is_null(v) else bool(int(v))
                                 )
+                        for col in ("track_id", "class_name", "team"):
+                            if col in chunk_df.columns:
+                                chunk_df[col] = chunk_df[col].map(sanitize_csv_value)
                         chunk_df.to_csv(
                             target_path,
                             mode="w" if not header_written else "a",
@@ -976,7 +982,10 @@ class DataExporter:
                 print(f"[DataExporter] {total_rows} satır CSV'ye yazıldı: {target_path}")
                 return target_path
 
-        df = self.to_dataframe()
+        df = self.to_dataframe().copy()
+        for col in ("track_id", "class_name", "team"):
+            if col in df.columns:
+                df[col] = df[col].map(sanitize_csv_value)
         df.to_csv(target_path, index=False)
         print(f"[DataExporter] {len(df)} satır CSV'ye yazıldı: {target_path}")
         return target_path
@@ -1481,6 +1490,9 @@ class DataExporter:
 
         summary_rows.sort(key=lambda r: (-float(r["total_distance_m"]), str(r["track_id"])))
         summary_df = pd.DataFrame(summary_rows, columns=list(self.SUMMARY_COLUMNS))
+        for col in ("track_id", "class_name", "team"):
+            if col in summary_df.columns:
+                summary_df[col] = summary_df[col].map(sanitize_csv_value)
 
         target_path = self._get_summary_path(output_path)
         self._ensure_parent_dir(target_path)

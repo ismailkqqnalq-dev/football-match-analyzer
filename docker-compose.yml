@@ -1,0 +1,30 @@
+services:
+  football-analyzer-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: football-match-analyzer-api
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # Üretimde güçlü değerleri ana makine ortamından (.env) geçiriniz
+      - FOOTBALL_API_KEY=${FOOTBALL_API_KEY}
+      - FOOTBALL_JWT_SECRET=${FOOTBALL_JWT_SECRET}
+      - FOOTBALL_MODEL_SHA256=${FOOTBALL_MODEL_SHA256:-}
+      - FOOTBALL_ALLOWED_ORIGINS=${FOOTBALL_ALLOWED_ORIGINS:-http://localhost:3000}
+      - FOOTBALL_JOBS_DIR=/app/data/jobs
+      - YOLO_CONFIG_DIR=/tmp/ultralytics_cfg
+    volumes:
+      # Model ağırlıkları salt-okunur bağlanır; dışarıdan değiştirilemez
+      - ./models:/app/models:ro
+      - ./data/jobs:/app/data/jobs:rw
+    read_only: true
+    tmpfs:
+      - /tmp:size=1G,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 8g
+    pids_limit: 256
+    restart: unless-stopped

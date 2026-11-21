@@ -1,0 +1,17 @@
+.git
+.gitignore
+.pytest_cache
+__pycache__
+*.py[cod]
+.venv
+venv
+env
+.env
+data/input_videos
+data/output_videos
+data/jobs
+tests
+runs
+datasets
+*.mp4
+*.avi
