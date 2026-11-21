@@ -45,14 +45,19 @@ class VideoProcessor:
         input_path : str
             İşlenecek giriş videosunun (.mp4) tam dosya yolu.
         output_path : str, optional
-            Çizimli çıktı videosunun kaydedileceği yol. Verilmezse sadece
-            okuma yapılabilir, yazma yapılamaz.
+            Çizimli çıktı videosunun kaydedileceği yol. None veya "" verilirse
+            VideoWriter başlatılmaz (has_writer == False) ve write_frame() güvenli
+            bir no-op olarak çalışır.
         """
+        input_path = os.fspath(input_path)
+        output_path = os.fspath(output_path) if output_path else None
+
         if not os.path.exists(input_path):
             raise FileNotFoundError(f"Giriş videosu bulunamadı: {input_path}")
 
         self.input_path = input_path
         self.output_path = output_path
+        self._released = False
 
         # cv2.VideoCapture: video dosyasını frame frame okumamızı sağlayan nesne
         self.cap = cv2.VideoCapture(self.input_path)
@@ -77,17 +82,28 @@ class VideoProcessor:
             self._init_writer()
 
     # ----------------------------------------------------------------
+    @property
+    def has_writer(self) -> bool:
+        """Çıktı video yazıcısının aktif ve yazmaya hazır olup olmadığını döndürür."""
+        return self.writer is not None and (
+            not hasattr(self.writer, "isOpened") or bool(self.writer.isOpened())
+        )
+
+    # ----------------------------------------------------------------
     def _init_writer(self):
         """cv2.VideoWriter nesnesini video meta verilerine göre başlatır."""
-        os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
+        out_dir = os.path.dirname(self.output_path)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
 
         # Codec'i config'den al (örn. 'mp4v') ve fourcc koduna çevir
         fourcc = cv2.VideoWriter_fourcc(*config.VIDEO_CODEC)
+        writer_fps = self.fps if (self.fps and np.isfinite(self.fps) and self.fps > 0) else 25.0
 
         self.writer = cv2.VideoWriter(
             self.output_path,
             fourcc,
-            self.fps,
+            writer_fps,
             (self.frame_width, self.frame_height),
         )
         print(f"[VideoProcessor] Çıktı videosu hazırlanıyor: {self.output_path}")
@@ -109,30 +125,33 @@ class VideoProcessor:
             frame -> BGR formatında NumPy dizisi (OpenCV varsayılanı)
         """
         frame_index = 0
+        total = self.total_frames if self.total_frames > 0 else None
 
         # tqdm ile terminalde ilerleme çubuğu gösteriyoruz
-        progress_bar = tqdm(total=self.total_frames, desc="Video okunuyor", unit="frame")
+        progress_bar = tqdm(total=total, desc="Video okunuyor", unit="frame")
 
-        while True:
-            # cap.read() -> (başarı_bool, frame) döner
-            success, frame = self.cap.read()
+        try:
+            while True:
+                # cap.read() -> (başarı_bool, frame) döner (her çağrıda ayrı bellek tahsisi)
+                success, frame = self.cap.read()
 
-            if not success:
-                # Video bitti veya bir okuma hatası oluştu
-                break
+                if not success:
+                    # Video bitti veya bir okuma hatası oluştu
+                    break
 
-            yield frame_index, frame
+                yield frame_index, frame
 
-            frame_index += 1
-            progress_bar.update(1)
-
-        progress_bar.close()
+                frame_index += 1
+                progress_bar.update(1)
+        finally:
+            progress_bar.close()
 
     # ----------------------------------------------------------------
     def draw_detections(
         self,
         frame: np.ndarray,
         detections: List[Dict],
+        inplace: bool = False,
     ) -> np.ndarray:
         """
         Verilen tespit/takip listesine göre frame üzerine bounding box ve ID çizer.
@@ -151,14 +170,16 @@ class VideoProcessor:
                 "team": "Team A" / "Team B" / "Referee" / None,  # 4. adımda doldurulacak
                 "confidence": float,
             }
+        inplace : bool, optional
+            True verilirse kopya almadan doğrudan verilen frame üzerine çizer.
 
         Dönüş
         -----
         np.ndarray
-            Üzerine kutu ve ID çizilmiş yeni frame (orijinali bozulmaz, kopyası döner).
+            Üzerine kutu ve ID çizilmiş frame (inplace=False ise kopyası döner).
         """
-        # Orijinal frame'i bozmamak için kopyasını alıyoruz
-        annotated = frame.copy()
+        # Orijinal frame'i bozmamak için varsayılan olarak kopyasını alıyoruz
+        annotated = frame if inplace else frame.copy()
 
         for det in detections:
             x1, y1, x2, y2 = map(int, det["bbox"])
@@ -254,8 +275,18 @@ class VideoProcessor:
         scale = scale if scale is not None else config.MINIMAP_OVERLAY_SCALE
         margin = margin if margin is not None else config.MINIMAP_OVERLAY_MARGIN_PX
 
+        if (
+            minimap is None
+            or getattr(minimap, "size", 0) == 0
+            or frame is None
+            or getattr(frame, "size", 0) == 0
+        ):
+            return frame
+
         frame_h, frame_w = frame.shape[:2]
         minimap_h, minimap_w = minimap.shape[:2]
+        if frame_h <= 0 or frame_w <= 0 or minimap_h <= 0 or minimap_w <= 0:
+            return frame
 
         # Minimap'i, video genişliğinin belirli bir oranı kadar olacak şekilde
         # küçült (en-boy oranını koruyarak).
@@ -282,26 +313,30 @@ class VideoProcessor:
         x2, y2 = min(frame_w, x1 + b_w), min(frame_h, y1 + b_h)
 
         # Kare, minimap'ten küçükse (nadir ama olası) kırp -- çökmeyi önle.
-        frame[y1:y2, x1:x2] = bordered[: y2 - y1, : x2 - x1]
+        if x2 > x1 and y2 > y1:
+            frame[y1:y2, x1:x2] = bordered[: y2 - y1, : x2 - x1]
 
         return frame
 
     # ----------------------------------------------------------------
-    def write_frame(self, frame: np.ndarray):
-        """İşlenmiş tek bir frame'i çıktı videosuna yazar."""
-        if self.writer is None:
-            raise RuntimeError(
-                "VideoWriter başlatılmadı. VideoProcessor'ı output_path parametresiyle oluşturmalısın."
-            )
+    def write_frame(self, frame: np.ndarray) -> bool:
+        """İşlenmiş tek bir frame'i çıktı videosuna yazar; writer kapalıysa no-op döner."""
+        if not self.has_writer:
+            return False
         self.writer.write(frame)
+        return True
 
     # ----------------------------------------------------------------
     def release(self):
         """Video okuma/yazma nesnelerini serbest bırakır (dosya kilitlerini kapatır)."""
-        self.cap.release()
-        if self.writer is not None:
+        if getattr(self, "cap", None) is not None:
+            self.cap.release()
+        if getattr(self, "writer", None) is not None:
             self.writer.release()
-        print("[VideoProcessor] Kaynaklar serbest bırakıldı. İşlem tamamlandı.")
+            self.writer = None
+        if not getattr(self, "_released", False):
+            self._released = True
+            print("[VideoProcessor] Kaynaklar serbest bırakıldı. İşlem tamamlandı.")
 
     # ----------------------------------------------------------------
     def __enter__(self):
@@ -311,6 +346,7 @@ class VideoProcessor:
     def __exit__(self, exc_type, exc_val, exc_tb):
         """with bloğu bittiğinde otomatik olarak kaynakları serbest bırakır."""
         self.release()
+        return False
 
 
 # ----------------------------------------------------------------------

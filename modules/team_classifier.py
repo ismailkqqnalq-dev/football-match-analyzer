@@ -192,6 +192,12 @@ class TeamClassifier:
     # ----------------------------------------------------------------
     def _collect_sample(self, track_id: int, color: np.ndarray):
         """Bir oyuncunun renk örneğini geçmişine ekler (maksimum limit ile)."""
+        if self.is_fitted and track_id not in self.color_history:
+            max_unlocked = int(getattr(config, "TEAM_COLOR_HISTORY_MAX_UNLOCKED_TRACKS", 512))
+            if max_unlocked > 0:
+                while len(self.color_history) >= max_unlocked:
+                    oldest_tid = next(iter(self.color_history))
+                    self.color_history.pop(oldest_tid, None)
         history = self.color_history[track_id]
         history.append(color)
         # Limit aşılırsa en eski örneği at (sliding window mantığı)
@@ -302,9 +308,11 @@ class TeamClassifier:
 
         print(f"[TeamClassifier] Küme boyutları: {cluster_sizes} -> Rol eşlemesi: {self.cluster_role_map}")
 
-        # Şimdiye kadar toplanan tüm oyunculara nihai etiketlerini ata ve önbellekle
+        # Şimdiye kadar toplanan tüm oyunculara nihai etiketlerini ata, önbellekle
+        # ve renk geçmişini bellekten temizle.
         for tid, label in zip(track_ids, cluster_labels):
             self.team_assignment[tid] = self.cluster_role_map[label]
+            self.color_history.pop(tid, None)
 
         self.is_fitted = True
 
@@ -347,10 +355,12 @@ class TeamClassifier:
                 if cls_name == "referee":
                     det["team"] = "Referee"
                     self.team_assignment[track_id] = "Referee"
+                    self.color_history.pop(track_id, None)
                     continue
                 if cls_name == "goalkeeper":
                     det["team"] = "Goalkeeper"
                     self.team_assignment[track_id] = "Goalkeeper"
+                    self.color_history.pop(track_id, None)
                     continue
 
             # --- 1) ÖNBELLEK KONTROLÜ (KRİTİK HIZ OPTİMİZASYONU) ---
@@ -380,8 +390,10 @@ class TeamClassifier:
                     predicted_cluster = self.kmeans.predict([avg_color])[0]
                     label = self.cluster_role_map[predicted_cluster]
                     det["team"] = label
-                    if len(self.color_history[track_id]) >= self.min_samples_for_lock:
+                    history = self.color_history.get(track_id)
+                    if history is not None and len(history) >= self.min_samples_for_lock:
                         self.team_assignment[track_id] = label
+                        self.color_history.pop(track_id, None)
                 else:
                     det["team"] = None
             else:

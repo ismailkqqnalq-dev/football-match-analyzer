@@ -40,6 +40,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from pandas.api.types import union_categoricals
 from scipy import stats as scipy_stats
 from scipy.spatial import ConvexHull
 from sklearn.base import clone
@@ -71,6 +72,45 @@ from config import config
 # ----------------------------------------------------------------------
 # YARDIMCI FONKSİYONLAR
 # ----------------------------------------------------------------------
+STANDARD_TRACKING_COLUMNS = (
+    "frame_idx",
+    "timestamp_sec",
+    "track_id",
+    "class_name",
+    "team",
+    "confidence",
+    "is_predicted",
+    "bbox_x1",
+    "bbox_y1",
+    "bbox_x2",
+    "bbox_y2",
+    "pixel_x",
+    "pixel_y",
+    "pitch_x",
+    "pitch_y",
+    "on_pitch",
+)
+_STANDARD_TRACKING_COL_SET = frozenset(STANDARD_TRACKING_COLUMNS)
+_ML_CAT_COLS = ("track_id", "class_name", "team")
+_ML_FLOAT32_COLS = (
+    "confidence",
+    "bbox_x1",
+    "bbox_y1",
+    "bbox_x2",
+    "bbox_y2",
+    "pixel_x",
+    "pixel_y",
+    "pitch_x",
+    "pitch_y",
+)
+_ML_BOOL_COLS = ("is_predicted", "on_pitch")
+
+
+def _get_human_class_names() -> set:
+    """M1 4-sınıf (goalkeeper/player/referee) ve eski COCO ('person') uyumlu insan sınıf kümesi."""
+    return set(getattr(config, "HUMAN_CLASS_NAMES", ())) | {"person"}
+
+
 def _clean_str(val: Any) -> Optional[str]:
     """NaN / None / boş metinleri güvenli biçimde None'a dönüştürür."""
     if val is None:
@@ -151,6 +191,190 @@ def _zone_label_from_norm(nx: float, ny: float) -> str:
     return f"{depth}_{lane}"
 
 
+def _bool_mask(series: pd.Series, na_value: bool) -> np.ndarray:
+    """Nullable boolean, float32, int, object ve category serilerini Kleene hatasız bool maskeye çevirir."""
+    n = len(series)
+    if n == 0:
+        return np.empty(0, dtype=bool)
+    dtype = series.dtype
+    if pd.api.types.is_bool_dtype(dtype):
+        return series.fillna(na_value).to_numpy(dtype=bool)
+    if pd.api.types.is_numeric_dtype(dtype):
+        arr = series.to_numpy(dtype=np.float32, copy=False)
+        out = arr != 0
+        nan_m = np.isnan(arr)
+        if nan_m.any():
+            out = out.copy()
+            out[nan_m] = na_value
+        return out
+    codes, uniques = pd.factorize(series, sort=False, use_na_sentinel=True)
+    u_bool = np.empty(len(uniques), dtype=bool)
+    for i, u in enumerate(uniques):
+        if u is None or (isinstance(u, float) and math.isnan(u)):
+            u_bool[i] = na_value
+        elif isinstance(u, (bool, np.bool_)):
+            u_bool[i] = bool(u)
+        elif isinstance(u, (int, float, np.integer, np.floating)):
+            u_bool[i] = float(u) != 0.0
+        else:
+            s = str(u).strip().lower()
+            if s in ("true", "1", "1.0", "yes"):
+                u_bool[i] = True
+            elif s in ("false", "0", "0.0", "no"):
+                u_bool[i] = False
+            else:
+                u_bool[i] = na_value
+    out = np.full(n, na_value, dtype=bool)
+    valid = codes >= 0
+    if valid.any():
+        out[valid] = u_bool[codes[valid]]
+    return out
+
+
+def _compact_bool_series(series: pd.Series) -> pd.Series:
+    """Boolean sütunu bool (non-null) veya Kleene-hatasız float32 (1.0/0.0/NaN) tipine sıkıştırır."""
+    dtype = series.dtype
+    if dtype == np.dtype(bool):
+        return series
+    if pd.api.types.is_bool_dtype(dtype):
+        if not series.isna().any():
+            return series.to_numpy(dtype=bool)
+        arr = np.full(len(series), np.nan, dtype=np.float32)
+        notna = series.notna().to_numpy(dtype=bool)
+        arr[notna] = series.loc[notna].to_numpy(dtype=np.float32)
+        return pd.Series(arr, index=series.index, dtype=np.float32)
+    if pd.api.types.is_numeric_dtype(dtype):
+        if not series.isna().any():
+            arr_num = series.to_numpy(dtype=np.float64, copy=False)
+            if np.all((arr_num == 0) | (arr_num == 1)):
+                return pd.Series(arr_num != 0, index=series.index, dtype=bool)
+        return pd.to_numeric(series, errors="coerce").astype(np.float32)
+
+    codes, uniques = pd.factorize(series, sort=False, use_na_sentinel=True)
+    u_vals = np.full(len(uniques), np.nan, dtype=np.float32)
+    for i, u in enumerate(uniques):
+        if u is None or (isinstance(u, float) and math.isnan(u)):
+            continue
+        if isinstance(u, (bool, np.bool_)):
+            u_vals[i] = 1.0 if bool(u) else 0.0
+        elif isinstance(u, (int, float, np.integer, np.floating)):
+            u_vals[i] = 1.0 if float(u) != 0.0 else 0.0
+        else:
+            s = str(u).strip().lower()
+            if s in ("true", "1", "1.0", "yes"):
+                u_vals[i] = 1.0
+            elif s in ("false", "0", "0.0", "no"):
+                u_vals[i] = 0.0
+    out = np.full(len(series), np.nan, dtype=np.float32)
+    valid = codes >= 0
+    if valid.any():
+        out[valid] = u_vals[codes[valid]]
+    if not np.isnan(out).any():
+        return pd.Series(out != 0.0, index=series.index, dtype=bool)
+    return pd.Series(out, index=series.index, dtype=np.float32)
+
+
+def _compact_tracking_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Yüklenen 16-sütunluk takip DataFrame'ini kompakt tiplere indirger."""
+    if "frame_idx" in df.columns:
+        f_num = pd.to_numeric(df["frame_idx"], errors="coerce")
+        if not f_num.isna().any():
+            df["frame_idx"] = f_num.astype(np.int32)
+        else:
+            df["frame_idx"] = f_num.astype(np.float32)
+
+    if "timestamp_sec" in df.columns:
+        df["timestamp_sec"] = pd.to_numeric(df["timestamp_sec"], errors="coerce").astype(np.float64)
+
+    for col in _ML_FLOAT32_COLS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float32)
+
+    for col in _ML_BOOL_COLS:
+        if col in df.columns:
+            df[col] = _compact_bool_series(df[col])
+
+    for col in _ML_CAT_COLS:
+        if col in df.columns and not isinstance(df[col].dtype, pd.CategoricalDtype):
+            s = df[col]
+            if pd.api.types.is_numeric_dtype(s.dtype):
+                s_str = s.astype(str).where(s.notna(), np.nan)
+                df[col] = pd.Categorical(s_str)
+            else:
+                df[col] = pd.Categorical(s)
+    return df
+
+
+def _encode_clean_strings(series: pd.Series) -> Tuple[np.ndarray, List[str]]:
+    """Serideki benzersiz değerleri _clean_str ile bir kez temizleyip int32 kodlara çevirir (-1 = None)."""
+    n = len(series)
+    if n == 0:
+        return np.empty(0, dtype=np.int32), []
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        raw_codes = series.cat.codes.to_numpy(dtype=np.int32)
+        uniques = series.cat.categories
+    else:
+        raw_codes, uniques = pd.factorize(series, sort=False, use_na_sentinel=True)
+        raw_codes = raw_codes.astype(np.int32, copy=False)
+
+    cleaned_list: List[str] = []
+    str_to_code: Dict[str, int] = {}
+    remap = np.full(len(uniques), -1, dtype=np.int32)
+    for i, u in enumerate(uniques):
+        cs = _clean_str(u)
+        if cs is not None:
+            c = str_to_code.get(cs)
+            if c is None:
+                c = len(cleaned_list)
+                cleaned_list.append(cs)
+                str_to_code[cs] = c
+            remap[i] = c
+
+    out = np.full(n, -1, dtype=np.int32)
+    valid = raw_codes >= 0
+    if valid.any():
+        out[valid] = remap[raw_codes[valid]]
+    return out, cleaned_list
+
+
+def _encode_sorted_track_ids(series: pd.Series) -> Tuple[np.ndarray, List[str]]:
+    """track_id serisini str(val) sırasına uyumlu (groupby düzeni) int32 kodlara ve benzersiz etiket listesine çevirir."""
+    n = len(series)
+    if n == 0:
+        return np.empty(0, dtype=np.int32), []
+    if isinstance(series.dtype, pd.CategoricalDtype):
+        raw_codes = series.cat.codes.to_numpy(dtype=np.int32)
+        uniques = list(series.cat.categories)
+    else:
+        raw_codes, uniques_idx = pd.factorize(series, sort=False, use_na_sentinel=True)
+        raw_codes = raw_codes.astype(np.int32, copy=False)
+        uniques = list(uniques_idx)
+
+    # Aynı str() temsiline sahip benzersizleri tekilleştir ve sırala
+    unique_items: Dict[str, Any] = {}
+    raw_to_str: List[str] = []
+    for u in uniques:
+        su = str(u)
+        raw_to_str.append(su)
+        if su not in unique_items:
+            unique_items[su] = u
+
+    try:
+        sorted_pairs = sorted(unique_items.items(), key=lambda kv: kv[1])
+    except TypeError:
+        sorted_pairs = sorted(unique_items.items(), key=lambda kv: kv[0])
+
+    sorted_strs = [kv[0] for kv in sorted_pairs]
+    str_to_sorted = {s: idx for idx, s in enumerate(sorted_strs)}
+    remap = np.array([str_to_sorted[su] for su in raw_to_str], dtype=np.int32)
+
+    out = np.full(n, -1, dtype=np.int32)
+    valid = raw_codes >= 0
+    if valid.any():
+        out[valid] = remap[raw_codes[valid]]
+    return out, sorted_strs
+
+
 # ----------------------------------------------------------------------
 # ANA ML ANALİZ SINIFI
 # ----------------------------------------------------------------------
@@ -188,8 +412,9 @@ class MLAnalyzer:
         fps: Optional[float] = None,
         analytics_summary: Optional[Dict[str, Any]] = None,
         random_state: int = config.ML_RANDOM_STATE,
+        copy: bool = False,
     ):
-        self.df = df.copy() if df is not None else pd.DataFrame()
+        self.df = df.copy() if (df is not None and copy) else (df if df is not None else pd.DataFrame())
         self.fps = float(fps) if fps and fps > 0 else self._infer_fps()
         self.analytics_summary = analytics_summary
         self.random_state = int(random_state)
@@ -198,11 +423,16 @@ class MLAnalyzer:
         self.coord_mode = "pitch_meters" if self.is_calibrated else "pixel_fallback"
         self.bounds = self._compute_coordinate_bounds()
 
-        # İnceleme / test erişimi için eğitilmiş modeller ve son sonuçlar
+        # İnceleme / test erişimi için eğitilmiş modeller, hız önbelleği ve son sonuçlar
+        self._speed_cache: Dict[bool, Tuple[Tuple[Any, ...], pd.DataFrame, List[Dict[str, Any]]]] = {}
         self.xp_models_: Dict[str, Pipeline] = {}
         self.best_xp_model_name_: Optional[str] = None
         self.best_xp_pipeline_: Optional[Pipeline] = None
         self.last_results_: Optional[Dict[str, Any]] = None
+
+    def clear_cache(self) -> None:
+        """Önbelleğe alınmış adım hızı tablolarını temizler."""
+        self._speed_cache.clear()
 
     # ----------------------------------------------------------------
     @classmethod
@@ -213,11 +443,44 @@ class MLAnalyzer:
         analytics_summary: Optional[Dict[str, Any]] = None,
         random_state: int = config.ML_RANDOM_STATE,
     ) -> "MLAnalyzer":
-        """CSV takip dosyasından MLAnalyzer örneği oluşturur."""
+        """CSV takip dosyasından sütun budamalı ve kompakt tipli MLAnalyzer örneği oluşturur."""
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"CSV dosyası bulunamadı: {csv_path}")
-        df = pd.read_csv(csv_path)
-        return cls(df=df, fps=fps, analytics_summary=analytics_summary, random_state=random_state)
+
+        try:
+            header_cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
+        except pd.errors.EmptyDataError:
+            return cls(
+                df=pd.DataFrame(columns=list(STANDARD_TRACKING_COLUMNS)),
+                fps=fps,
+                analytics_summary=analytics_summary,
+                random_state=random_state,
+                copy=False,
+            )
+        usecols = [c for c in header_cols if c in _STANDARD_TRACKING_COL_SET]
+        usecols_arg = usecols if usecols else None
+
+        dtype_hint = {
+            "track_id": "category",
+            "class_name": "category",
+            "team": "category",
+            "timestamp_sec": "float64",
+            "confidence": "float32",
+            "bbox_x1": "float32",
+            "bbox_y1": "float32",
+            "bbox_x2": "float32",
+            "bbox_y2": "float32",
+            "pixel_x": "float32",
+            "pixel_y": "float32",
+            "pitch_x": "float32",
+            "pitch_y": "float32",
+        }
+        try:
+            df = pd.read_csv(csv_path, usecols=usecols_arg, dtype=dtype_hint)
+        except (ValueError, TypeError):
+            df = pd.read_csv(csv_path, usecols=usecols_arg)
+        df = _compact_tracking_df(df)
+        return cls(df=df, fps=fps, analytics_summary=analytics_summary, random_state=random_state, copy=False)
 
     # ----------------------------------------------------------------
     @classmethod
@@ -229,16 +492,47 @@ class MLAnalyzer:
         analytics_summary: Optional[Dict[str, Any]] = None,
         random_state: int = config.ML_RANDOM_STATE,
     ) -> "MLAnalyzer":
-        """SQLite veritabanından MLAnalyzer örneği oluşturur."""
+        """SQLite veritabanından parçalı (chunked) ve kompakt tipli MLAnalyzer örneği oluşturur."""
         if not os.path.exists(db_path):
             raise FileNotFoundError(f"SQLite dosyası bulunamadı: {db_path}")
         table = table_name or config.EXPORT_SQL_TABLE_NAME
+        safe_table = str(table).replace('"', '""')
+        sql_chunksize = max(1, int(getattr(config, "ANALYTICS_SQL_CHUNKSIZE", 250_000)))
+
         conn = sqlite3.connect(db_path)
         try:
-            df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
+            info_df = pd.read_sql_query(f'PRAGMA table_info("{safe_table}")', conn)
+            existing_cols = info_df["name"].tolist() if not info_df.empty else []
+            selected_cols = [c for c in STANDARD_TRACKING_COLUMNS if c in existing_cols]
+            cols_sql = ", ".join(f'"{c}"' for c in selected_cols) if selected_cols else "*"
+            query = f'SELECT {cols_sql} FROM "{safe_table}"'
+
+            chunks: List[pd.DataFrame] = []
+            for chunk in pd.read_sql_query(query, conn, chunksize=sql_chunksize):
+                chunks.append(_compact_tracking_df(chunk))
         finally:
             conn.close()
-        return cls(df=df, fps=fps, analytics_summary=analytics_summary, random_state=random_state)
+
+        if not chunks:
+            df = pd.DataFrame(columns=selected_cols)
+        elif len(chunks) == 1:
+            df = chunks[0]
+        else:
+            cat_data = {}
+            for col in _ML_CAT_COLS:
+                if col in chunks[0].columns:
+                    cat_data[col] = union_categoricals([c[col] for c in chunks])
+            non_cat_cols = [c for c in chunks[0].columns if c not in cat_data]
+            if non_cat_cols:
+                df = pd.concat([c[non_cat_cols] for c in chunks], ignore_index=True)
+            else:
+                df = pd.DataFrame(index=range(sum(len(c) for c in chunks)))
+            for col, cat_vals in cat_data.items():
+                df[col] = cat_vals
+            ordered_cols = [c for c in chunks[0].columns if c in df.columns]
+            df = df[ordered_cols]
+
+        return cls(df=df, fps=fps, analytics_summary=analytics_summary, random_state=random_state, copy=False)
 
     # ----------------------------------------------------------------
     def _infer_fps(self) -> float:
@@ -246,22 +540,34 @@ class MLAnalyzer:
         if self.df.empty or "frame_idx" not in self.df.columns or "timestamp_sec" not in self.df.columns:
             return 25.0
 
-        ts_df = (
-            self.df[["frame_idx", "timestamp_sec"]]
-            .dropna()
-            .drop_duplicates(subset=["frame_idx"])
-            .sort_values("frame_idx")
-        )
-        if len(ts_df) < 2:
+        f_arr = pd.to_numeric(self.df["frame_idx"], errors="coerce").to_numpy(dtype=np.float64)
+        t_arr = pd.to_numeric(self.df["timestamp_sec"], errors="coerce").to_numpy(dtype=np.float64)
+        valid_ft = np.isfinite(f_arr) & np.isfinite(t_arr)
+        if int(valid_ft.sum()) < 2:
             return 25.0
 
-        df_idx = ts_df["frame_idx"].diff()
-        dt = ts_df["timestamp_sec"].diff()
+        f_arr = f_arr[valid_ft]
+        t_arr = t_arr[valid_ft]
+        if np.any(f_arr[1:] < f_arr[:-1]):
+            order = np.argsort(f_arr, kind="mergesort")
+            f_arr = f_arr[order]
+            t_arr = t_arr[order]
+
+        first = np.empty(len(f_arr), dtype=bool)
+        first[0] = True
+        first[1:] = f_arr[1:] != f_arr[:-1]
+        f_u = f_arr[first]
+        t_u = t_arr[first]
+        if len(f_u) < 2:
+            return 25.0
+
+        df_idx = np.diff(f_u)
+        dt = np.diff(t_u)
         valid = (df_idx > 0) & (dt > 0)
         if not valid.any():
             return 25.0
 
-        est = float((df_idx[valid] / dt[valid]).median())
+        est = float(np.median(df_idx[valid] / dt[valid]))
         if est <= 0 or math.isnan(est) or math.isinf(est):
             return 25.0
         if abs(est - round(est)) < 0.05:
@@ -279,12 +585,18 @@ class MLAnalyzer:
         ):
             return False, False, False
 
-        has_valid_pitch = self.df["pitch_x"].notna() & self.df["pitch_y"].notna()
-        is_ball = self.df["class_name"] == config.BALL_CLASS_NAME
-        team_not_ref = (self.df["team"] != "Referee") if "team" in self.df.columns else True
+        has_valid_pitch = (self.df["pitch_x"].notna() & self.df["pitch_y"].notna()).to_numpy(dtype=bool)
+        cls_s = self.df["class_name"]
+        is_ball = (cls_s == config.BALL_CLASS_NAME).fillna(False).to_numpy(dtype=bool)
+        human_names = _get_human_class_names()
+        team_not_ref = (
+            ~((self.df["team"] == "Referee").fillna(False).to_numpy(dtype=bool))
+            if "team" in self.df.columns
+            else True
+        )
         is_player = (
-            self.df["class_name"].isin(config.HUMAN_CLASS_NAMES)
-            & (self.df["class_name"] != "referee")
+            cls_s.isin(human_names).fillna(False).to_numpy(dtype=bool)
+            & ~((cls_s == "referee").fillna(False).to_numpy(dtype=bool))
             & team_not_ref
         )
         has_pitch_players = bool((has_valid_pitch & is_player).any())
@@ -317,29 +629,35 @@ class MLAnalyzer:
         if self.df.empty or "pixel_x" not in self.df.columns or "pixel_y" not in self.df.columns:
             return (0.0, 1920.0, 0.0, 1080.0)
 
-        obs = self.df.dropna(subset=["pixel_x", "pixel_y"]).copy()
-        if max_frame_idx is not None and "frame_idx" in obs.columns:
-            obs_split = obs[obs["frame_idx"] <= int(max_frame_idx)]
-            if not obs_split.empty:
-                obs = obs_split
-        if "is_predicted" in obs.columns:
-            obs_real = obs[obs["is_predicted"] != True]  # noqa: E712
-            if not obs_real.empty:
-                obs = obs_real
-        valid_bbox = self._get_valid_bbox_mask(obs)
-        if valid_bbox.any():
-            obs = obs[valid_bbox]
-        in_frame = obs[(obs["pixel_x"] >= 0.0) & (obs["pixel_y"] >= 0.0)]
-        if not in_frame.empty:
-            obs = in_frame
-
-        if obs.empty:
+        mask = (self.df["pixel_x"].notna() & self.df["pixel_y"].notna()).to_numpy(dtype=bool)
+        if not mask.any():
             return (0.0, 1920.0, 0.0, 1080.0)
 
-        min_x = float(obs["pixel_x"].min())
-        max_x = float(obs["pixel_x"].max())
-        min_y = float(obs["pixel_y"].min())
-        max_y = float(obs["pixel_y"].max())
+        if max_frame_idx is not None and "frame_idx" in self.df.columns:
+            m = mask & (self.df["frame_idx"] <= int(max_frame_idx)).fillna(False).to_numpy(dtype=bool)
+            if m.any():
+                mask = m
+        if "is_predicted" in self.df.columns:
+            m = mask & (~_bool_mask(self.df["is_predicted"], na_value=False))
+            if m.any():
+                mask = m
+        valid_bbox = self._get_valid_bbox_mask(self.df).to_numpy(dtype=bool)
+        m = mask & valid_bbox
+        if m.any():
+            mask = m
+        in_frame = mask & ((self.df["pixel_x"] >= 0.0) & (self.df["pixel_y"] >= 0.0)).fillna(False).to_numpy(dtype=bool)
+        if in_frame.any():
+            mask = in_frame
+
+        if not mask.any():
+            return (0.0, 1920.0, 0.0, 1080.0)
+
+        px_vals = self.df.loc[mask, "pixel_x"].to_numpy(dtype=np.float64)
+        py_vals = self.df.loc[mask, "pixel_y"].to_numpy(dtype=np.float64)
+        min_x = float(px_vals.min())
+        max_x = float(px_vals.max())
+        min_y = float(py_vals.min())
+        max_y = float(py_vals.max())
         if max_x - min_x < 10.0:
             max_x = min_x + 100.0
         if max_y - min_y < 10.0:
@@ -425,41 +743,42 @@ class MLAnalyzer:
             }
 
         is_ball = (
-            self.df["class_name"] == config.BALL_CLASS_NAME
+            (self.df["class_name"] == config.BALL_CLASS_NAME).fillna(False).to_numpy(dtype=bool)
             if "class_name" in self.df.columns
-            else pd.Series(False, index=self.df.index)
+            else np.zeros(n_rows, dtype=bool)
         )
+        human_names = _get_human_class_names()
         is_human = (
-            self.df["class_name"].isin(config.HUMAN_CLASS_NAMES)
+            self.df["class_name"].isin(human_names).fillna(False).to_numpy(dtype=bool)
             if "class_name" in self.df.columns
-            else pd.Series(False, index=self.df.index)
+            else np.zeros(n_rows, dtype=bool)
         )
         is_pred = (
-            self.df["is_predicted"].fillna(False).astype(bool)
+            _bool_mask(self.df["is_predicted"], na_value=False)
             if "is_predicted" in self.df.columns
-            else pd.Series(False, index=self.df.index)
+            else np.zeros(n_rows, dtype=bool)
         )
 
         team_na = (
-            self.df["team"].isna()
+            self.df["team"].isna().to_numpy(dtype=bool)
             if "team" in self.df.columns
-            else pd.Series(True, index=self.df.index)
+            else np.ones(n_rows, dtype=bool)
         )
         team_na_ball = int((team_na & is_ball).sum())
         team_na_human = int((team_na & is_human).sum())
 
         conf_na_human = (
-            int((self.df["confidence"].isna() & is_human).sum())
+            int((self.df["confidence"].isna().to_numpy(dtype=bool) & is_human).sum())
             if "confidence" in self.df.columns
             else n_rows
         )
         conf_na_ball = (
-            int((self.df["confidence"].isna() & is_ball).sum())
+            int((self.df["confidence"].isna().to_numpy(dtype=bool) & is_ball).sum())
             if "confidence" in self.df.columns
             else n_rows
         )
 
-        valid_bbox = self._get_valid_bbox_mask(self.df)
+        valid_bbox = self._get_valid_bbox_mask(self.df).to_numpy(dtype=bool)
         invalid_bbox_total = int((~valid_bbox).sum())
         invalid_bbox_pred = int((~valid_bbox & is_pred).sum())
 
@@ -468,17 +787,19 @@ class MLAnalyzer:
         if "pixel_x" in self.df.columns and "pixel_y" in self.df.columns:
             max_px_x = max(1920.0, float(self.bounds[1]))
             max_px_y = max(1080.0, float(self.bounds[3]))
+            px_x = self.df["pixel_x"].to_numpy(dtype=np.float64, copy=False)
+            px_y = self.df["pixel_y"].to_numpy(dtype=np.float64, copy=False)
             oob_mask = (
-                (self.df["pixel_x"] < 0.0)
-                | (self.df["pixel_y"] < 0.0)
-                | (self.df["pixel_x"] > max_px_x)
-                | (self.df["pixel_y"] > max_px_y)
+                (px_x < 0.0)
+                | (px_y < 0.0)
+                | (px_x > max_px_x)
+                | (px_y > max_px_y)
             )
             oob_total = int(oob_mask.sum())
             oob_pred = int((oob_mask & is_pred).sum())
 
         on_pitch_false = (
-            int((self.df["on_pitch"] == False).sum())  # noqa: E712
+            int((~_bool_mask(self.df["on_pitch"], na_value=True)).sum())
             if "on_pitch" in self.df.columns
             else 0
         )
@@ -486,11 +807,15 @@ class MLAnalyzer:
         # Takip izlerinin gözlenen kare sayıları (geçici kısa izleri tespit et)
         transient_tracks: List[str] = []
         if "track_id" in self.df.columns:
-            human_obs = self.df[is_human & (~is_pred)]
-            if not human_obs.empty:
-                obs_counts = human_obs["track_id"].astype(str).value_counts()
+            tid_sub = self.df.loc[is_human & (~is_pred), "track_id"]
+            if not tid_sub.empty:
+                if isinstance(tid_sub.dtype, pd.CategoricalDtype) or pd.api.types.is_integer_dtype(tid_sub.dtype):
+                    obs_counts = tid_sub.value_counts()
+                else:
+                    obs_counts = tid_sub.astype(str).value_counts()
                 transient_tracks = [
-                    tid for tid, cnt in obs_counts.items() if int(cnt) < config.ML_MIN_TRACK_FRAMES
+                    str(tid) for tid, cnt in obs_counts.items()
+                    if 0 < int(cnt) < config.ML_MIN_TRACK_FRAMES
                 ]
 
         handling_strategy = [
@@ -553,6 +878,19 @@ class MLAnalyzer:
         Gerçek dışı hız sıçramalarını (ışınlanma / kamera kesmesi) hız ortalamalarından
         ayırır ve anomali adayı olarak döndürür.
         """
+        cache_key = bool(exclude_referees)
+        cache_sig = (
+            id(self.df),
+            self.df.shape,
+            tuple(self.df.columns),
+            self.is_calibrated,
+            self.fps,
+            self.bounds,
+        )
+        cached = self._speed_cache.get(cache_key)
+        if cached is not None and cached[0] == cache_sig:
+            return cached[1].copy(deep=True), [dict(a) for a in cached[2]]
+
         x_col, y_col = self._get_xy_columns()
         empty_cols = [
             "frame_idx", "timestamp_sec", "track_id", "team",
@@ -564,31 +902,102 @@ class MLAnalyzer:
             or y_col not in self.df.columns
             or "class_name" not in self.df.columns
             or "frame_idx" not in self.df.columns
+            or "track_id" not in self.df.columns
         ):
-            return pd.DataFrame(columns=empty_cols), []
+            empty_df = pd.DataFrame(columns=empty_cols)
+            self._speed_cache[cache_key] = (cache_sig, empty_df, [])
+            return empty_df.copy(deep=True), []
 
-        valid_bbox = self._get_valid_bbox_mask(self.df)
-        mask = self.df["class_name"].isin(config.HUMAN_CLASS_NAMES) & valid_bbox
+        valid_bbox = self._get_valid_bbox_mask(self.df).to_numpy(dtype=bool)
+        cls_s = self.df["class_name"]
+        human_names = _get_human_class_names()
+        mask = cls_s.isin(human_names).fillna(False).to_numpy(dtype=bool) & valid_bbox
         if exclude_referees:
-            team_not_ref = (self.df["team"] != "Referee") if "team" in self.df.columns else True
-            mask &= (self.df["class_name"] != "referee") & team_not_ref
+            team_not_ref = (
+                ~((self.df["team"] == "Referee").fillna(False).to_numpy(dtype=bool))
+                if "team" in self.df.columns
+                else True
+            )
+            mask &= ~((cls_s == "referee").fillna(False).to_numpy(dtype=bool)) & team_not_ref
         if "is_predicted" in self.df.columns:
-            mask &= self.df["is_predicted"] != True  # noqa: E712
+            mask &= ~_bool_mask(self.df["is_predicted"], na_value=False)
         if self.is_calibrated and "on_pitch" in self.df.columns:
-            mask &= self.df["on_pitch"] != False  # noqa: E712
+            mask &= _bool_mask(self.df["on_pitch"], na_value=True)
 
-        sub = self.df[mask].dropna(subset=[x_col, y_col, "frame_idx"]).copy()
-        if sub.empty:
-            return pd.DataFrame(columns=empty_cols), []
+        mask &= (
+            self.df[x_col].notna().to_numpy(dtype=bool)
+            & self.df[y_col].notna().to_numpy(dtype=bool)
+            & self.df["frame_idx"].notna().to_numpy(dtype=bool)
+            & self.df["track_id"].notna().to_numpy(dtype=bool)
+        )
 
         if not self.is_calibrated:
             min_x, max_x, min_y, max_y = self.bounds
-            sub = sub[
-                (sub[x_col] >= min_x - 30.0)
-                & (sub[x_col] <= max_x + 30.0)
-                & (sub[y_col] >= min_y - 30.0)
-                & (sub[y_col] <= max_y + 30.0)
-            ]
+            x_all = self.df[x_col].to_numpy(dtype=np.float64, copy=False)
+            y_all = self.df[y_col].to_numpy(dtype=np.float64, copy=False)
+            mask &= (
+                (x_all >= min_x - 30.0)
+                & (x_all <= max_x + 30.0)
+                & (y_all >= min_y - 30.0)
+                & (y_all <= max_y + 30.0)
+            )
+
+        idx = np.flatnonzero(mask)
+        if len(idx) < 2:
+            empty_df = pd.DataFrame(columns=empty_cols)
+            self._speed_cache[cache_key] = (cache_sig, empty_df, [])
+            return empty_df.copy(deep=True), []
+
+        tid_codes, tid_strs = _encode_sorted_track_ids(self.df["track_id"].iloc[idx])
+        fids = self.df["frame_idx"].iloc[idx].to_numpy(dtype=np.int64)
+        xs = np.round(self.df[x_col].iloc[idx].to_numpy(dtype=np.float64), 4)
+        ys = np.round(self.df[y_col].iloc[idx].to_numpy(dtype=np.float64), 4)
+        ts_arr = (
+            np.round(self.df["timestamp_sec"].iloc[idx].to_numpy(dtype=np.float64), 4)
+            if "timestamp_sec" in self.df.columns
+            else np.full(len(idx), np.nan, dtype=np.float64)
+        )
+        if "team" in self.df.columns:
+            team_codes, team_strs = _encode_clean_strings(self.df["team"].iloc[idx])
+        else:
+            team_codes = np.full(len(idx), -1, dtype=np.int32)
+            team_strs = []
+
+        # Kararlı (track_id, frame_idx) sıralaması ve yinelenen karelerin ilkini tutma
+        order = np.lexsort((fids, tid_codes))
+        tid_codes = tid_codes[order]
+        fids = fids[order]
+        xs = xs[order]
+        ys = ys[order]
+        ts_arr = ts_arr[order]
+        team_codes = team_codes[order]
+
+        dup_keep = np.empty(len(fids), dtype=bool)
+        dup_keep[0] = True
+        dup_keep[1:] = (tid_codes[1:] != tid_codes[:-1]) | (fids[1:] != fids[:-1])
+        if not dup_keep.all():
+            tid_codes = tid_codes[dup_keep]
+            fids = fids[dup_keep]
+            xs = xs[dup_keep]
+            ys = ys[dup_keep]
+            ts_arr = ts_arr[dup_keep]
+            team_codes = team_codes[dup_keep]
+
+        n_rows = len(fids)
+        if n_rows < 2:
+            empty_df = pd.DataFrame(columns=empty_cols)
+            self._speed_cache[cache_key] = (cache_sig, empty_df, [])
+            return empty_df.copy(deep=True), []
+
+        # Nedensel takım ileri doldurma (track başına)
+        idx_all = np.arange(n_rows, dtype=np.int64)
+        is_t_start = np.empty(n_rows, dtype=bool)
+        is_t_start[0] = True
+        is_t_start[1:] = tid_codes[1:] != tid_codes[:-1]
+        row_t_start = np.maximum.accumulate(np.where(is_t_start, idx_all, 0))
+        last_valid_pos = np.maximum.accumulate(np.where(team_codes >= 0, idx_all, -1))
+        has_team = last_valid_pos >= row_t_start
+        resolved_team_codes = np.where(has_team, team_codes[np.maximum(0, last_valid_pos)], -1)
 
         max_speed_cap = (
             float(config.MAX_REALISTIC_PLAYER_SPEED_KMH)
@@ -598,104 +1007,105 @@ class MLAnalyzer:
         max_gap = max(1, int(config.DISTANCE_CALC_MAX_FRAME_GAP))
         smooth_win = min(3, max(1, int(config.SPEED_SMOOTHING_WINDOW_FRAMES)))
 
-        speed_rows: List[Dict[str, Any]] = []
+        same_track = tid_codes[1:] == tid_codes[:-1]
+        df_i = fids[1:] - fids[:-1]
+        step_ok = same_track & (df_i > 0) & (df_i <= max_gap)
+        dt_step = np.where(step_ok, df_i / self.fps, 1.0)
+        dx_step = xs[1:] - xs[:-1]
+        dy_step = ys[1:] - ys[:-1]
+        dist_step = np.hypot(dx_step, dy_step)
+        scale_spd = 3.6 if self.is_calibrated else 1.0
+        raw_spd_step = np.where(step_ok, (dist_step / dt_step) * scale_spd, 0.0)
+
+        step_ok_full = np.r_[False, step_ok]
+        raw_spd_full = np.r_[0.0, raw_spd_step]
+        dx_full = np.r_[0.0, dx_step]
+        dy_full = np.r_[0.0, dy_step]
+        dt_full = np.r_[0.0, dt_step]
+
+        is_spike = step_ok_full & (raw_spd_full > max_speed_cap)
         spike_anomalies: List[Dict[str, Any]] = []
+        if is_spike.any():
+            unit = "km/sa" if self.is_calibrated else "px/sn"
+            for si in np.flatnonzero(is_spike):
+                s_idx = int(si)
+                tid_s = tid_strs[int(tid_codes[s_idx])]
+                tmc = int(resolved_team_codes[s_idx])
+                team_s = team_strs[tmc] if tmc >= 0 else "Unknown"
+                ts_s = float(ts_arr[s_idx]) if np.isfinite(ts_arr[s_idx]) else float(fids[s_idx]) / self.fps
+                r_spd = float(raw_spd_full[s_idx])
+                spike_anomalies.append({
+                    "anomaly_type": "speed_spike",
+                    "severity": "high",
+                    "frame_idx": int(fids[s_idx]),
+                    "timestamp_sec": round(ts_s, 2),
+                    "track_id": tid_s,
+                    "team": team_s,
+                    "metric_value": round(r_spd, 2),
+                    "threshold": max_speed_cap,
+                    "description_tr": (
+                        f"Oyuncu {tid_s} için fiziksel sınır üstü hız sıçraması "
+                        f"({r_spd:.1f} {unit} > {max_speed_cap:.1f} {unit}); ortalama hesaptan dışlandı."
+                    ),
+                })
 
-        # Nedensel takım çözümlemesi için track bazında son bilinen takım
-        for tid_raw, grp in sub.groupby("track_id"):
-            tid = str(tid_raw)
-            grp = grp.sort_values("frame_idx").drop_duplicates(subset=["frame_idx"]).reset_index(drop=True)
-            if len(grp) < 2:
-                continue
+        is_keep = step_ok_full & (~is_spike)
+        if not is_keep.any():
+            empty_df = pd.DataFrame(columns=empty_cols)
+            self._speed_cache[cache_key] = (cache_sig, empty_df, spike_anomalies)
+            return empty_df.copy(deep=True), [dict(a) for a in spike_anomalies]
 
-            fdiff = grp["frame_idx"].diff()
-            seg_ids = (fdiff.isna() | (fdiff > max_gap)).cumsum()
+        # Kesinlikle nedensel geriye dönük yumuşatma (segment ve sıçrama sınırlarında sıfırlanır)
+        last_reset = np.maximum.accumulate(np.where(~is_keep, idx_all, -1))
+        run_len = idx_all - last_reset
+        w_eff = np.minimum(run_len, smooth_win)
 
-            # Nedensel takım: ilk geçerli takım gözlemi sonrası taşınır
-            running_team: Optional[str] = None
-            resolved_teams: List[Optional[str]] = []
-            team_series = grp["team"].tolist() if "team" in grp.columns else [None] * len(grp)
-            for t_val in team_series:
-                ct = _clean_str(t_val)
-                if ct is not None:
-                    running_team = ct
-                resolved_teams.append(ct if ct is not None else running_team)
-            grp["_causal_team"] = resolved_teams
+        keep_idx = np.flatnonzero(is_keep)
+        w_k = w_eff[keep_idx].astype(np.float64)
+        spd_sum = raw_spd_full[keep_idx].copy()
+        for offset in range(1, smooth_win):
+            has_prev = w_eff[keep_idx] > offset
+            if has_prev.any():
+                spd_sum[has_prev] += raw_spd_full[keep_idx[has_prev] - offset]
+        smoothed_spd = spd_sum / w_k
 
-            for _, seg in grp.groupby(seg_ids):
-                seg = seg.reset_index(drop=True)
-                if len(seg) < 2:
-                    continue
+        ts_keep_raw = ts_arr[keep_idx]
+        ts_keep = np.where(np.isfinite(ts_keep_raw), ts_keep_raw, fids[keep_idx] / self.fps)
+        x_keep = xs[keep_idx]
+        y_keep = ys[keep_idx]
+        min_bx, max_bx, min_by, max_by = self.bounds
+        nx_keep = np.clip((x_keep - min_bx) / max(1e-6, max_bx - min_bx), 0.0, 1.0)
+        ny_keep = np.clip((y_keep - min_by) / max(1e-6, max_by - min_by), 0.0, 1.0)
 
-                raw_xs = seg[x_col].to_numpy(dtype=float)
-                raw_ys = seg[y_col].to_numpy(dtype=float)
-                # Kesinlikle nedensel (center=False) geriye dönük hareketli ortalama için adım tamponu
-                valid_step_speeds: List[float] = []
+        team_cats = list(team_strs)
+        if "Unknown" in team_cats:
+            unknown_code = team_cats.index("Unknown")
+        else:
+            unknown_code = len(team_cats)
+            team_cats.append("Unknown")
+        keep_team_codes = np.where(
+            resolved_team_codes[keep_idx] >= 0,
+            resolved_team_codes[keep_idx],
+            unknown_code,
+        )
 
-                for i in range(1, len(seg)):
-                    df_i = int(seg.loc[i, "frame_idx"] - seg.loc[i - 1, "frame_idx"])
-                    if df_i <= 0 or df_i > max_gap:
-                        valid_step_speeds.clear()
-                        continue
-                    dt = df_i / self.fps
-                    if dt <= 0:
-                        valid_step_speeds.clear()
-                        continue
+        speed_df = pd.DataFrame({
+            "frame_idx": fids[keep_idx].astype(np.int32),
+            "timestamp_sec": np.round(ts_keep, 3),
+            "track_id": pd.Categorical.from_codes(tid_codes[keep_idx], categories=tid_strs),
+            "team": pd.Categorical.from_codes(keep_team_codes, categories=team_cats),
+            "x": x_keep,
+            "y": y_keep,
+            "norm_x": nx_keep,
+            "norm_y": ny_keep,
+            "speed": smoothed_spd,
+            "dx": dx_full[keep_idx],
+            "dy": dy_full[keep_idx],
+            "dt": dt_full[keep_idx],
+        })
 
-                    dx = float(raw_xs[i] - raw_xs[i - 1])
-                    dy = float(raw_ys[i] - raw_ys[i - 1])
-                    dist = math.hypot(dx, dy)
-                    raw_speed = (dist / dt) * 3.6 if self.is_calibrated else (dist / dt)
-
-                    ts_raw = seg.loc[i, "timestamp_sec"] if "timestamp_sec" in seg.columns else None
-                    ts = (
-                        float(ts_raw)
-                        if ts_raw is not None and not pd.isna(ts_raw)
-                        else float(seg.loc[i, "frame_idx"]) / self.fps
-                    )
-                    x_val = float(raw_xs[i])
-                    y_val = float(raw_ys[i])
-                    nx, ny = self._normalize_xy(x_val, y_val)
-
-                    if raw_speed > max_speed_cap:
-                        unit = "km/sa" if self.is_calibrated else "px/sn"
-                        spike_anomalies.append({
-                            "anomaly_type": "speed_spike",
-                            "severity": "high",
-                            "frame_idx": int(seg.loc[i, "frame_idx"]),
-                            "timestamp_sec": round(ts, 2),
-                            "track_id": tid,
-                            "team": seg.loc[i, "_causal_team"] or "Unknown",
-                            "metric_value": round(raw_speed, 2),
-                            "threshold": max_speed_cap,
-                            "description_tr": (
-                                f"Oyuncu {tid} için fiziksel sınır üstü hız sıçraması "
-                                f"({raw_speed:.1f} {unit} > {max_speed_cap:.1f} {unit}); ortalama hesaptan dışlandı."
-                            ),
-                        })
-                        # Sıçrama sonraki adımların nedensel penceresini kirletmesin
-                        valid_step_speeds.clear()
-                        continue
-
-                    valid_step_speeds.append(raw_speed)
-                    speed = float(np.mean(valid_step_speeds[-smooth_win:]))
-
-                    speed_rows.append({
-                        "frame_idx": int(seg.loc[i, "frame_idx"]),
-                        "timestamp_sec": round(ts, 3),
-                        "track_id": tid,
-                        "team": seg.loc[i, "_causal_team"] or "Unknown",
-                        "x": x_val,
-                        "y": y_val,
-                        "norm_x": nx,
-                        "norm_y": ny,
-                        "speed": speed,
-                        "dx": dx,
-                        "dy": dy,
-                        "dt": dt,
-                    })
-
-        return pd.DataFrame(speed_rows, columns=empty_cols), spike_anomalies
+        self._speed_cache[cache_key] = (cache_sig, speed_df, spike_anomalies)
+        return speed_df.copy(deep=True), [dict(a) for a in spike_anomalies]
 
     # ----------------------------------------------------------------
     def extract_proxy_pass_events(self) -> pd.DataFrame:
@@ -726,32 +1136,121 @@ class MLAnalyzer:
         ):
             return pd.DataFrame(columns=event_cols)
 
-        df_sorted = self.df.sort_values("frame_idx").copy()
+        cls_s = self.df["class_name"]
+        f_notna = self.df["frame_idx"].notna().to_numpy(dtype=bool)
+        xy_notna = (self.df[x_col].notna() & self.df[y_col].notna()).to_numpy(dtype=bool)
 
         # Top verisi (aynı karede varsa is_predicted=False tercih edilir)
-        ball_df = df_sorted[df_sorted["class_name"] == config.BALL_CLASS_NAME].dropna(subset=[x_col, y_col]).copy()
-        if ball_df.empty:
+        b_mask = (cls_s == config.BALL_CLASS_NAME).fillna(False).to_numpy(dtype=bool) & xy_notna & f_notna
+        b_idx = np.flatnonzero(b_mask)
+        if len(b_idx) == 0:
             return pd.DataFrame(columns=event_cols)
-        if "is_predicted" in ball_df.columns:
-            ball_df["_pred_sort"] = ball_df["is_predicted"].fillna(False).astype(bool)
-            ball_df = ball_df.sort_values(["frame_idx", "_pred_sort"]).drop_duplicates(subset=["frame_idx"])
-        else:
-            ball_df["_pred_sort"] = False
-            ball_df = ball_df.sort_values("frame_idx").drop_duplicates(subset=["frame_idx"])
 
-        valid_bbox = self._get_valid_bbox_mask(df_sorted)
-        team_not_ref = (df_sorted["team"] != "Referee") if "team" in df_sorted.columns else True
-        players_df = df_sorted[
-            df_sorted["class_name"].isin(config.HUMAN_CLASS_NAMES)
-            & (df_sorted["class_name"] != "referee")
+        b_fids = self.df["frame_idx"].iloc[b_idx].to_numpy(dtype=np.int64)
+        b_xs = self.df[x_col].iloc[b_idx].to_numpy(dtype=np.float64)
+        b_ys = self.df[y_col].iloc[b_idx].to_numpy(dtype=np.float64)
+        b_ts = (
+            self.df["timestamp_sec"].iloc[b_idx].to_numpy(dtype=np.float64)
+            if "timestamp_sec" in self.df.columns
+            else np.full(len(b_idx), np.nan, dtype=np.float64)
+        )
+        b_pred = (
+            _bool_mask(self.df["is_predicted"].iloc[b_idx], na_value=False).astype(np.uint8)
+            if "is_predicted" in self.df.columns
+            else np.zeros(len(b_idx), dtype=np.uint8)
+        )
+        b_ord = np.lexsort((b_pred, b_fids))
+        b_fids = b_fids[b_ord]
+        b_xs = b_xs[b_ord]
+        b_ys = b_ys[b_ord]
+        b_ts = b_ts[b_ord]
+        b_pred = b_pred[b_ord]
+
+        b_first = np.empty(len(b_fids), dtype=bool)
+        b_first[0] = True
+        b_first[1:] = b_fids[1:] != b_fids[:-1]
+        ball_fids = b_fids[b_first]
+        ball_xs = b_xs[b_first]
+        ball_ys = b_ys[b_first]
+        ball_ts = b_ts[b_first]
+        ball_is_pred = b_pred[b_first]
+
+        valid_bbox = self._get_valid_bbox_mask(self.df).to_numpy(dtype=bool)
+        human_names = _get_human_class_names()
+        team_not_ref = (
+            ~((self.df["team"] == "Referee").fillna(False).to_numpy(dtype=bool))
+            if "team" in self.df.columns
+            else True
+        )
+        p_mask = (
+            cls_s.isin(human_names).fillna(False).to_numpy(dtype=bool)
+            & ~((cls_s == "referee").fillna(False).to_numpy(dtype=bool))
             & team_not_ref
             & valid_bbox
-        ].dropna(subset=[x_col, y_col]).copy()
-        if self.is_calibrated and "on_pitch" in players_df.columns:
-            players_df = players_df[players_df["on_pitch"] != False]  # noqa: E712
+            & xy_notna
+            & f_notna
+        )
+        if self.is_calibrated and "on_pitch" in self.df.columns:
+            p_mask &= _bool_mask(self.df["on_pitch"], na_value=True)
 
-        if players_df.empty:
+        p_idx = np.flatnonzero(p_mask)
+        if len(p_idx) == 0:
             return pd.DataFrame(columns=event_cols)
+
+        p_fids = self.df["frame_idx"].iloc[p_idx].to_numpy(dtype=np.int64)
+        p_xs = self.df[x_col].iloc[p_idx].to_numpy(dtype=np.float64)
+        p_ys = self.df[y_col].iloc[p_idx].to_numpy(dtype=np.float64)
+        p_tid_codes, tid_list = (
+            _encode_clean_strings(self.df["track_id"].iloc[p_idx])
+            if "track_id" in self.df.columns
+            else (np.full(len(p_idx), -1, dtype=np.int32), [])
+        )
+        p_team_codes, team_list = (
+            _encode_clean_strings(self.df["team"].iloc[p_idx])
+            if "team" in self.df.columns
+            else (np.full(len(p_idx), -1, dtype=np.int32), [])
+        )
+        p_is_pred = (
+            _bool_mask(self.df["is_predicted"].iloc[p_idx], na_value=False).astype(np.uint8)
+            if "is_predicted" in self.df.columns
+            else np.zeros(len(p_idx), dtype=np.uint8)
+        )
+
+        # Kare sırasına göre kararlı sıralama (kare içi sıra korunur)
+        if len(p_fids) > 1 and np.any(p_fids[1:] < p_fids[:-1]):
+            p_ord = np.argsort(p_fids, kind="mergesort")
+            p_fids = p_fids[p_ord]
+            p_xs = p_xs[p_ord]
+            p_ys = p_ys[p_ord]
+            p_tid_codes = p_tid_codes[p_ord]
+            p_team_codes = p_team_codes[p_ord]
+            p_is_pred = p_is_pred[p_ord]
+
+        # NEDENSEL (CAUSAL) takım çözümleme: Yalnızca kesinlikle önceki karelerden (fid' < fid)
+        n_p = len(p_fids)
+        order = np.lexsort((p_fids, p_tid_codes))
+        tc = p_tid_codes[order]
+        fc = p_fids[order]
+        tm = p_team_codes[order]
+        idx_p = np.arange(n_p, dtype=np.int64)
+
+        is_t_start = np.empty(n_p, dtype=bool)
+        is_t_start[0] = True
+        is_t_start[1:] = tc[1:] != tc[:-1]
+        is_tf_start = is_t_start.copy()
+        if n_p > 1:
+            is_tf_start[1:] |= (fc[1:] != fc[:-1])
+
+        row_t_start = np.maximum.accumulate(np.where(is_t_start, idx_p, 0))
+        row_tf_start = np.maximum.accumulate(np.where(is_tf_start, idx_p, 0))
+        last_valid_pos = np.maximum.accumulate(np.where(tm >= 0, idx_p, -1))
+        prev_pos = np.where(row_tf_start > 0, last_valid_pos[np.maximum(0, row_tf_start - 1)], -1)
+        has_prior = (prev_pos >= row_t_start) & (tc >= 0)
+        resolved_sorted = np.where(tm >= 0, tm, np.where(has_prior, tm[np.maximum(0, prev_pos)], -1))
+
+        p_resolved_team_codes = np.empty(n_p, dtype=np.int32)
+        p_resolved_team_codes[order] = resolved_sorted
+        p_raw_missing = (p_team_codes < 0).astype(np.uint8)
 
         max_ctrl_dist = (
             float(config.POSSESSION_MAX_PLAYER_BALL_DIST_M)
@@ -765,102 +1264,220 @@ class MLAnalyzer:
             else float(config.PASS_MIN_BALL_MOVE_PX)
         )
 
-        # Oyuncu hızlarını nedensel sözlük olarak hazırla
+        # Oyuncu hızlarını np.searchsorted tabanlı arama dizisi olarak hazırla
         speed_df, _ = self._compute_player_step_speeds(exclude_referees=True)
-        speed_lookup: Dict[Tuple[int, str], float] = {}
-        if not speed_df.empty:
-            for _, sr in speed_df.iterrows():
-                speed_lookup[(int(sr["frame_idx"]), str(sr["track_id"]))] = float(sr["speed"])
+        tid_to_code = {s: i for i, s in enumerate(tid_list)}
+        sp_keys_s = np.empty(0, dtype=np.int64)
+        sp_vals_s = np.empty(0, dtype=np.float64)
+        sp_fallback: Dict[Tuple[int, int], float] = {}
+        if not speed_df.empty and tid_to_code:
+            sp_fids = speed_df["frame_idx"].to_numpy(dtype=np.int64)
+            sp_raw_c, sp_uniqs = pd.factorize(speed_df["track_id"], sort=False)
+            sp_remap = np.array([tid_to_code.get(str(u), -1) for u in sp_uniqs], dtype=np.int32)
+            sp_tids = np.where(sp_raw_c >= 0, sp_remap[np.maximum(0, sp_raw_c)], -1)
+            sp_spds = speed_df["speed"].to_numpy(dtype=np.float64)
+            sp_in_range = (sp_tids >= 0) & (sp_fids >= 0) & (sp_fids < (1 << 31))
+            if sp_in_range.any():
+                sp_keys = (sp_fids[sp_in_range] << 32) | sp_tids[sp_in_range].astype(np.int64)
+                sp_ord = np.argsort(sp_keys, kind="mergesort")
+                sp_keys_s = sp_keys[sp_ord]
+                sp_vals_s = sp_spds[sp_in_range][sp_ord]
+            sp_out_range = (sp_tids >= 0) & (~sp_in_range)
+            if sp_out_range.any():
+                for fk, tk, sv in zip(sp_fids[sp_out_range], sp_tids[sp_out_range], sp_spds[sp_out_range]):
+                    sp_fallback[(int(fk), int(tk))] = float(sv)
 
-        players_by_frame = {int(fid): grp for fid, grp in players_df.groupby("frame_idx")}
-        ball_by_frame = {int(brow["frame_idx"]): brow for _, brow in ball_df.iterrows()}
+        def _lookup_speed(fid_val: int, tid_c: int) -> float:
+            if len(sp_keys_s) > 0 and 0 <= fid_val < (1 << 31):
+                k = (int(fid_val) << 32) | int(tid_c)
+                pos = int(np.searchsorted(sp_keys_s, k))
+                if pos < len(sp_keys_s) and sp_keys_s[pos] == k:
+                    return float(sp_vals_s[pos])
+            if sp_fallback:
+                return sp_fallback.get((int(fid_val), int(tid_c)), 0.0)
+            return 0.0
 
-        # NEDENSEL (CAUSAL) takip: yalnızca kare t ve öncesinden takım öğren
-        causal_team_map: Dict[str, str] = {}
-        causal_teams_by_frame: Dict[int, Dict[str, Optional[str]]] = {}
+        starts = np.searchsorted(p_fids, ball_fids, side="left")
+        ends = np.searchsorted(p_fids, ball_fids, side="right")
+        active = np.flatnonzero(ends > starts)
+
         frame_snapshots: List[Dict[str, Any]] = []
+        if len(active) > 0:
+            act_s = starts[active]
+            act_e = ends[active]
+            act_lens = act_e - act_s
+            first_len = int(act_lens[0])
+            # 90 dakikalık düzenli kare dilimlerinde (sabit oyuncu sayısı/kare) %100 vektörel hızlı yol
+            if first_len > 0 and np.all(act_lens == first_len):
+                n_act = len(active)
+                k_players = first_len
+                b_xs_act = ball_xs[active]
+                b_ys_act = ball_ys[active]
+                b_fids_act = ball_fids[active]
+                b_ts_act = ball_ts[active]
+                b_pred_act = ball_is_pred[active]
 
-        all_frames = sorted(set(ball_by_frame.keys()) | set(players_by_frame.keys()))
-        for fid in all_frames:
-            f_players = players_by_frame.get(fid)
-            if f_players is not None and not f_players.empty:
-                # Önce kare içindeki anlık ve geçmiş takımları çöz (gelecekten okuma YOK)
-                resolved_list: List[Optional[str]] = []
-                raw_missing_list: List[int] = []
-                frame_team_dict: Dict[str, Optional[str]] = {}
-                for _, prow in f_players.iterrows():
-                    tid = _clean_str(prow.get("track_id"))
-                    raw_team = _clean_str(prow.get("team"))
-                    if raw_team is not None:
-                        resolved_team = raw_team
-                        raw_missing_list.append(0)
+                base_idx = act_s[:, None] + np.arange(k_players, dtype=np.int64)[None, :]
+                px_mat = p_xs[base_idx]
+                py_mat = p_ys[base_idx]
+                dx_mat = px_mat - b_xs_act[:, None]
+                dy_mat = py_mat - b_ys_act[:, None]
+                d2_mat = dx_mat * dx_mat + dy_mat * dy_mat
+                min_locs = np.argmin(d2_mat, axis=1)
+                row_arange = np.arange(n_act, dtype=np.int64)
+                min_dists = np.sqrt(d2_mat[row_arange, min_locs])
+                win_global_idx = act_s + min_locs
+                chosen_tids = p_tid_codes[win_global_idx]
+
+                valid_snap = (min_dists <= max_ctrl_dist) & (chosen_tids >= 0)
+                v_rows = np.flatnonzero(valid_snap)
+                if len(v_rows) > 0:
+                    v_bi = active[v_rows]
+                    v_s = act_s[v_rows]
+                    v_min_loc = min_locs[v_rows]
+                    v_win_idx = win_global_idx[v_rows]
+                    v_tids = chosen_tids[v_rows]
+                    v_teams = p_resolved_team_codes[v_win_idx]
+                    v_fids = b_fids_act[v_rows]
+                    v_ts_raw = b_ts_act[v_rows]
+                    v_ts = np.where(np.isfinite(v_ts_raw), v_ts_raw, v_fids / self.fps)
+                    v_bx = b_xs_act[v_rows]
+                    v_by = b_ys_act[v_rows]
+                    v_min_d = min_dists[v_rows]
+                    v_raw_miss = p_raw_missing[v_win_idx]
+                    v_b_pred = b_pred_act[v_rows]
+                    v_p_pred = p_is_pred[v_win_idx]
+
+                    v_base = v_s[:, None] + np.arange(k_players, dtype=np.int64)[None, :]
+                    v_px_mat = p_xs[v_base]
+                    v_py_mat = p_ys[v_base]
+                    v_tm_mat = p_resolved_team_codes[v_base]
+                    win_px = p_xs[v_win_idx][:, None]
+                    win_py = p_ys[v_win_idx][:, None]
+
+                    opp_mask_mat = (
+                        (v_teams[:, None] >= 0)
+                        & (v_tm_mat >= 0)
+                        & (v_tm_mat != v_teams[:, None])
+                    )
+                    opp_d_mat = np.hypot(v_px_mat - win_px, v_py_mat - win_py)
+                    opp_d_masked = np.where(opp_mask_mat, opp_d_mat, np.inf)
+                    min_opp_d = opp_d_masked.min(axis=1)
+                    has_opp = np.isfinite(min_opp_d)
+                    v_nearest_opp = np.where(has_opp, min_opp_d, np.nan)
+                    v_opp_nearby = (opp_d_masked <= pressure_radius).sum(axis=1)
+
+                    # Vektörel hız araması
+                    v_spds = np.zeros(len(v_rows), dtype=np.float64)
+                    if len(sp_keys_s) > 0:
+                        in_r = (v_fids >= 0) & (v_fids < (1 << 31))
+                        if in_r.any():
+                            q_keys = (v_fids[in_r].astype(np.int64) << 32) | v_tids[in_r].astype(np.int64)
+                            q_pos = np.searchsorted(sp_keys_s, q_keys)
+                            q_pos_safe = np.minimum(q_pos, len(sp_keys_s) - 1)
+                            q_hit = (q_pos < len(sp_keys_s)) & (sp_keys_s[q_pos_safe] == q_keys)
+                            tmp_spd = np.zeros(len(q_keys), dtype=np.float64)
+                            tmp_spd[q_hit] = sp_vals_s[q_pos_safe[q_hit]]
+                            v_spds[in_r] = tmp_spd
+
+                    # Yalnızca ardışık kontrol değişimlerinin başı ve sonunu (spells) tut!
+                    n_v = len(v_rows)
+                    is_spell_start = np.empty(n_v, dtype=bool)
+                    is_spell_start[0] = True
+                    if n_v > 1:
+                        is_spell_start[1:] = v_tids[1:] != v_tids[:-1]
+                    is_spell_end = np.empty(n_v, dtype=bool)
+                    is_spell_end[-1] = True
+                    if n_v > 1:
+                        is_spell_end[:-1] = v_tids[:-1] != v_tids[1:]
+                    keep_v = np.flatnonzero(is_spell_start | is_spell_end)
+
+                    for ki in keep_v:
+                        ii = int(ki)
+                        tc_val = int(v_tids[ii])
+                        tm_val = int(v_teams[ii])
+                        fid_val = int(v_fids[ii])
+                        spd_val = float(v_spds[ii])
+                        if spd_val == 0.0 and sp_fallback:
+                            spd_val = sp_fallback.get((fid_val, tc_val), 0.0)
+                        frame_snapshots.append({
+                            "b_idx": int(v_bi[ii]),
+                            "frame_idx": fid_val,
+                            "timestamp_sec": float(v_ts[ii]),
+                            "ball_x": float(v_bx[ii]),
+                            "ball_y": float(v_by[ii]),
+                            "tid_code": tc_val,
+                            "track_id": tid_list[tc_val],
+                            "team_code": tm_val,
+                            "team": team_list[tm_val] if tm_val >= 0 else None,
+                            "ball_player_dist": float(v_min_d[ii]),
+                            "nearest_opponent_dist": float(v_nearest_opp[ii]) if has_opp[ii] else np.nan,
+                            "opponents_nearby": int(v_opp_nearby[ii]),
+                            "passer_speed": spd_val,
+                            "is_team_missing": int(v_raw_miss[ii]),
+                            "is_ball_predicted": int(v_b_pred[ii]),
+                            "is_passer_predicted": int(v_p_pred[ii]),
+                        })
+            else:
+                for b_i in active:
+                    bi = int(b_i)
+                    s = int(starts[bi])
+                    e = int(ends[bi])
+                    bx = float(ball_xs[bi])
+                    by = float(ball_ys[bi])
+
+                    pxs_slice = p_xs[s:e]
+                    pys_slice = p_ys[s:e]
+                    dx_s = pxs_slice - bx
+                    dy_s = pys_slice - by
+                    d2 = dx_s * dx_s + dy_s * dy_s
+                    min_local = int(np.argmin(d2))
+                    min_d = math.hypot(float(dx_s[min_local]), float(dy_s[min_local]))
+                    if min_d > max_ctrl_dist:
+                        continue
+
+                    chosen_tid_c = int(p_tid_codes[s + min_local])
+                    if chosen_tid_c < 0:
+                        continue
+
+                    chosen_team_c = int(p_resolved_team_codes[s + min_local])
+                    fid = int(ball_fids[bi])
+                    ts = float(ball_ts[bi]) if np.isfinite(ball_ts[bi]) else fid / self.fps
+
+                    if chosen_team_c >= 0:
+                        teams_slice = p_resolved_team_codes[s:e]
+                        opp_mask = (teams_slice >= 0) & (teams_slice != chosen_team_c)
+                        if opp_mask.any():
+                            opp_d = np.hypot(
+                                pxs_slice[opp_mask] - pxs_slice[min_local],
+                                pys_slice[opp_mask] - pys_slice[min_local],
+                            )
+                            nearest_opp = float(opp_d.min())
+                            opp_nearby = int((opp_d <= pressure_radius).sum())
+                        else:
+                            nearest_opp = np.nan
+                            opp_nearby = 0
                     else:
-                        resolved_team = causal_team_map.get(tid) if tid else None
-                        raw_missing_list.append(1)
-                    resolved_list.append(resolved_team)
-                    if tid is not None:
-                        frame_team_dict[tid] = resolved_team
-                causal_teams_by_frame[fid] = frame_team_dict
-
-                # Kare bittikten sonra bilinen takımları gelecek kareler için güncelle
-                for _, prow in f_players.iterrows():
-                    tid = _clean_str(prow.get("track_id"))
-                    raw_team = _clean_str(prow.get("team"))
-                    if tid and raw_team is not None:
-                        causal_team_map[tid] = raw_team
-
-                brow = ball_by_frame.get(fid)
-                if brow is None:
-                    continue
-
-                bx = float(brow[x_col])
-                by = float(brow[y_col])
-                ts = (
-                    float(brow["timestamp_sec"])
-                    if "timestamp_sec" in brow and not pd.isna(brow["timestamp_sec"])
-                    else fid / self.fps
-                )
-                pxs = f_players[x_col].to_numpy(dtype=float)
-                pys = f_players[y_col].to_numpy(dtype=float)
-                dists = np.hypot(pxs - bx, pys - by)
-                min_idx = int(np.argmin(dists))
-                min_d = float(dists[min_idx])
-
-                chosen = f_players.iloc[min_idx]
-                chosen_tid = _clean_str(chosen.get("track_id"))
-                chosen_team = resolved_list[min_idx]
-                is_team_missing = raw_missing_list[min_idx]
-                is_passer_pred = int(bool(chosen.get("is_predicted"))) if "is_predicted" in chosen and not pd.isna(chosen.get("is_predicted")) else 0
-                is_ball_pred = int(bool(brow.get("_pred_sort")))
-
-                if min_d <= max_ctrl_dist and chosen_tid is not None:
-                    # Rakip baskı mesafesi (farklı bilinen takımdaki en yakın oyuncu)
-                    opp_dists: List[float] = []
-                    for j in range(len(f_players)):
-                        if j == min_idx:
-                            continue
-                        other_team = resolved_list[j]
-                        if chosen_team is not None and other_team is not None and other_team != chosen_team:
-                            d_opp = float(math.hypot(pxs[j] - pxs[min_idx], pys[j] - pys[min_idx]))
-                            opp_dists.append(d_opp)
-
-                    nearest_opp = min(opp_dists) if opp_dists else np.nan
-                    opp_nearby = sum(1 for d in opp_dists if d <= pressure_radius)
+                        nearest_opp = np.nan
+                        opp_nearby = 0
 
                     frame_snapshots.append({
+                        "b_idx": bi,
                         "frame_idx": fid,
                         "timestamp_sec": ts,
                         "ball_x": bx,
                         "ball_y": by,
-                        "track_id": chosen_tid,
-                        "team": chosen_team,
+                        "tid_code": chosen_tid_c,
+                        "track_id": tid_list[chosen_tid_c],
+                        "team_code": chosen_team_c,
+                        "team": team_list[chosen_team_c] if chosen_team_c >= 0 else None,
                         "ball_player_dist": min_d,
                         "nearest_opponent_dist": nearest_opp,
                         "opponents_nearby": opp_nearby,
-                        "passer_speed": speed_lookup.get((fid, chosen_tid), 0.0),
-                        "is_team_missing": is_team_missing,
-                        "is_ball_predicted": is_ball_pred,
-                        "is_passer_predicted": is_passer_pred,
+                        "passer_speed": _lookup_speed(fid, chosen_tid_c),
+                        "is_team_missing": int(p_raw_missing[s + min_local]),
+                        "is_ball_predicted": int(ball_is_pred[bi]),
+                        "is_passer_predicted": int(p_is_pred[s + min_local]),
                     })
 
         if len(frame_snapshots) < 2:
@@ -869,16 +1486,19 @@ class MLAnalyzer:
         # Ardışık kontrol periyotları (spells) oluştur
         spells: List[Dict[str, Any]] = []
         for snap in frame_snapshots:
-            if spells and spells[-1]["track_id"] == snap["track_id"]:
+            if spells and spells[-1]["tid_code"] == snap["tid_code"]:
                 spells[-1]["end"] = snap
             else:
-                spells.append({"track_id": snap["track_id"], "start": snap, "end": snap})
+                spells.append({"tid_code": snap["tid_code"], "start": snap, "end": snap})
 
+        cols_n = int(config.ML_XT_GRID_COLS)
+        rows_n = int(config.ML_XT_GRID_ROWS)
         events: List[Dict[str, Any]] = []
+
         for i in range(len(spells) - 1):
             s1_end = spells[i]["end"]
             s2_start = spells[i + 1]["start"]
-            if s1_end["track_id"] == s2_start["track_id"]:
+            if s1_end["tid_code"] == s2_start["tid_code"]:
                 continue
 
             gap_sec = (s2_start["frame_idx"] - s1_end["frame_idx"]) / self.fps
@@ -900,39 +1520,35 @@ class MLAnalyzer:
             else:
                 outcome = np.nan
 
-            # Yönlü ilerleme (bilinen Team B için ters eksen varsayımı yalnızca yön bilgisi tutarlıysa)
             fwd_dx = (sx_n - ex_n) if from_team == "Team B" else (ex_n - sx_n)
-
-            cols_n = int(config.ML_XT_GRID_COLS)
-            rows_n = int(config.ML_XT_GRID_ROWS)
             opp_dist = s1_end["nearest_opponent_dist"]
 
-            # Alıcı baskı mesafesini gelecek kareden (s2_start) DEĞİL, pasın bırakıldığı
-            # serbest bırakma karesinden (s1_end) nedensel olarak ölç (sıfır gelecek sızıntısı).
+            # Alıcı baskı mesafesini gelecek kareden (s2_start) DEĞİL, serbest bırakma karesinden (s1_end) ölç
             rec_pressure: Any = np.nan
-            rel_fid = int(s1_end["frame_idx"])
-            to_tid_str = str(s2_start["track_id"])
-            rel_players = players_by_frame.get(rel_fid)
-            rel_teams = causal_teams_by_frame.get(rel_fid, {})
-            if rel_players is not None and not rel_players.empty:
-                rel_tids = rel_players["track_id"].astype(str).tolist()
-                if to_tid_str in rel_tids:
-                    rec_idx = rel_tids.index(to_tid_str)
-                    rel_xs = rel_players[x_col].to_numpy(dtype=float)
-                    rel_ys = rel_players[y_col].to_numpy(dtype=float)
-                    rec_x, rec_y = float(rel_xs[rec_idx]), float(rel_ys[rec_idx])
-                    rec_team = rel_teams.get(to_tid_str)
-                    ref_team = rec_team if rec_team is not None else (from_team if from_team != "Unknown" else None)
-                    if ref_team is not None:
-                        rec_opp_dists = [
-                            float(math.hypot(rel_xs[j] - rec_x, rel_ys[j] - rec_y))
-                            for j, tid_j in enumerate(rel_tids)
-                            if tid_j != to_tid_str
-                            and rel_teams.get(tid_j) is not None
-                            and rel_teams.get(tid_j) != ref_team
-                        ]
-                        if rec_opp_dists:
-                            rec_pressure = min(rec_opp_dists)
+            s1_bi = int(s1_end["b_idx"])
+            rs = int(starts[s1_bi])
+            re = int(ends[s1_bi])
+            if re > rs:
+                to_tid_c = int(s2_start["tid_code"])
+                rel_tids_sl = p_tid_codes[rs:re]
+                rec_matches = np.flatnonzero(rel_tids_sl == to_tid_c)
+                if len(rec_matches) > 0:
+                    rec_local = int(rec_matches[0])
+                    rel_teams_sl = p_resolved_team_codes[rs:re]
+                    rec_team_c = int(rel_teams_sl[rec_local])
+                    ref_team_c = rec_team_c if rec_team_c >= 0 else int(s1_end["team_code"])
+                    if ref_team_c >= 0:
+                        opp_m = (
+                            (rel_tids_sl != to_tid_c)
+                            & (rel_teams_sl >= 0)
+                            & (rel_teams_sl != ref_team_c)
+                        )
+                        if opp_m.any():
+                            rec_x = p_xs[rs + rec_local]
+                            rec_y = p_ys[rs + rec_local]
+                            rec_pressure = float(
+                                np.hypot(p_xs[rs:re][opp_m] - rec_x, p_ys[rs:re][opp_m] - rec_y).min()
+                            )
 
             events.append({
                 "frame_idx": int(s1_end["frame_idx"]),
@@ -1204,46 +1820,34 @@ class MLAnalyzer:
         cols_n = int(config.ML_XT_GRID_COLS)
         rows_n = int(config.ML_XT_GRID_ROWS)
 
-        sx_ns: List[float] = []
-        sy_ns: List[float] = []
-        ex_ns: List[float] = []
-        ey_ns: List[float] = []
-        fwd_dxs: List[float] = []
-        sz_xs: List[int] = []
-        sz_ys: List[int] = []
-        ez_xs: List[int] = []
-        ez_ys: List[int] = []
-        pz_s: List[str] = []
-        pz_e: List[str] = []
+        min_x, max_x, min_y, max_y = bounds
+        span_x = max(1e-6, max_x - min_x)
+        span_y = max(1e-6, max_y - min_y)
 
-        for _, row in out.iterrows():
-            sx_n, sy_n = self._normalize_xy(float(row["start_x"]), float(row["start_y"]), bounds=bounds)
-            ex_n, ey_n = self._normalize_xy(float(row["end_x"]), float(row["end_y"]), bounds=bounds)
-            from_team = _clean_str(row.get("from_team")) or "Unknown"
-            fwd_dx = (sx_n - ex_n) if from_team == "Team B" else (ex_n - sx_n)
-            sx_ns.append(round(sx_n, 4))
-            sy_ns.append(round(sy_n, 4))
-            ex_ns.append(round(ex_n, 4))
-            ey_ns.append(round(ey_n, 4))
-            fwd_dxs.append(round(float(fwd_dx), 4))
-            sz_xs.append(min(cols_n - 1, max(0, int(sx_n * cols_n))))
-            sz_ys.append(min(rows_n - 1, max(0, int(sy_n * rows_n))))
-            ez_xs.append(min(cols_n - 1, max(0, int(ex_n * cols_n))))
-            ez_ys.append(min(rows_n - 1, max(0, int(ey_n * rows_n))))
-            pz_s.append(_zone_label_from_norm(sx_n, sy_n))
-            pz_e.append(_zone_label_from_norm(ex_n, ey_n))
+        sx_n = np.clip((out["start_x"].to_numpy(dtype=np.float64) - min_x) / span_x, 0.0, 1.0)
+        sy_n = np.clip((out["start_y"].to_numpy(dtype=np.float64) - min_y) / span_y, 0.0, 1.0)
+        ex_n = np.clip((out["end_x"].to_numpy(dtype=np.float64) - min_x) / span_x, 0.0, 1.0)
+        ey_n = np.clip((out["end_y"].to_numpy(dtype=np.float64) - min_y) / span_y, 0.0, 1.0)
 
-        out["start_norm_x"] = sx_ns
-        out["start_norm_y"] = sy_ns
-        out["end_norm_x"] = ex_ns
-        out["end_norm_y"] = ey_ns
-        out["forward_progress_dx"] = fwd_dxs
-        out["start_zone_x"] = sz_xs
-        out["start_zone_y"] = sz_ys
-        out["end_zone_x"] = ez_xs
-        out["end_zone_y"] = ez_ys
-        out["pitch_zone_start"] = pz_s
-        out["pitch_zone_end"] = pz_e
+        if "from_team" in out.columns:
+            team_codes, team_list = _encode_clean_strings(out["from_team"])
+            tb_code = team_list.index("Team B") if "Team B" in team_list else -2
+            is_tb = team_codes == tb_code
+        else:
+            is_tb = np.zeros(len(out), dtype=bool)
+        fwd_dx = np.where(is_tb, sx_n - ex_n, ex_n - sx_n)
+
+        out["start_norm_x"] = np.round(sx_n, 4)
+        out["start_norm_y"] = np.round(sy_n, 4)
+        out["end_norm_x"] = np.round(ex_n, 4)
+        out["end_norm_y"] = np.round(ey_n, 4)
+        out["forward_progress_dx"] = np.round(fwd_dx, 4)
+        out["start_zone_x"] = np.clip((sx_n * cols_n).astype(int), 0, cols_n - 1)
+        out["start_zone_y"] = np.clip((sy_n * rows_n).astype(int), 0, rows_n - 1)
+        out["end_zone_x"] = np.clip((ex_n * cols_n).astype(int), 0, cols_n - 1)
+        out["end_zone_y"] = np.clip((ey_n * rows_n).astype(int), 0, rows_n - 1)
+        out["pitch_zone_start"] = [_zone_label_from_norm(float(x), float(y)) for x, y in zip(sx_n, sy_n)]
+        out["pitch_zone_end"] = [_zone_label_from_norm(float(x), float(y)) for x, y in zip(ex_n, ey_n)]
         return out
 
     # ----------------------------------------------------------------
@@ -1757,15 +2361,17 @@ class MLAnalyzer:
             and {"start_zone_x", "start_zone_y", "end_zone_x", "end_zone_y"}.issubset(events_df.columns)
         ):
             counts = np.zeros((n_cells, n_cells), dtype=float)
-            for _, row in events_df.iterrows():
-                try:
-                    c1 = int(np.clip(int(row["start_zone_x"]), 0, cols - 1))
-                    r1 = int(np.clip(int(row["start_zone_y"]), 0, rows - 1))
-                    c2 = int(np.clip(int(row["end_zone_x"]), 0, cols - 1))
-                    r2 = int(np.clip(int(row["end_zone_y"]), 0, rows - 1))
-                    counts[r1 * cols + c1, r2 * cols + c2] += 1.0
-                except (TypeError, ValueError):
-                    continue
+            z_sx = pd.to_numeric(events_df["start_zone_x"], errors="coerce").to_numpy(dtype=np.float64)
+            z_sy = pd.to_numeric(events_df["start_zone_y"], errors="coerce").to_numpy(dtype=np.float64)
+            z_ex = pd.to_numeric(events_df["end_zone_x"], errors="coerce").to_numpy(dtype=np.float64)
+            z_ey = pd.to_numeric(events_df["end_zone_y"], errors="coerce").to_numpy(dtype=np.float64)
+            valid_z = np.isfinite(z_sx) & np.isfinite(z_sy) & np.isfinite(z_ex) & np.isfinite(z_ey)
+            if valid_z.any():
+                c1 = np.clip(z_sx[valid_z].astype(int), 0, cols - 1)
+                r1 = np.clip(z_sy[valid_z].astype(int), 0, rows - 1)
+                c2 = np.clip(z_ex[valid_z].astype(int), 0, cols - 1)
+                r2 = np.clip(z_ey[valid_z].astype(int), 0, rows - 1)
+                np.add.at(counts, (r1 * cols + c1, r2 * cols + c2), 1.0)
             # Dirichlet / Laplace karışımı (prior gücü = 15.0)
             row_sums = counts.sum(axis=1, keepdims=True)
             T = (counts + 15.0 * T_prior) / (row_sums + 15.0)
@@ -1821,65 +2427,58 @@ class MLAnalyzer:
         )
         xt_grid = self._build_xt_grid(grid_ref_df)
 
-        def _safe_norm(val: Any) -> float:
-            if val is None:
-                return 0.5
-            try:
-                if pd.isna(val):
-                    return 0.5
-            except (TypeError, ValueError):
-                return 0.5
-            fval = float(val)
-            if math.isnan(fval) or math.isinf(fval):
-                return 0.5
-            return float(np.clip(fval, 0.0, 0.9999))
+        def _safe_norm_arr(df_in: pd.DataFrame, col: str) -> np.ndarray:
+            if col not in df_in.columns:
+                return np.full(len(df_in), 0.5, dtype=np.float64)
+            arr = pd.to_numeric(df_in[col], errors="coerce").to_numpy(dtype=np.float64)
+            bad = ~np.isfinite(arr)
+            if bad.any():
+                arr = arr.copy()
+                arr[bad] = 0.5
+            return np.clip(arr, 0.0, 0.9999)
 
         def score_df_with_xt(df_in: pd.DataFrame) -> pd.DataFrame:
             if df_in.empty:
                 return df_in.copy()
             df_out = df_in.copy()
-            xt_starts: List[float] = []
-            xt_ends: List[float] = []
-            deltas: List[float] = []
-            exp_xts: List[float] = []
+            sx_n = _safe_norm_arr(df_out, "start_norm_x")
+            sy_n = _safe_norm_arr(df_out, "start_norm_y")
+            ex_n = _safe_norm_arr(df_out, "end_norm_x")
+            ey_n = _safe_norm_arr(df_out, "end_norm_y")
 
-            for _, row in df_out.iterrows():
-                sx_n = _safe_norm(row.get("start_norm_x", 0.5))
-                sy_n = _safe_norm(row.get("start_norm_y", 0.5))
-                ex_n = _safe_norm(row.get("end_norm_x", 0.5))
-                ey_n = _safe_norm(row.get("end_norm_y", 0.5))
+            # Team B sağdan sola hücum ediyorsa x eksenini kendi hücum yönüne çevir
+            if "from_team" in df_out.columns:
+                ft_codes, ft_list = _encode_clean_strings(df_out["from_team"])
+                tb_c = ft_list.index("Team B") if "Team B" in ft_list else -2
+                is_tb = ft_codes == tb_c
+            else:
+                is_tb = np.zeros(len(df_out), dtype=bool)
+            sx_eff = np.where(is_tb, 1.0 - sx_n, sx_n)
+            ex_eff = np.where(is_tb, 1.0 - ex_n, ex_n)
 
-                # Team B sağdan sola hücum ediyorsa x eksenini kendi hücum yönüne çevir
-                team_val = _clean_str(row.get("from_team"))
-                if team_val == "Team B":
-                    sx_eff = 1.0 - sx_n
-                    ex_eff = 1.0 - ex_n
-                else:
-                    sx_eff = sx_n
-                    ex_eff = ex_n
+            c1 = np.clip((sx_eff * cols).astype(int), 0, cols - 1)
+            r1 = np.clip((sy_n * rows).astype(int), 0, rows - 1)
+            c2 = np.clip((ex_eff * cols).astype(int), 0, cols - 1)
+            r2 = np.clip((ey_n * rows).astype(int), 0, rows - 1)
 
-                c1 = min(cols - 1, max(0, int(sx_eff * cols)))
-                r1 = min(rows - 1, max(0, int(sy_n * rows)))
-                c2 = min(cols - 1, max(0, int(ex_eff * cols)))
-                r2 = min(rows - 1, max(0, int(ey_n * rows)))
+            xt_s = xt_grid[r1, c1]
+            xt_e = xt_grid[r2, c2]
+            d_xt = xt_e - xt_s
 
-                xt_s = float(xt_grid[r1, c1])
-                xt_e = float(xt_grid[r2, c2])
-                d_xt = xt_e - xt_s
-                xp_val = row.get("predicted_xp")
-                if xp_val is None or pd.isna(xp_val) or (isinstance(xp_val, (float, np.floating)) and (math.isnan(float(xp_val)) or math.isinf(float(xp_val)))):
-                    xp_val = 0.75
-                exp_xt = float(xp_val) * d_xt
+            if "predicted_xp" in df_out.columns:
+                xp_arr = pd.to_numeric(df_out["predicted_xp"], errors="coerce").to_numpy(dtype=np.float64)
+                bad_xp = ~np.isfinite(xp_arr)
+                if bad_xp.any():
+                    xp_arr = xp_arr.copy()
+                    xp_arr[bad_xp] = 0.75
+            else:
+                xp_arr = np.full(len(df_out), 0.75, dtype=np.float64)
+            exp_xt = xp_arr * d_xt
 
-                xt_starts.append(round(xt_s, 5))
-                xt_ends.append(round(xt_e, 5))
-                deltas.append(round(d_xt, 5))
-                exp_xts.append(round(exp_xt, 5))
-
-            df_out["xT_start"] = xt_starts
-            df_out["xT_end"] = xt_ends
-            df_out["delta_xT"] = deltas
-            df_out["expected_xT"] = exp_xts
+            df_out["xT_start"] = np.round(xt_s, 5)
+            df_out["xT_end"] = np.round(xt_e, 5)
+            df_out["delta_xT"] = np.round(d_xt, 5)
+            df_out["expected_xT"] = np.round(exp_xt, 5)
             return df_out
 
         scored_eval = score_df_with_xt(eval_df)
@@ -1979,24 +2578,33 @@ class MLAnalyzer:
                 "pca_explained_variance_ratio": [],
                 "cluster_summaries": [],
             }
-        valid_bbox = self._get_valid_bbox_mask(self.df)
-        human_df = self.df[self.df["class_name"].isin(config.HUMAN_CLASS_NAMES) & valid_bbox].copy()
-        if "is_predicted" in human_df.columns:
-            human_df = human_df[human_df["is_predicted"] != True]  # noqa: E712
-        if self.is_calibrated and "on_pitch" in human_df.columns:
-            human_df = human_df[human_df["on_pitch"] != False]  # noqa: E712
-        human_df = human_df.dropna(subset=[x_col, y_col])
 
-        if not self.is_calibrated and not human_df.empty:
+        cls_s = self.df["class_name"]
+        human_names = _get_human_class_names()
+        valid_bbox = self._get_valid_bbox_mask(self.df).to_numpy(dtype=bool)
+        h_mask = (
+            cls_s.isin(human_names).fillna(False).to_numpy(dtype=bool)
+            & valid_bbox
+            & self.df[x_col].notna().to_numpy(dtype=bool)
+            & self.df[y_col].notna().to_numpy(dtype=bool)
+            & self.df["track_id"].notna().to_numpy(dtype=bool)
+        )
+        if "is_predicted" in self.df.columns:
+            h_mask &= ~_bool_mask(self.df["is_predicted"], na_value=False)
+        if self.is_calibrated and "on_pitch" in self.df.columns:
+            h_mask &= _bool_mask(self.df["on_pitch"], na_value=True)
+        if not self.is_calibrated and h_mask.any():
             min_x, max_x, min_y, max_y = self.bounds
-            human_df = human_df[
-                (human_df[x_col] >= min_x - 30.0)
-                & (human_df[x_col] <= max_x + 30.0)
-                & (human_df[y_col] >= min_y - 30.0)
-                & (human_df[y_col] <= max_y + 30.0)
-            ]
+            x_all = self.df[x_col].to_numpy(dtype=np.float64, copy=False)
+            y_all = self.df[y_col].to_numpy(dtype=np.float64, copy=False)
+            h_mask &= (
+                (x_all >= min_x - 30.0)
+                & (x_all <= max_x + 30.0)
+                & (y_all >= min_y - 30.0)
+                & (y_all <= max_y + 30.0)
+            )
 
-        # Hız ve top mesafesi yardımcı tabloları
+        # Hız tablosu ve ön-gruplama (O(N_tracks x N_rows) taramayı önler)
         speed_df, _ = self._compute_player_step_speeds(exclude_referees=True)
         hsr_thresh = (
             float(config.SPEED_ZONE_RUNNING_MAX_KMH)
@@ -2007,55 +2615,186 @@ class MLAnalyzer:
                 else 120.0
             )
         )
+        speed_by_track: Dict[str, np.ndarray] = {}
+        if not speed_df.empty:
+            s_codes, s_uniques = pd.factorize(speed_df["track_id"], sort=False)
+            s_vals = speed_df["speed"].to_numpy(dtype=np.float64)
+            s_ord = np.argsort(s_codes, kind="mergesort")
+            sc_s = s_codes[s_ord]
+            sv_s = s_vals[s_ord]
+            s_brk = np.flatnonzero(sc_s[1:] != sc_s[:-1]) + 1
+            for st, en in zip(np.r_[0, s_brk], np.r_[s_brk, len(sc_s)]):
+                c_val = int(sc_s[st])
+                if c_val >= 0:
+                    speed_by_track[str(s_uniques[c_val])] = sv_s[st:en]
 
-        # Top-oyuncu mesafesi ve kontrol oranı (kare bazında)
-        ball_df = self.df[self.df["class_name"] == config.BALL_CLASS_NAME].dropna(subset=[x_col, y_col]).copy()
-        if "is_predicted" in ball_df.columns:
-            ball_df["_ps"] = ball_df["is_predicted"].fillna(False).astype(bool)
-            ball_df = ball_df.sort_values(["frame_idx", "_ps"]).drop_duplicates(subset=["frame_idx"])
-        ball_coords = {
-            int(r["frame_idx"]): (float(r[x_col]), float(r[y_col]))
-            for _, r in ball_df.iterrows()
-        }
+        h_idx = np.flatnonzero(h_mask)
+        if len(h_idx) == 0:
+            return pd.DataFrame(columns=profile_cols), {
+                "coord_mode": self.coord_mode,
+                "min_track_frames": min_frames,
+                "eligible_players": 0,
+                "excluded_tracks_count": 0,
+                "excluded_tracks": [],
+                "candidate_k_scores": {},
+                "optimal_k": None,
+                "best_silhouette": None,
+                "pca_explained_variance_ratio": [],
+                "cluster_summaries": [],
+            }
+
+        h_tid_codes, tid_strs = _encode_sorted_track_ids(self.df["track_id"].iloc[h_idx])
+        n_tracks = len(tid_strs)
+        h_xs = self.df[x_col].iloc[h_idx].to_numpy(dtype=np.float64)
+        h_ys = self.df[y_col].iloc[h_idx].to_numpy(dtype=np.float64)
+        h_is_ref_cls = (cls_s.iloc[h_idx] == "referee").fillna(False).to_numpy(dtype=bool)
+        if "team" in self.df.columns:
+            h_team_codes, h_team_strs = _encode_clean_strings(self.df["team"].iloc[h_idx])
+            h_team_not_ref = ~((self.df["team"].iloc[h_idx] == "Referee").fillna(False).to_numpy(dtype=bool))
+        else:
+            h_team_codes = np.full(len(h_idx), -1, dtype=np.int32)
+            h_team_strs = []
+            h_team_not_ref = np.ones(len(h_idx), dtype=bool)
+
+        # Top-oyuncu mesafesi ve kontrol oranı (np.searchsorted + np.bincount)
+        b_mask = (
+            (cls_s == config.BALL_CLASS_NAME).fillna(False).to_numpy(dtype=bool)
+            & self.df[x_col].notna().to_numpy(dtype=bool)
+            & self.df[y_col].notna().to_numpy(dtype=bool)
+        )
+        has_fidx_col = "frame_idx" in self.df.columns
+        if has_fidx_col:
+            b_mask &= self.df["frame_idx"].notna().to_numpy(dtype=bool)
+        b_idx = np.flatnonzero(b_mask)
+
+        ball_frames = np.empty(0, dtype=np.int64)
+        ball_xs = np.empty(0, dtype=np.float64)
+        ball_ys = np.empty(0, dtype=np.float64)
+        if len(b_idx) > 0 and has_fidx_col:
+            b_fids = self.df["frame_idx"].iloc[b_idx].to_numpy(dtype=np.int64)
+            b_xs_raw = self.df[x_col].iloc[b_idx].to_numpy(dtype=np.float64)
+            b_ys_raw = self.df[y_col].iloc[b_idx].to_numpy(dtype=np.float64)
+            if "is_predicted" in self.df.columns:
+                b_pred = _bool_mask(self.df["is_predicted"].iloc[b_idx], na_value=False).astype(np.uint8)
+                b_ord = np.lexsort((b_pred, b_fids))
+                b_fids = b_fids[b_ord]
+                b_xs_raw = b_xs_raw[b_ord]
+                b_ys_raw = b_ys_raw[b_ord]
+                b_keep = np.empty(len(b_fids), dtype=bool)
+                b_keep[0] = True
+                b_keep[1:] = b_fids[1:] != b_fids[:-1]
+            else:
+                b_ord = np.argsort(b_fids, kind="mergesort")
+                b_fids = b_fids[b_ord]
+                b_xs_raw = b_xs_raw[b_ord]
+                b_ys_raw = b_ys_raw[b_ord]
+                b_keep = np.empty(len(b_fids), dtype=bool)
+                b_keep[-1] = True
+                b_keep[:-1] = b_fids[:-1] != b_fids[1:]
+            ball_frames = b_fids[b_keep]
+            ball_xs = b_xs_raw[b_keep]
+            ball_ys = b_ys_raw[b_keep]
+
         max_ctrl_dist = (
             float(config.POSSESSION_MAX_PLAYER_BALL_DIST_M)
             if self.is_calibrated
             else float(config.POSSESSION_MAX_PLAYER_BALL_DIST_PX)
         )
 
-        # Her karede topa en yakın oyuncuyu bul
-        ball_ctrl_counts: Counter = Counter()
-        ball_dists_by_track: Dict[str, List[float]] = {}
-        team_not_ref_h = (human_df["team"] != "Referee") if "team" in human_df.columns else True
-        players_non_ref = human_df[
-            (human_df["class_name"] != "referee") & team_not_ref_h
-        ]
-        for fid, fgrp in players_non_ref.groupby("frame_idx"):
-            bxy = ball_coords.get(int(fid))
-            if bxy is None or fgrp.empty:
-                continue
-            bx, by = bxy
-            pxs = fgrp[x_col].to_numpy(dtype=float)
-            pys = fgrp[y_col].to_numpy(dtype=float)
-            dists = np.hypot(pxs - bx, pys - by)
-            for idx_row, tid_val in enumerate(fgrp["track_id"].astype(str).tolist()):
-                ball_dists_by_track.setdefault(tid_val, []).append(float(dists[idx_row]))
-            min_idx = int(np.argmin(dists))
-            if float(dists[min_idx]) <= max_ctrl_dist:
-                ctrl_tid = str(fgrp.iloc[min_idx]["track_id"])
-                ball_ctrl_counts[ctrl_tid] += 1
+        ball_dist_sum = np.zeros(n_tracks, dtype=np.float64)
+        ball_dist_cnt = np.zeros(n_tracks, dtype=np.int64)
+        ball_ctrl_arr = np.zeros(n_tracks, dtype=np.int64)
+        total_ball_frames = max(1, len(ball_frames))
 
-        total_ball_frames = max(1, len(ball_coords))
+        if len(ball_frames) > 0 and has_fidx_col:
+            h_fids = self.df["frame_idx"].iloc[h_idx].to_numpy(dtype=np.float64)
+            nr_mask = (~h_is_ref_cls) & h_team_not_ref & np.isfinite(h_fids)
+            if nr_mask.any():
+                nr_fids = h_fids[nr_mask].astype(np.int64)
+                nr_xs = h_xs[nr_mask]
+                nr_ys = h_ys[nr_mask]
+                nr_tids = h_tid_codes[nr_mask]
+
+                b_pos = np.searchsorted(ball_frames, nr_fids)
+                b_pos_safe = np.minimum(b_pos, len(ball_frames) - 1)
+                matched = (b_pos < len(ball_frames)) & (ball_frames[b_pos_safe] == nr_fids)
+                if matched.any():
+                    m_fids = nr_fids[matched]
+                    m_bidx = b_pos_safe[matched]
+                    m_xs = nr_xs[matched]
+                    m_ys = nr_ys[matched]
+                    m_tids = nr_tids[matched]
+
+                    m_dists = np.hypot(m_xs - ball_xs[m_bidx], m_ys - ball_ys[m_bidx])
+                    ball_dist_sum = np.bincount(m_tids, weights=m_dists, minlength=n_tracks)
+                    ball_dist_cnt = np.bincount(m_tids, minlength=n_tracks)
+
+                    m_orig_pos = np.arange(len(m_fids), dtype=np.int64)
+                    # Düzenli 90-dk matrislerinde (her karede sabit k oyuncu) O(N) reshape ile min bul
+                    n_m = len(m_fids)
+                    n_bf = len(ball_frames)
+                    if n_bf > 0 and n_m % n_bf == 0 and np.all(m_fids[:: n_m // n_bf] == ball_frames):
+                        k_p = n_m // n_bf
+                        d_mat = m_dists.reshape(n_bf, k_p)
+                        min_col = np.argmin(d_mat, axis=1)
+                        min_rows = np.arange(n_bf, dtype=np.int64) * k_p + min_col
+                    else:
+                        m_ord = np.lexsort((m_orig_pos, m_dists, m_fids))
+                        f_sorted = m_fids[m_ord]
+                        is_first_f = np.empty(len(f_sorted), dtype=bool)
+                        is_first_f[0] = True
+                        is_first_f[1:] = f_sorted[1:] != f_sorted[:-1]
+                        min_rows = m_ord[is_first_f]
+                    ctrl_rows = min_rows[m_dists[min_rows] <= max_ctrl_dist]
+                    if len(ctrl_rows) > 0:
+                        ball_ctrl_arr = np.bincount(m_tids[ctrl_rows], minlength=n_tracks)
+
         excluded_tracks: List[Dict[str, Any]] = []
         player_rows: List[Dict[str, Any]] = []
 
-        for tid_raw, grp in human_df.groupby("track_id"):
-            tid = str(tid_raw)
-            n_obs = int(len(grp))
-            team_vals = [_clean_str(v) for v in grp["team"].tolist() if _clean_str(v) is not None] if "team" in grp.columns else []
-            resolved_team = Counter(team_vals).most_common(1)[0][0] if team_vals else "Unknown"
-            is_ref = bool((grp["class_name"] == "referee").any() or resolved_team == "Referee")
+        # Track bazlı gruplama için tek O(N log N) sıralama
+        h_ord = np.argsort(h_tid_codes, kind="mergesort")
+        hc_s = h_tid_codes[h_ord]
+        hxs_s = h_xs[h_ord]
+        hys_s = h_ys[h_ord]
+        href_s = h_is_ref_cls[h_ord]
+        htm_s = h_team_codes[h_ord]
 
+        h_brk = np.flatnonzero(hc_s[1:] != hc_s[:-1]) + 1
+        min_bx, max_bx, min_by, max_by = self.bounds
+        inv_span_x = 1.0 / max(1e-6, max_bx - min_bx)
+        inv_span_y = 1.0 / max(1e-6, max_by - min_by)
+
+        for st, en in zip(np.r_[0, h_brk], np.r_[h_brk, len(hc_s)]):
+            st_i = int(st)
+            en_i = int(en)
+            t_code = int(hc_s[st_i])
+            if t_code < 0:
+                continue
+            tid = tid_strs[t_code]
+            n_obs = en_i - st_i
+
+            tm_slice = htm_s[st_i:en_i]
+            valid_tm = tm_slice[tm_slice >= 0]
+            if len(valid_tm) == 0:
+                resolved_team = "Unknown"
+            elif len(valid_tm) == 1:
+                resolved_team = h_team_strs[int(valid_tm[0])]
+            else:
+                tm_cnts = np.bincount(valid_tm)
+                max_tc = int(tm_cnts.max())
+                tied = np.flatnonzero(tm_cnts == max_tc)
+                if len(tied) == 1:
+                    resolved_team = h_team_strs[int(tied[0])]
+                else:
+                    tied_set = set(tied.tolist())
+                    resolved_team = "Unknown"
+                    for c_val in valid_tm:
+                        if int(c_val) in tied_set:
+                            resolved_team = h_team_strs[int(c_val)]
+                            break
+
+            is_ref = bool(href_s[st_i:en_i].any() or resolved_team == "Referee")
             if is_ref:
                 excluded_tracks.append({
                     "track_id": tid,
@@ -2074,34 +2813,33 @@ class MLAnalyzer:
                 })
                 continue
 
-            xs = grp[x_col].to_numpy(dtype=float)
-            ys = grp[y_col].to_numpy(dtype=float)
-            norm_pts = np.array([self._normalize_xy(x, y) for x, y in zip(xs, ys)], dtype=float)
-            nxs = norm_pts[:, 0]
-            nys = norm_pts[:, 1]
+            xs = hxs_s[st_i:en_i]
+            ys = hys_s[st_i:en_i]
+            nxs = np.clip((xs - min_bx) * inv_span_x, 0.0, 1.0)
+            nys = np.clip((ys - min_by) * inv_span_y, 0.0, 1.0)
 
-            # Saha kapsama alanı: Konveks Örtü (ConvexHull), kolineer/az nokta durumunda bbox alanı
-            cov_area = 0.0
-            if len(norm_pts) >= 3:
+            span_nx = float(nxs.max() - nxs.min())
+            span_ny = float(nys.max() - nys.min())
+            if len(nxs) >= 3 and span_nx > 1e-12 and span_ny > 1e-12:
                 try:
-                    hull = ConvexHull(norm_pts)
+                    hull = ConvexHull(np.column_stack((nxs, nys)))
                     cov_area = float(hull.volume)  # 2B'de volume == alan
                 except Exception:
-                    cov_area = float((nxs.max() - nxs.min()) * (nys.max() - nys.min()))
+                    cov_area = span_nx * span_ny
             else:
-                cov_area = float((nxs.max() - nxs.min()) * (nys.max() - nys.min()))
+                cov_area = span_nx * span_ny
 
-            p_spds = speed_df[speed_df["track_id"] == tid]["speed"].to_numpy(dtype=float)
-            if p_spds.size > 0:
+            p_spds = speed_by_track.get(tid)
+            if p_spds is not None and p_spds.size > 0:
                 mean_spd = float(np.mean(p_spds))
                 p95_spd = float(np.percentile(p_spds, 95))
                 hsr_ratio = float(np.mean(p_spds >= hsr_thresh))
             else:
                 mean_spd, p95_spd, hsr_ratio = 0.0, 0.0, 0.0
 
-            b_dists = ball_dists_by_track.get(tid, [])
-            mean_b_dist = float(np.mean(b_dists)) if b_dists else np.nan
-            ctrl_pct = (ball_ctrl_counts.get(tid, 0) / total_ball_frames) * 100.0
+            b_cnt = int(ball_dist_cnt[t_code])
+            mean_b_dist = float(ball_dist_sum[t_code] / b_cnt) if b_cnt > 0 else np.nan
+            ctrl_pct = (int(ball_ctrl_arr[t_code]) / total_ball_frames) * 100.0
 
             player_rows.append({
                 "track_id": tid,
@@ -2143,7 +2881,6 @@ class MLAnalyzer:
         ]
 
         X_raw = profiles_df[cluster_feat_cols].to_numpy(dtype=float)
-        # Eğer bir sütunun tamamı NaN ise (örn. top hiç yoksa) 0 ile güvenli doldur
         col_all_nan = np.isnan(X_raw).all(axis=0)
         if col_all_nan.any():
             X_raw[:, col_all_nan] = 0.0
@@ -2165,7 +2902,10 @@ class MLAnalyzer:
                 labels = km.fit_predict(X_scaled)
                 if len(set(labels)) < 2:
                     continue
-                sil = float(silhouette_score(X_scaled, labels))
+                if n_players > 2000:
+                    sil = float(silhouette_score(X_scaled, labels, sample_size=2000, random_state=self.random_state))
+                else:
+                    sil = float(silhouette_score(X_scaled, labels))
                 candidate_k_scores[k] = round(sil, 4)
                 if best_sil is None or sil > best_sil:
                     best_sil = sil
@@ -2201,7 +2941,7 @@ class MLAnalyzer:
         cluster_summaries: List[Dict[str, Any]] = []
         role_map: Dict[int, str] = {}
 
-        for cid, cgrp in profiles_df.groupby("cluster_id"):
+        for cid, cgrp in profiles_df.groupby("cluster_id", observed=True):
             cid_int = int(cid)
             z_speed = float((cgrp["mean_speed"].mean() - global_means["mean_speed"]) / max(1e-6, global_stds["mean_speed"]))
             z_ctrl = float((cgrp["ball_control_pct"].mean() - global_means["ball_control_pct"]) / max(1e-6, global_stds["ball_control_pct"]))
@@ -2302,43 +3042,101 @@ class MLAnalyzer:
         if window_sec is None and total_dur > 600.0:
             win_sec = max(win_sec, round(total_dur / 30.0, 1))
 
-        speed_df = speed_df.copy()
-        speed_df["window_idx"] = np.floor((speed_df["timestamp_sec"] - t_min) / max(0.5, win_sec)).astype(int)
+        win_denom = max(0.5, win_sec)
+        s_ts = speed_df["timestamp_sec"].to_numpy(dtype=np.float64)
+        s_fidx = speed_df["frame_idx"].to_numpy(dtype=np.int64)
+        s_spd = speed_df["speed"].to_numpy(dtype=np.float64)
+        s_nx = speed_df["norm_x"].to_numpy(dtype=np.float64)
+        s_ny = speed_df["norm_y"].to_numpy(dtype=np.float64)
+        s_win = np.maximum(0, np.floor((s_ts - t_min) / win_denom).astype(np.int64))
         max_w_idx = max(
-            int(speed_df["window_idx"].max()),
-            int(math.floor(max(0.0, t_max - t_min - 1e-6) / max(0.5, win_sec))),
+            int(s_win.max()),
+            int(math.floor(max(0.0, t_max - t_min - 1e-6) / win_denom)),
         )
+        n_wins = max_w_idx + 1
+
+        s_tid_codes, s_tid_strs = _encode_sorted_track_ids(speed_df["track_id"])
+        s_team_raw_codes, s_team_strs = _encode_clean_strings(speed_df["team"])
 
         hsr_thresh = (
             float(config.SPEED_ZONE_RUNNING_MAX_KMH)
             if self.is_calibrated
-            else float(speed_df["speed"].quantile(0.75))
+            else float(np.quantile(s_spd, 0.75))
         )
         min_samples = int(config.ML_TEMPO_MIN_SAMPLES_PER_WINDOW)
 
-        teams_to_eval = ["ALL"] + [t for t in ("Team A", "Team B") if (speed_df["team"] == t).any()]
+        team_a_code = s_team_strs.index("Team A") if "Team A" in s_team_strs else -2
+        team_b_code = s_team_strs.index("Team B") if "Team B" in s_team_strs else -2
+        teams_to_eval = ["ALL"]
+        if team_a_code >= 0 and (s_team_raw_codes == team_a_code).any():
+            teams_to_eval.append("Team A")
+        if team_b_code >= 0 and (s_team_raw_codes == team_b_code).any():
+            teams_to_eval.append("Team B")
+
         window_rows: List[Dict[str, Any]] = []
-
         for team_label in teams_to_eval:
-            t_sub = speed_df if team_label == "ALL" else speed_df[speed_df["team"] == team_label]
-            # Önceki kapsanan pencerelerin nedensel ortalaması için tarihçe
-            prior_covered_means: List[float] = []
+            if team_label == "ALL":
+                t_win = s_win
+                t_tid = s_tid_codes
+                t_spd = s_spd
+                t_fidx = s_fidx
+            else:
+                tc_target = team_a_code if team_label == "Team A" else team_b_code
+                t_m = s_team_raw_codes == tc_target
+                t_win = s_win[t_m]
+                t_tid = s_tid_codes[t_m]
+                t_spd = s_spd[t_m]
+                t_fidx = s_fidx[t_m]
 
-            for w_idx in range(max_w_idx + 1):
+            if len(t_win) > 0:
+                ord_w = np.lexsort((t_tid, t_win))
+                w_s = t_win[ord_w]
+                tid_s = t_tid[ord_w]
+                spd_s = t_spd[ord_w]
+                fidx_s = t_fidx[ord_w]
+
+                s_cnt_arr = np.bincount(w_s, minlength=n_wins)
+                spd_sum_arr = np.bincount(w_s, weights=spd_s, minlength=n_wins)
+                hsr_sum_arr = np.bincount(w_s, weights=(spd_s >= hsr_thresh), minlength=n_wins)
+                is_new_tid = np.empty(len(tid_s), dtype=bool)
+                is_new_tid[0] = True
+                is_new_tid[1:] = (tid_s[1:] != tid_s[:-1]) | (w_s[1:] != w_s[:-1])
+                act_p_arr = np.bincount(w_s, weights=is_new_tid, minlength=n_wins).astype(int)
+
+                w_brk = np.flatnonzero(w_s[1:] != w_s[:-1]) + 1
+                w_starts_nz = np.r_[0, w_brk]
+                w_ends_nz = np.r_[w_brk, len(w_s)]
+                win_slices: List[Optional[Tuple[int, int]]] = [None] * n_wins
+                for st_w, en_w in zip(w_starts_nz, w_ends_nz):
+                    win_slices[int(w_s[st_w])] = (int(st_w), int(en_w))
+            else:
+                s_cnt_arr = np.zeros(n_wins, dtype=np.int64)
+                spd_sum_arr = np.zeros(n_wins, dtype=np.float64)
+                hsr_sum_arr = np.zeros(n_wins, dtype=np.float64)
+                act_p_arr = np.zeros(n_wins, dtype=int)
+                spd_s = np.empty(0, dtype=np.float64)
+                fidx_s = np.empty(0, dtype=np.int64)
+                win_slices = [None] * n_wins
+
+            prior_covered_means: List[float] = []
+            for w_idx in range(n_wins):
                 w_start = t_min + w_idx * win_sec
                 w_end = w_start + win_sec
-                w_df = t_sub[t_sub["window_idx"] == w_idx]
-                s_cnt = int(len(w_df))
-                act_p = int(w_df["track_id"].nunique()) if not w_df.empty else 0
+                s_cnt = int(s_cnt_arr[w_idx])
+                act_p = int(act_p_arr[w_idx])
                 cov_ok = bool(s_cnt >= min_samples and act_p >= 1)
                 low_cov = not cov_ok
 
-                if not w_df.empty:
-                    m_spd = float(w_df["speed"].mean())
-                    p90_spd = float(np.percentile(w_df["speed"], 90))
-                    hsr_r = float(np.mean(w_df["speed"] >= hsr_thresh))
+                sl = win_slices[w_idx]
+                if sl is not None:
+                    st_w, en_w = sl
+                    m_spd = float(spd_sum_arr[w_idx] / s_cnt)
+                    p90_spd = float(np.percentile(spd_s[st_w:en_w], 90))
+                    hsr_r = float(hsr_sum_arr[w_idx] / s_cnt)
+                    min_fidx = int(fidx_s[st_w:en_w].min())
                 else:
                     m_spd, p90_spd, hsr_r = 0.0, 0.0, 0.0
+                    min_fidx = None
 
                 baseline_spd = float(np.mean(prior_covered_means)) if prior_covered_means else np.nan
                 drop_pct = (
@@ -2372,7 +3170,7 @@ class MLAnalyzer:
                     anomalies_list.append({
                         "anomaly_type": "tempo_drop",
                         "severity": "high" if drop_pct >= 0.35 else "medium",
-                        "frame_idx": int(w_df["frame_idx"].min()) if not w_df.empty else None,
+                        "frame_idx": min_fidx,
                         "timestamp_sec": round(w_start, 2),
                         "track_id": "TEAM",
                         "team": team_label,
@@ -2387,7 +3185,7 @@ class MLAnalyzer:
                     anomalies_list.append({
                         "anomaly_type": "low_coverage",
                         "severity": "info",
-                        "frame_idx": int(w_df["frame_idx"].min()) if not w_df.empty else None,
+                        "frame_idx": min_fidx,
                         "timestamp_sec": round(w_start, 2),
                         "track_id": "TEAM",
                         "team": team_label,
@@ -2421,15 +3219,27 @@ class MLAnalyzer:
 
         # Oyuncu bazlı yorgunluk (hız düşüş eğimi) analizi
         fatigue_trends: List[Dict[str, Any]] = []
-        for tid, pgrp in speed_df.groupby("track_id"):
-            if len(pgrp) < 12:
+        unknown_tm_code = next((i for i, s in enumerate(s_team_strs) if s.lower() == "unknown"), -1)
+        f_ord = np.lexsort((s_ts, s_tid_codes))
+        ft_tid = s_tid_codes[f_ord]
+        ft_ts = s_ts[f_ord]
+        ft_spd = s_spd[f_ord]
+        ft_fidx = s_fidx[f_ord]
+        ft_tm = s_team_raw_codes[f_ord]
+
+        ft_brk = np.flatnonzero(ft_tid[1:] != ft_tid[:-1]) + 1
+        min_dur_fatigue = max(2.0, win_sec)
+
+        for st_f, en_f in zip(np.r_[0, ft_brk], np.r_[ft_brk, len(ft_tid)]):
+            st_i = int(st_f)
+            en_i = int(en_f)
+            if en_i - st_i < 12:
                 continue
-            pgrp = pgrp.sort_values("timestamp_sec")
-            ts_arr = pgrp["timestamp_sec"].to_numpy(dtype=float)
-            spd_arr = pgrp["speed"].to_numpy(dtype=float)
-            if float(ts_arr.max() - ts_arr.min()) < max(2.0, win_sec):
+            ts_arr = ft_ts[st_i:en_i]
+            if float(ts_arr.max() - ts_arr.min()) < min_dur_fatigue:
                 continue
 
+            spd_arr = ft_spd[st_i:en_i]
             reg = scipy_stats.linregress(ts_arr, spd_arr)
             half_idx = len(spd_arr) // 2
             first_mean = float(np.mean(spd_arr[:half_idx]))
@@ -2441,16 +3251,31 @@ class MLAnalyzer:
                 and half_drop_pct >= 0.20
                 and (math.isnan(reg.pvalue) or reg.pvalue < 0.15)
             )
-            known_teams = [
-                t for t in (_clean_str(v) for v in pgrp["team"].tolist())
-                if t is not None and t.lower() != "unknown"
-            ]
-            p_team = Counter(known_teams).most_common(1)[0][0] if known_teams else "Unknown"
+            tm_sl = ft_tm[st_i:en_i]
+            known_tm = tm_sl[(tm_sl >= 0) & (tm_sl != unknown_tm_code)]
+            if len(known_tm) == 0:
+                p_team = "Unknown"
+            elif len(known_tm) == 1:
+                p_team = s_team_strs[int(known_tm[0])]
+            else:
+                k_cnts = np.bincount(known_tm)
+                max_k = int(k_cnts.max())
+                tied_k = np.flatnonzero(k_cnts == max_k)
+                if len(tied_k) == 1:
+                    p_team = s_team_strs[int(tied_k[0])]
+                else:
+                    tied_set = set(tied_k.tolist())
+                    p_team = "Unknown"
+                    for c_val in known_tm:
+                        if int(c_val) in tied_set:
+                            p_team = s_team_strs[int(c_val)]
+                            break
 
+            tid = s_tid_strs[int(ft_tid[st_i])]
             fatigue_trends.append({
-                "track_id": str(tid),
+                "track_id": tid,
                 "team": p_team,
-                "samples": int(len(pgrp)),
+                "samples": en_i - st_i,
                 "speed_slope_per_sec": round(float(reg.slope), 4),
                 "p_value": round(float(reg.pvalue), 4) if not math.isnan(reg.pvalue) else None,
                 "first_half_mean_speed": round(first_mean, 2),
@@ -2463,9 +3288,9 @@ class MLAnalyzer:
                 anomalies_list.append({
                     "anomaly_type": "fatigue_trend",
                     "severity": "medium",
-                    "frame_idx": int(pgrp["frame_idx"].iloc[half_idx]),
+                    "frame_idx": int(ft_fidx[st_i + half_idx]),
                     "timestamp_sec": round(float(ts_arr[half_idx]), 2),
-                    "track_id": str(tid),
+                    "track_id": tid,
                     "team": p_team,
                     "metric_value": round(half_drop_pct * 100.0, 2),
                     "threshold": 20.0,
@@ -2477,81 +3302,143 @@ class MLAnalyzer:
                 })
 
         # Konum & Hareket Anomalisi (Takım merkezine uzaklık + MAD z-skoru + IsolationForest)
-        # Kare bazında takım formasyon merkezini hız sıçramasından dışlanmayan TÜM geçerli
-        # gözlemlenen oyuncular üzerinden (aykırıya dayanıklı medyan ile) nedensel hesapla
         x_col, y_col = self._get_xy_columns()
         used_obs_centroids = False
+        dist_from_centroid = np.empty(len(s_fidx), dtype=np.float64)
+
+        # Birleşik takım kodlaması ("Unknown" dahil)
+        unified_teams = list(s_team_strs)
+        if "Unknown" not in unified_teams:
+            unified_teams.append("Unknown")
+        u_team_to_code = {t: i for i, t in enumerate(unified_teams)}
+        s_team_uni = np.array(
+            [u_team_to_code[s_team_strs[c]] if c >= 0 else u_team_to_code["Unknown"] for c in s_team_raw_codes],
+            dtype=np.int64,
+        )
+
         if (
             not self.df.empty
             and x_col in self.df.columns
             and y_col in self.df.columns
             and "class_name" in self.df.columns
             and "frame_idx" in self.df.columns
+            and "track_id" in self.df.columns
         ):
-            valid_bbox_obs = self._get_valid_bbox_mask(self.df)
-            team_not_ref_obs = (self.df["team"] != "Referee") if "team" in self.df.columns else True
+            cls_s = self.df["class_name"]
+            human_names = _get_human_class_names()
+            valid_bbox_obs = self._get_valid_bbox_mask(self.df).to_numpy(dtype=bool)
+            team_not_ref_obs = (
+                ~((self.df["team"] == "Referee").fillna(False).to_numpy(dtype=bool))
+                if "team" in self.df.columns
+                else True
+            )
             obs_mask = (
-                self.df["class_name"].isin(config.HUMAN_CLASS_NAMES)
-                & (self.df["class_name"] != "referee")
+                cls_s.isin(human_names).fillna(False).to_numpy(dtype=bool)
+                & ~((cls_s == "referee").fillna(False).to_numpy(dtype=bool))
                 & team_not_ref_obs
                 & valid_bbox_obs
+                & self.df[x_col].notna().to_numpy(dtype=bool)
+                & self.df[y_col].notna().to_numpy(dtype=bool)
+                & self.df["frame_idx"].notna().to_numpy(dtype=bool)
+                & self.df["track_id"].notna().to_numpy(dtype=bool)
             )
             if "is_predicted" in self.df.columns:
-                obs_mask &= self.df["is_predicted"] != True  # noqa: E712
+                obs_mask &= ~_bool_mask(self.df["is_predicted"], na_value=False)
             if self.is_calibrated and "on_pitch" in self.df.columns:
-                obs_mask &= self.df["on_pitch"] != False  # noqa: E712
-            obs_pos = self.df[obs_mask].dropna(subset=[x_col, y_col, "frame_idx"]).copy()
-            if not self.is_calibrated and not obs_pos.empty:
+                obs_mask &= _bool_mask(self.df["on_pitch"], na_value=True)
+            if not self.is_calibrated and obs_mask.any():
                 min_x, max_x, min_y, max_y = self.bounds
-                obs_pos = obs_pos[
-                    (obs_pos[x_col] >= min_x - 30.0)
-                    & (obs_pos[x_col] <= max_x + 30.0)
-                    & (obs_pos[y_col] >= min_y - 30.0)
-                    & (obs_pos[y_col] <= max_y + 30.0)
-                ]
-            if not obs_pos.empty:
-                obs_pos = obs_pos.sort_values(["track_id", "frame_idx"]).reset_index(drop=True)
-                obs_teams: List[str] = []
-                for _, tgrp in obs_pos.groupby("track_id", sort=False):
-                    r_team: Optional[str] = None
-                    t_list = tgrp["team"].tolist() if "team" in tgrp.columns else [None] * len(tgrp)
-                    for tv in t_list:
-                        ct = _clean_str(tv)
-                        if ct is not None:
-                            r_team = ct
-                        obs_teams.append((ct if ct is not None else r_team) or "Unknown")
-                obs_pos["_obs_team"] = obs_teams
-                min_bx, max_bx, min_by, max_by = self.bounds
-                obs_pos["_obs_nx"] = np.clip((obs_pos[x_col].to_numpy(dtype=float) - min_bx) / max(1e-6, max_bx - min_bx), 0.0, 1.0)
-                obs_pos["_obs_ny"] = np.clip((obs_pos[y_col].to_numpy(dtype=float) - min_by) / max(1e-6, max_by - min_by), 0.0, 1.0)
-                obs_cent = (
-                    obs_pos.groupby(["frame_idx", "_obs_team"], as_index=False)[["_obs_nx", "_obs_ny"]]
-                    .median()
-                    .rename(columns={"_obs_team": "team", "_obs_nx": "_cx", "_obs_ny": "_cy"})
+                x_all = self.df[x_col].to_numpy(dtype=np.float64, copy=False)
+                y_all = self.df[y_col].to_numpy(dtype=np.float64, copy=False)
+                obs_mask &= (
+                    (x_all >= min_x - 30.0)
+                    & (x_all <= max_x + 30.0)
+                    & (y_all >= min_y - 30.0)
+                    & (y_all <= max_y + 30.0)
                 )
-                merged_cent = speed_df[["frame_idx", "team"]].merge(
-                    obs_cent, on=["frame_idx", "team"], how="left"
-                )
-                if not merged_cent["_cx"].isna().any():
-                    speed_df["dist_from_team_centroid"] = np.hypot(
-                        speed_df["norm_x"].to_numpy(dtype=float) - merged_cent["_cx"].to_numpy(dtype=float),
-                        speed_df["norm_y"].to_numpy(dtype=float) - merged_cent["_cy"].to_numpy(dtype=float),
+
+            obs_idx = np.flatnonzero(obs_mask)
+            if len(obs_idx) > 0:
+                o_tids, _ = _encode_sorted_track_ids(self.df["track_id"].iloc[obs_idx])
+                o_fids = self.df["frame_idx"].iloc[obs_idx].to_numpy(dtype=np.int64)
+                o_xs = self.df[x_col].iloc[obs_idx].to_numpy(dtype=np.float64)
+                o_ys = self.df[y_col].iloc[obs_idx].to_numpy(dtype=np.float64)
+
+                o_ord = np.lexsort((o_fids, o_tids))
+                o_tids = o_tids[o_ord]
+                o_fids = o_fids[o_ord]
+                o_xs = o_xs[o_ord]
+                o_ys = o_ys[o_ord]
+
+                if "team" in self.df.columns:
+                    o_tm_codes, o_tm_strs = _encode_clean_strings(self.df["team"].iloc[obs_idx])
+                    o_tm_codes = o_tm_codes[o_ord]
+                    for ts_val in o_tm_strs:
+                        if ts_val not in u_team_to_code:
+                            u_team_to_code[ts_val] = len(unified_teams)
+                            unified_teams.append(ts_val)
+                    o_remap = np.array([u_team_to_code[s] for s in o_tm_strs], dtype=np.int64)
+                    n_o = len(o_tids)
+                    idx_o = np.arange(n_o, dtype=np.int64)
+                    is_ot_start = np.empty(n_o, dtype=bool)
+                    is_ot_start[0] = True
+                    if n_o > 1:
+                        is_ot_start[1:] = o_tids[1:] != o_tids[:-1]
+                    row_ot_start = np.maximum.accumulate(np.where(is_ot_start, idx_o, 0))
+                    last_valid_o = np.maximum.accumulate(np.where(o_tm_codes >= 0, idx_o, -1))
+                    has_ot = last_valid_o >= row_ot_start
+                    o_resolved_team = np.where(
+                        has_ot,
+                        o_remap[o_tm_codes[np.maximum(0, last_valid_o)]],
+                        u_team_to_code["Unknown"],
                     )
+                else:
+                    o_resolved_team = np.full(len(o_idx := obs_idx), u_team_to_code["Unknown"], dtype=np.int64)
+
+                min_bx, max_bx, min_by, max_by = self.bounds
+                obs_nx = np.clip((o_xs - min_bx) / max(1e-6, max_bx - min_bx), 0.0, 1.0)
+                obs_ny = np.clip((o_ys - min_by) / max(1e-6, max_by - min_by), 0.0, 1.0)
+
+                team_stride = len(unified_teams) + 1
+                fid_offset = min(int(o_fids.min()), int(s_fidx.min()))
+                obs_keys = (o_fids - fid_offset) * team_stride + o_resolved_team
+                obs_cent = pd.DataFrame({"key": obs_keys, "nx": obs_nx, "ny": obs_ny}).groupby("key", sort=True).median()
+                cent_keys = obs_cent.index.to_numpy(dtype=np.int64)
+                spd_keys = (s_fidx - fid_offset) * team_stride + s_team_uni
+                pos = np.searchsorted(cent_keys, spd_keys)
+                pos_safe = np.minimum(pos, max(0, len(cent_keys) - 1))
+                matched = (len(cent_keys) > 0) & (pos < len(cent_keys)) & (cent_keys[pos_safe] == spd_keys)
+                if np.all(matched):
+                    cx = obs_cent["nx"].to_numpy(dtype=np.float64)[pos_safe]
+                    cy = obs_cent["ny"].to_numpy(dtype=np.float64)[pos_safe]
+                    dist_from_centroid = np.hypot(s_nx - cx, s_ny - cy)
                     used_obs_centroids = True
 
         if not used_obs_centroids:
-            centroids = (
-                speed_df.groupby(["frame_idx", "team"])[["norm_x", "norm_y"]]
-                .transform("median")
-            )
-            speed_df["dist_from_team_centroid"] = np.hypot(
-                speed_df["norm_x"] - centroids["norm_x"],
-                speed_df["norm_y"] - centroids["norm_y"],
-            )
+            team_stride = len(unified_teams) + 1
+            fid_offset = int(s_fidx.min())
+            spd_keys = (s_fidx - fid_offset) * team_stride + s_team_uni
+            spd_cent = pd.DataFrame({"key": spd_keys, "nx": s_nx, "ny": s_ny}).groupby("key", sort=True).median()
+            cent_keys = spd_cent.index.to_numpy(dtype=np.int64)
+            pos = np.searchsorted(cent_keys, spd_keys)
+            cx = spd_cent["nx"].to_numpy(dtype=np.float64)[pos]
+            cy = spd_cent["ny"].to_numpy(dtype=np.float64)[pos]
+            dist_from_centroid = np.hypot(s_nx - cx, s_ny - cy)
 
         # Oyuncu-pencere özetleri üzerinden anomali değerlendirmesi (gürültüyü azaltır)
+        pw_in = pd.DataFrame({
+            "window_idx": s_win,
+            "track_id": speed_df["track_id"].to_numpy(),
+            "team": speed_df["team"].to_numpy(),
+            "frame_idx": s_fidx,
+            "timestamp_sec": s_ts,
+            "norm_x": s_nx,
+            "norm_y": s_ny,
+            "speed": s_spd,
+            "dist_from_team_centroid": dist_from_centroid,
+        })
         pw_df = (
-            speed_df.groupby(["window_idx", "track_id", "team"], as_index=False)
+            pw_in.groupby(["window_idx", "track_id", "team"], as_index=False, observed=True, sort=True)
             .agg(
                 frame_idx=("frame_idx", "min"),
                 timestamp_sec=("timestamp_sec", "mean"),
@@ -2565,10 +3452,10 @@ class MLAnalyzer:
         pw_df = pw_df[pw_df["samples"] >= 3].reset_index(drop=True)
 
         if len(pw_df) >= 6:
-            dist_mad_z = _robust_mad_zscore(pw_df["dist_from_team_centroid"].to_numpy(dtype=float))
-            spd_mad_z = _robust_mad_zscore(pw_df["speed"].to_numpy(dtype=float))
-            pw_df["dist_mad_z"] = dist_mad_z
-            pw_df["speed_mad_z"] = spd_mad_z
+            dist_vals = pw_df["dist_from_team_centroid"].to_numpy(dtype=float)
+            spd_vals = pw_df["speed"].to_numpy(dtype=float)
+            dist_mad_z = _robust_mad_zscore(dist_vals)
+            spd_mad_z = _robust_mad_zscore(spd_vals)
 
             iso_flags = np.zeros(len(pw_df), dtype=bool)
             if len(pw_df) >= 20:
@@ -2582,43 +3469,61 @@ class MLAnalyzer:
                 iso_flags = iso.fit_predict(iso_feats) == -1
 
             mad_thresh = float(config.ML_ANOMALY_MAD_Z_THRESHOLD)
-            for idx, row in pw_df.iterrows():
-                is_spatial_mad = abs(float(row["dist_mad_z"])) >= mad_thresh
-                is_speed_mad = abs(float(row["speed_mad_z"])) >= mad_thresh
-                is_iso = bool(iso_flags[idx])
+            is_spatial_mad = np.abs(dist_mad_z) >= mad_thresh
+            is_speed_mad = np.abs(spd_mad_z) >= mad_thresh
+            cond_spatial = is_spatial_mad | (iso_flags & (dist_mad_z >= 2.0))
+            cond_move = (~cond_spatial) & (is_speed_mad | iso_flags)
 
-                if is_spatial_mad or (is_iso and float(row["dist_mad_z"]) >= 2.0):
-                    anomalies_list.append({
-                        "anomaly_type": "spatial_off_formation",
-                        "severity": "high" if abs(float(row["dist_mad_z"])) >= mad_thresh else "medium",
-                        "frame_idx": int(row["frame_idx"]),
-                        "timestamp_sec": round(float(row["timestamp_sec"]), 2),
-                        "track_id": str(row["track_id"]),
-                        "team": str(row["team"]),
-                        "metric_value": round(float(row["dist_from_team_centroid"]), 4),
-                        "threshold": mad_thresh,
-                        "description_tr": (
-                            f"Oyuncu {row['track_id']} ({row['team']}) {row['timestamp_sec']:.1f}s civarında "
-                            f"formasyon dışı konumlanma sergiledi (takım merkezine uzaklık={row['dist_from_team_centroid']:.3f}, "
-                            f"MAD z={row['dist_mad_z']:.2f}, IsolationForest={'Aykırı' if is_iso else 'Normal'})."
-                        ),
-                    })
-                elif is_speed_mad or is_iso:
-                    anomalies_list.append({
-                        "anomaly_type": "movement_anomaly",
-                        "severity": "medium",
-                        "frame_idx": int(row["frame_idx"]),
-                        "timestamp_sec": round(float(row["timestamp_sec"]), 2),
-                        "track_id": str(row["track_id"]),
-                        "team": str(row["team"]),
-                        "metric_value": round(float(row["speed"]), 2),
-                        "threshold": mad_thresh,
-                        "description_tr": (
-                            f"Oyuncu {row['track_id']} ({row['team']}) {row['timestamp_sec']:.1f}s civarında "
-                            f"olağandışı hareket yoğunluğu gösterdi (hız={row['speed']:.1f}, "
-                            f"MAD z={row['speed_mad_z']:.2f}, IsolationForest={'Aykırı' if is_iso else 'Normal'})."
-                        ),
-                    })
+            flagged_indices = np.flatnonzero(cond_spatial | cond_move)
+            if len(flagged_indices) > 0:
+                pw_fidx = pw_df["frame_idx"].to_numpy(dtype=np.int64)
+                pw_ts = pw_df["timestamp_sec"].to_numpy(dtype=np.float64)
+                pw_tid = pw_df["track_id"].astype(str).to_numpy()
+                pw_tm = pw_df["team"].astype(str).to_numpy()
+
+                for idx in flagged_indices:
+                    ii = int(idx)
+                    is_iso = bool(iso_flags[ii])
+                    tid_s = str(pw_tid[ii])
+                    tm_s = str(pw_tm[ii])
+                    ts_v = float(pw_ts[ii])
+                    f_v = int(pw_fidx[ii])
+                    if cond_spatial[ii]:
+                        dmz = float(dist_mad_z[ii])
+                        d_cent = float(dist_vals[ii])
+                        anomalies_list.append({
+                            "anomaly_type": "spatial_off_formation",
+                            "severity": "high" if abs(dmz) >= mad_thresh else "medium",
+                            "frame_idx": f_v,
+                            "timestamp_sec": round(ts_v, 2),
+                            "track_id": tid_s,
+                            "team": tm_s,
+                            "metric_value": round(d_cent, 4),
+                            "threshold": mad_thresh,
+                            "description_tr": (
+                                f"Oyuncu {tid_s} ({tm_s}) {ts_v:.1f}s civarında "
+                                f"formasyon dışı konumlanma sergiledi (takım merkezine uzaklık={d_cent:.3f}, "
+                                f"MAD z={dmz:.2f}, IsolationForest={'Aykırı' if is_iso else 'Normal'})."
+                            ),
+                        })
+                    else:
+                        smz = float(spd_mad_z[ii])
+                        sp_v = float(spd_vals[ii])
+                        anomalies_list.append({
+                            "anomaly_type": "movement_anomaly",
+                            "severity": "medium",
+                            "frame_idx": f_v,
+                            "timestamp_sec": round(ts_v, 2),
+                            "track_id": tid_s,
+                            "team": tm_s,
+                            "metric_value": round(sp_v, 2),
+                            "threshold": mad_thresh,
+                            "description_tr": (
+                                f"Oyuncu {tid_s} ({tm_s}) {ts_v:.1f}s civarında "
+                                f"olağandışı hareket yoğunluğu gösterdi (hız={sp_v:.1f}, "
+                                f"MAD z={smz:.2f}, IsolationForest={'Aykırı' if is_iso else 'Normal'})."
+                            ),
+                        })
 
         anomalies_df = pd.DataFrame(anomalies_list, columns=anom_cols)
         if not anomalies_df.empty:
@@ -2757,11 +3662,11 @@ class MLAnalyzer:
         palette = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b"]
         markers = {"Team A": "o", "Team B": "s"}
 
-        for cid, cgrp in profiles_df.groupby("cluster_id"):
+        for cid, cgrp in profiles_df.groupby("cluster_id", observed=True):
             cid_int = int(cid)
             role = str(cgrp["tactical_role_tr"].iloc[0])
             col = palette[cid_int % len(palette)]
-            for team_name, tgrp in cgrp.groupby("team"):
+            for team_name, tgrp in cgrp.groupby("team", observed=True):
                 mk = markers.get(str(team_name), "^")
                 ax.scatter(
                     tgrp["pca_1"],
@@ -2774,10 +3679,10 @@ class MLAnalyzer:
                     alpha=0.9,
                     label=f"Küme {cid_int}: {role} ({team_name})",
                 )
-                for _, row in tgrp.iterrows():
+                for tid_v, px_v, py_v in zip(tgrp["track_id"], tgrp["pca_1"], tgrp["pca_2"]):
                     ax.annotate(
-                        f"ID:{row['track_id']}",
-                        (row["pca_1"], row["pca_2"]),
+                        f"ID:{tid_v}",
+                        (px_v, py_v),
                         textcoords="offset points",
                         xytext=(6, 5),
                         fontsize=8,
@@ -2823,9 +3728,8 @@ class MLAnalyzer:
             return out_path
 
         team_colors = {"ALL": "#222222", "Team A": "#1f77b4", "Team B": "#d62728"}
-        for tname, tgrp in windows_df.groupby("team"):
+        for tname, tgrp in windows_df.groupby("team", observed=True):
             tgrp = tgrp.sort_values("window_start_sec")
-            t_mid = 0.5 * (tgrp["window_start_sec"] + tgrp["window_end_sec"])
             cov_df = tgrp[tgrp["coverage_ok"]]
             if not cov_df.empty:
                 ax1.plot(
@@ -2849,13 +3753,17 @@ class MLAnalyzer:
                 )
             if tname == "ALL":
                 low_df = tgrp[tgrp["low_coverage_flag"]]
-                for _, lrow in low_df.iterrows():
-                    ax1.axvspan(
-                        lrow["window_start_sec"],
-                        lrow["window_end_sec"],
-                        color="#cccccc",
-                        alpha=0.35,
-                    )
+                if not low_df.empty:
+                    l_starts = low_df["window_start_sec"].to_numpy(dtype=float)
+                    l_ends = low_df["window_end_sec"].to_numpy(dtype=float)
+                    cur_s, cur_e = float(l_starts[0]), float(l_ends[0])
+                    for ns, ne in zip(l_starts[1:], l_ends[1:]):
+                        if float(ns) <= cur_e + 1e-6:
+                            cur_e = max(cur_e, float(ne))
+                        else:
+                            ax1.axvspan(cur_s, cur_e, color="#cccccc", alpha=0.35)
+                            cur_s, cur_e = float(ns), float(ne)
+                    ax1.axvspan(cur_s, cur_e, color="#cccccc", alpha=0.35)
 
         ax1.set_ylabel(f"Ortalama Hız ({unit})")
         ax1.set_title(
@@ -2877,12 +3785,13 @@ class MLAnalyzer:
         if not anomalies_df.empty:
             type_map = {t: idx for idx, t in enumerate(sorted(anomalies_df["anomaly_type"].unique()))}
             sev_colors = {"high": "#d62728", "medium": "#ff7f0e", "info": "#7f7f7f"}
-            for _, arow in anomalies_df.iterrows():
-                y_pos = type_map[arow["anomaly_type"]]
+            for (atype, sev), agrp in anomalies_df.groupby(["anomaly_type", "severity"], observed=True):
+                y_pos = type_map[atype]
+                ts_vals = agrp["timestamp_sec"].to_numpy(dtype=float)
                 ax2.scatter(
-                    float(arow["timestamp_sec"]),
-                    y_pos,
-                    color=sev_colors.get(str(arow["severity"]), "#1f77b4"),
+                    ts_vals,
+                    np.full(len(ts_vals), y_pos, dtype=float),
+                    color=sev_colors.get(str(sev), "#1f77b4"),
                     s=70,
                     alpha=0.85,
                 )

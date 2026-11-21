@@ -430,7 +430,7 @@ def test_detector_gpu_cpu_config(monkeypatch):
     assert det_cpu.half is False
     dummy_frame = np.zeros((64, 64, 3), dtype=np.uint8)
     out = det_cpu.detect_frame(dummy_frame)
-    assert len(out) == 1 and out[0]["class_name"] == "person"
+    assert len(out) == 1 and out[0]["class_name"] == config.TARGET_CLASS_IDS[0]
     assert predict_calls[-1]["half"] is False
     assert predict_calls[-1]["imgsz"] == 640
     assert predict_calls[-1]["classes"] == list(config.TARGET_CLASS_IDS.keys())

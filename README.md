@@ -1,47 +1,59 @@
 # Futbol Maç Analiz ve Oyuncu Takip Sistemi
 
-Video → oyuncu/top tespiti → kalıcı takip → takım sınıflandırma → kamera
-hareketi telafili saha (metre) koordinatları → görsel çıktı + CSV/SQL veri
-dışa aktarımı.
+Video → futbola özel 4 sınıflı YOLO ile oyuncu/kaleci/hakem/top tespiti →
+kalıcı takip (DeepSORT / ByteTrack) → takım sınıflandırma → TV yayını sahne
+kesmesi ve tekrar dönüşü telafili saha (metre) koordinatları → görsel çıktı +
+90 dakikalık maç ölçeğinde akışlı (streaming) CSV/SQLite veri dışa aktarımı +
+taktik analiz ve makine öğrenmesi raporları.
 
 ## Kurulum
 ```bash
 pip install -r requirements.txt
 ```
 
-YOLO model ağırlığı ilk çalıştırmada otomatik indirilir (internet gerektirir),
-ya da `models/` klasörüne manuel olarak `.pt` dosyası koyabilirsiniz.
+Varsayılan yapılandırma `models/football_yolo11s_best.pt` konumundaki 4 sınıflı
+(`0: ball`, `1: goalkeeper`, `2: player`, `3: referee`) futbola özel eğitilmiş
+YOLO11s modelini kullanır.
 
 ## Çalıştırma öncesi: Homografi kalibrasyonu (Adım 5 için gerekli)
-Saha (metre) koordinatları üretebilmek için, videonun uygun bir karesinde birkaç
-bilinen saha noktasını (köşe, orta yuvarlak vb.) işaretlemeniz gerekiyor:
+Saha (metre) koordinatları üretebilmek için, videonun uygun bir karesinde en az
+4 bilinen saha noktasını (köşe, orta yuvarlak, ceza sahası köşesi vb.)
+işaretlemeniz gerekiyor:
 ```bash
 python utils/calibrate_homography.py --input data/input_videos/match_sample.mp4
 ```
 Bu adımı atlarsanız pipeline yine çalışır, sadece `pitch_x`/`pitch_y` alanları
-`None` kalır (piksel koordinatları ve video çıktısı etkilenmez).
+`None` kalır (piksel koordinatları, `pixel_fallback` modundaki analizler ve
+video çıktısı etkilenmez).
 
 ## Çalıştırma
 ```bash
 python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4
 ```
 
-Ek CLI seçenekleri:
-- `--batch-size N`: YOLO çıkarımı için batch boyutu (varsayılan: CUDA aktifse `8`, CPU'da `1`).
+### 90 Dakikalık Maç ve Üretim CLI Seçenekleri
+- `--no-video`: Çıktı videosu oluşturmayı ve kare çizimini atlar; 90 dakikalık (~135.000 kare / ~2,7 milyon satır) maç analizlerinde disk ve işlem süresini önemli ölçüde azaltır.
+- `--no-minimap`: Çıktı videosu üzerine kuş bakışı 2D taktik minimap bindirmeyi kapatır.
+- `--no-csv` / `--no-sql`: İsteğe bağlı olarak CSV veya SQLite çıktılarından birini devre dışı bırakır.
+- `--export-dir DİZİN`: Tüm veri, ısı haritası ve ML rapor çıktılarının yazılacağı hedef klasörü belirler (varsayılan: `data/exports`).
+- `--flush-interval N`: Kare-kare takip verilerini her `N` karede bir SQLite (WAL modu) ve CSV'ye akıtarak RAM kullanımını sabit tutar (varsayılan: `2500`, `0` = sadece video sonunda yaz).
+- `--tracker {deepsort,bytetrack}`: Oyuncu takipçisi seçimi (`deepsort` = görünüm + hareket, `bytetrack` = yüksek hızlı Kalman + IoU).
+- `--embedding-stride N`: DeepSORT modunda görünüm embedding çıkarma aralığı (`1` = her kare, `>1` = ara karelerde hızlı IoU eşleştirme).
+- `--batch-size N`: YOLO çıkarımı için batch boyutu (varsayılan: CUDA aktifse `8`, CPU'da `1`; CUDA OOM durumunda otomatik yarıya bölerek kurtarır).
 - `--max-frames N`: Hızlı test/önizleme için yalnızca ilk `N` kareyi işler.
 - `--no-analytics`: Video bitiminde Adım 7 taktik analiz ve ısı haritası üretimini atlar.
 - `--no-ml`: Video bitiminde Adım 8 taktik ve scouting ML analizini (`xP`/`xT`, rol kümeleme, tempo/anomali) atlar.
 
-Mevcut takip verisinden videoyu tekrar çalıştırmadan bağımsız analiz üretmek için:
+Mevcut takip verisinden (CSV veya SQLite `.db`) videoyu tekrar çalıştırmadan bağımsız analiz üretmek için:
 ```bash
-python modules/match_analytics.py --input data/exports/tracking_data.csv
-python modules/ml_analyzer.py --input data/exports/tracking_data.csv
+python modules/match_analytics.py --input data/exports/tracking_data.db
+python modules/ml_analyzer.py --input data/exports/tracking_data.db
 ```
 
 Çıktılar:
-- `data/output_videos/`  -> kutular + ID + takım renkleri + (kalibre ise) taktik minimap ile işaretlenmiş video
-- `data/exports/tracking_data.csv` ve `.db`  -> kare-kare ham takip verisi (backfill + top interpolasyonlu)
-- `data/exports/player_distance_summary.csv`  -> oyuncu başına yumuşatılmış mesafe, hız ve FIFA hız bandı / sprint özeti
+- `data/output_videos/` -> kutular + ID + takım renkleri + (kalibre ise) taktik minimap ile işaretlenmiş video
+- `data/exports/tracking_data.csv` ve `.db` -> kare-kare ham takip verisi (parçalar arası takım backfill + kayan pencereli top interpolasyonlu)
+- `data/exports/player_distance_summary.csv` -> oyuncu başına yumuşatılmış mesafe, hız ve FIFA hız bandı / sprint özeti
 - `data/exports/match_analytics_summary.json` ve `possession_timeline.csv` -> topa sahip olma, pas ağı ve takım şekli özeti
 - `data/exports/heatmaps/` -> takım ve öne çıkan oyuncular için 2D ısı haritası PNG görselleri
 - `data/exports/ml_reports/` -> Adım 8 ML çıktıları (`ml_analysis_summary.json`, `ml_analysis_report.md`, `ml_player_profiles.csv`, `ml_tempo_windows.csv`, `ml_anomalies.csv`, `ml_pass_predictions.csv`, `xp_model_comparison.png`, `xt_spatial_heatmap.png`, `player_clusters_pca.png`, `tempo_anomaly_timeline.png`)
@@ -49,95 +61,39 @@ python modules/ml_analyzer.py --input data/exports/tracking_data.csv
 ## Pipeline Adımları
 | Adım | Modül | Görev |
 |---|---|---|
-| 1 | `modules/video_processor.py` | Video okuma/yazma/çizim + minimap bindirme |
-| 2 | `modules/detector.py` | YOLO nesne tespiti (batch + CUDA FP16 destekli oyuncu/top) |
-| 3 | `modules/tracker.py` | DeepSORT (GPU embedder) ile kalıcı ID + sönümlenen hızlı top takibi |
-| 4 | `modules/team_classifier.py` | CIELAB/BGR K-Means forma renk kümeleme + önbellekli Takım A/B/Hakem/Kaleci ayrımı |
-| 5 | `modules/perspective_transformer.py` + `modules/camera_motion_tracker.py` | Homografi + optical flow ile kamera hareketi telafisi -> saha (metre) koordinatları |
-| 6 | `modules/data_exporter.py` | Pandas ile biriktirme, takım backfill + top interpolasyonu, CSV/SQLite + FIFA hız bantlı özet |
-| 7 | `modules/match_analytics.py` | Topa sahip olma, pas tespiti/ağı, takım şekli ve 2D ısı haritası üretimi |
+| 1 | `modules/video_processor.py` | Video okuma/yazma/çizim (`--no-video` ve yerinde çizim destekli) + minimap bindirme |
+| 2 | `modules/detector.py` | 4 sınıflı futbola özel YOLO11s nesne tespiti (batch + CUDA FP16 + OOM yarıya bölme korumalı) |
+| 3 | `modules/tracker.py` | DeepSORT (GPU embedder + stride) ve ByteTrack (Kalman+IoU) ile kalıcı ID + sahne kesmesi sıfırlamalı top takibi |
+| 4 | `modules/team_classifier.py` | CIELAB/BGR K-Means forma renk kümeleme + kilit sonrası geçmiş temizlemeli Takım A/B/Hakem/Kaleci ayrımı |
+| 5 | `modules/perspective_transformer.py` + `modules/camera_motion_tracker.py` | Homografi + optical flow + ORB anahtar kare bankası ile TV sahne kesmesi/tekrar dönüşü kurtarmalı saha (metre) koordinatları |
+| 6 | `modules/data_exporter.py` | Periyodik disk akışı (SQLite WAL + CSV), parçalar arası takım backfill + top interpolasyonu, FIFA hız bantlı özet |
+| 7 | `modules/match_analytics.py` | Vektörel topa sahip olma, pas tespiti/ağı, takım şekli ve 2D ısı haritası üretimi |
 | 8 | `modules/ml_analyzer.py` | Taktik & Scouting ML Motoru: `xP` pas başarı olasılığı, `xT` mekansal tehdit, Silhouette + 2B PCA oyuncu rol kümeleme, tempo/yorgunluk ve anomali tespiti |
 
 `config/config.py` tüm sabitleri (yollar, eşik değerleri, model parametreleri) tek yerde toplar.
 
-## Taktik ve Scouting ML Motoru (Adım 8)
-`modules/ml_analyzer.py`, hem kalibre edilmiş (`pitch_x`, `pitch_y` metre) hem de kalibresiz (`pixel_fallback`) takip verilerinde çalışır:
-- **Pas Başarı Olasılığı (`xP`) ve Beklenen Tehdit (`xT`)**: Eksik/NULL değer denetimi (nedensel `team` işleme), ön işlemeden önce kesin kronolojik eğitim/doğrulama/test bölünmesi (sıfır veri sızıntısı), `DummyClassifier` baz çizgisi ile `LogisticRegression`, `RandomForestClassifier` ve `GradientBoostingClassifier` karşılaştırması (F1, ROC-AUC, PR-AUC, Brier skoru, karmaşıklık matrisi, operasyonel ödünleşimler) ve 12×8 Markov `xT` ızgarası.
-- **Oyuncu Rol Kümeleme (`PCA` + `Silhouette`)**: Ortalama pozisyon, konveks örtü kapsama alanı, hız/sprint profili ve top kontrol metrikleriyle aday `k` değerleri arasında Silhouette skorunu ençoklayan kümeleme ve 2B PCA rol görselleştirmesi.
-- **Tempo Düşüşü / Yorgunluk ve Anomali Tespiti**: Kapsam farkındalıklı zaman pencereleri (kamera çıkışlarını yorgunluktan ayırır), oyuncu hız düşüş eğimleri ve `IsolationForest` + dayanıklı MAD z-skoru ile formasyon dışı konum/hız anomalisi tespiti.
+## Futbola Özel 4 Sınıflı YOLO Modeli Eğitimi (`utils/train_custom_yolo.py`)
+`utils/train_custom_yolo.py` betiği, Roboflow üzerindeki `football-players-detection`
+veri setini (`ball`, `goalkeeper`, `player`, `referee`) geçici `%TEMP%\football_yolo_training`
+dizinine indirerek yerel GPU (örn. RTX 4050 6 GB VRAM) üzerinde `yolo11s.pt` taban
+modeliyle (`imgsz=960`, `batch=4`, `amp=True`, `cache=False`) eğitir ve en iyi ağırlığı
+`models/football_yolo11s_best.pt` konumuna kopyalar:
 
-Bağımsız çalıştırma seçenekleri:
-```bash
-python modules/ml_analyzer.py --input data/exports/tracking_data.csv --output-dir data/exports/ml_reports
-python modules/ml_analyzer.py --input data/exports/tracking_data.db --no-plots
+```powershell
+$env:ROBOFLOW_API_KEY = "SENIN_ROBOFLOW_API_KEYIN"
+$env:YOLO_CONFIG_DIR = "$env:TEMP\ultralytics_cfg"
+python utils/train_custom_yolo.py --epochs 60 --imgsz 960 --batch 4
+Remove-Item Env:ROBOFLOW_API_KEY -ErrorAction SilentlyContinue
 ```
+
+## TV Yayını Sahne Kesmesi ve Uzun Çekim Kayma (Drift) Dayanıklılığı (Adım 5)
+- **Çok Sinyalli Kesme ve Kademeli Geçiş (Dissolve) Tespiti**: `CameraMotionTracker`, gri/HSV histogram korelasyonu, kenar yoğunluğu, yeşil çim oranı ve optical flow RANSAC inlier oranını birlikte değerlendirerek sert kesmeleri, yakın çekim tekrarları ve kademeli geçişleri (fade/dissolve) yakalar.
+- **Ana Kameraya Dönüşte Otomatik Yeniden Hizalanma (Recovery)**: Tekrar veya yakın çekim sırasında `update()` güvenli biçimde `None` döndürür (sahte saha koordinatı üretilmez); yayın ana taktik kameraya döndüğünde ORB anahtar kare bankası (`_keyframe_bank`) ile kalibrasyon koordinat sistemine otomatik olarak yeniden kilitlenir.
+- **Skorbord Maskeleme ve Uzun Çekim Kararlılığı**: Sabit TV skorbord/logo bölgeleri ve oyuncu kutuları maskelenir, ayrıca periyodik anahtar kare doğrulaması ile uzun çekimlerde birikimli kayma (drift) sınırlandırılır.
 
 ## Testler
-Otomatik birim ve entegrasyon testlerini çalıştırmak için:
-```bash
+Otomatik birim, stres ve uçtan uca (E2E) testlerini çalıştırmak için:
+```powershell
+$env:YOLO_CONFIG_DIR="$env:TEMP\ultralytics_cfg"
 pytest -v
-```
-
-## Varsayılan YOLO modeli hakkında (COCO, sınırlı)
-Şu anki varsayılan `yolov8x.pt`, COCO veri setiyle eğitilmiştir ve sadece
-`person` + `sports ball` sınıflarını tanır -- hakem/oyuncu ayrımını YOLO
-seviyesinde YAPAMAZ (bunu Adım 4'teki K-Means renk kümelemesi tahmin eder).
-Daha isabetli sonuç için aşağıdaki fine-tune seçeneğine bakın.
-
-## (Opsiyonel) Futbola özel fine-tune edilmiş YOLO modeli kullanma
-`utils/train_custom_yolo.py` betiği, Roboflow'daki halka açık
-"football-players-detection" veri setiyle (ball/goalkeeper/player/referee
-sınıfları) kendi fine-tune modelinizi eğitmenizi sağlar.
-
-**Bu betik GPU ve internet gerektirir -- bu proje ortamında değil, Google
-Colab gibi ücretsiz bir GPU ortamında çalıştırılmalıdır.** Adım adım talimat
-için dosyanın başındaki docstring'e bakın; özetle:
-```bash
-pip install ultralytics roboflow
-python train_custom_yolo.py --api-key SENIN_ROBOFLOW_API_KEYIN --epochs 100
-```
-Eğitim bitince betik, `config/config.py` içinde değiştirmeniz gereken TAM İKİ
-satırı (`YOLO_MODEL_PATH` ve `TARGET_CLASS_IDS`) ekrana yazdırır. Başka
-hiçbir dosyaya (main.py, tracker.py, team_classifier.py) dokunmanıza gerek
-yok -- pipeline, bu iki değerden `HUMAN_CLASS_NAMES`, `BALL_CLASS_NAME` ve
-`USES_FINE_TUNED_FOOTBALL_MODEL` gibi ayarları otomatik türetip kendini
-buna göre ayarlar (ör. hakem artık K-Means'e hiç sokulmadan doğrudan
-etiketlenir, K-Means küme sayısı 3'ten 2'ye düşer).
-
-## Bilinen Sınırlamalar
-- **Kamera hareketi telafisi (Adım 5)**: Optical flow tabanlı olduğu için
-  zamanla küçük bir "drift" (kayma hatası) birikir; çok uzun kesintisiz
-  çekimlerde periyodik yeniden kalibrasyon gerekebilir. Yayın başka bir
-  kameraya (tekrar izleme vb.) geçtiğinde sistem bunu tespit edip o segment
-  için saha koordinatı üretmeyi durdurur (otomatik toparlanmaz).
-- **Mesafe/hız hesabı (Adım 6)**: Sadece ardışık karelerdeki (kayıp kare
-  olmayan), gerçek (tahmini olmayan) tespitler arası mesafe sayılır.
-
-## Klasör Yapısı
-```
-football_analysis_system/
-├── main.py                          # pipeline'ı baştan sona çalıştıran orkestratör
-├── requirements.txt
-├── config/config.py                 # tüm sabitler tek yerde
-├── modules/
-│   ├── video_processor.py           # Adım 1
-│   ├── detector.py                  # Adım 2
-│   ├── tracker.py                   # Adım 3
-│   ├── team_classifier.py           # Adım 4
-│   ├── perspective_transformer.py   # Adım 5
-│   ├── camera_motion_tracker.py     # Adım 5 eklentisi (kamera hareketi telafisi)
-│   ├── data_exporter.py             # Adım 6
-│   ├── match_analytics.py           # Adım 7 (taktik analiz ve ısı haritaları)
-│   └── ml_analyzer.py               # Adım 8 (Taktik & Scouting ML motoru)
-├── tests/
-│   ├── test_pipeline.py             # Adım 1-7 birim/entegrasyon testleri
-│   └── test_ml_analyzer.py          # Adım 8 ML motoru testleri
-├── utils/
-│   ├── calibrate_homography.py      # homografi kalibrasyon yardımcı aracı
-│   └── train_custom_yolo.py         # (opsiyonel) fine-tune eğitim betiği
-├── models/                          # YOLO .pt ağırlıkları
-└── data/
-    ├── input_videos/
-    ├── output_videos/
-    └── exports/                     # CSV + SQLite çıktıları
 ```

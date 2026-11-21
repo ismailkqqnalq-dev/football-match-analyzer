@@ -32,6 +32,7 @@ EXPORT_DISTANCE_SUMMARY_FILENAME = "player_distance_summary.csv"  # oyuncu baş�
 EXPORT_ANALYTICS_SUMMARY_FILENAME = "match_analytics_summary.json"
 EXPORT_POSSESSION_FILENAME = "possession_timeline.csv"
 EXPORT_HEATMAP_DIR = os.path.join(EXPORT_DIR, "heatmaps")
+EXPORT_FLUSH_INTERVAL_FRAMES = 0                       # DataExporter varsayılanı (0 = bellekte tut; main.py CLI'da 2500 kullanır)
 
 # Mesafe/hız hesabı (saha koordinatları üzerinden), sadece ARDIŞIK karelerde yapılır.
 # Aradan kare kaçarsa (ör. oyuncu geçici olarak kayboldu) o segment mesafeye
@@ -89,7 +90,7 @@ DEFAULT_OUTPUT_VIDEO = os.path.join(OUTPUT_VIDEO_DIR, "match_sample_annotated.mp
 # (Farklı bir Roboflow projesi/veri seti kullanıyorsan, indirdiğin data.yaml
 # dosyasındaki "names:" listesinin SIRASINI birebir buraya kopyala -- sıra
 # yanlışsa sınıf ID'leri yanlış isimlere eşlenir.)
-YOLO_MODEL_PATH = os.path.join(MODELS_DIR, "yolov8x.pt")  # veya kendi fine-tune modelin
+YOLO_MODEL_PATH = os.path.join(MODELS_DIR, "football_yolo11s_best.pt")  # M1 futbola özel fine-tune model
 
 # YOLO çıkarım (inference) çözünürlüğü, FP16 ve batch ayarları
 DETECTION_IMG_SIZE = 960
@@ -102,12 +103,16 @@ DETECTION_CONFIDENCE_THRESHOLD = 0.3
 # IOU eşiği (Non-Max Suppression için): Örtüşen kutuların birleştirilme oranı.
 DETECTION_IOU_THRESHOLD = 0.45
 
-# Bizim ilgilendiğimiz COCO sınıf ID'leri:
-#   0  -> person (oyuncu + hakem, henüz ayrılmamış)
-#   32 -> sports ball (top)
+# Futbola özel fine-tune edilmiş 4 sınıflı model ID eşlemesi (data.yaml sırası):
+#   0 -> ball
+#   1 -> goalkeeper
+#   2 -> player
+#   3 -> referee
 TARGET_CLASS_IDS = {
-    0: "person",
-    32: "ball",
+    0: "ball",
+    1: "goalkeeper",
+    2: "player",
+    3: "referee",
 }
 
 # --- AŞAĞIDAKİLER TARGET_CLASS_IDS'TEN OTOMATİK TÜRETİLİR, ELLE DEĞİŞTİRME ---
@@ -171,6 +176,15 @@ TRACKER_EMBEDDER = "mobilenet"
 # GPU varsa embedder'ı hızlandırmak için True yap (CUDA yoksa PlayerTracker otomatik CPU'ya düşer).
 TRACKER_EMBEDDER_GPU = True
 TRACKER_EMBEDDER_HALF = True
+
+# 90 dakikalık maç ölçeklenebilirliği için takipçi tipi ("deepsort" veya "bytetrack")
+# ve DeepSORT görünüm embedding hesaplama adımı (1 = her kare, >1 = ara karelerde Kalman+IoU)
+TRACKER_TYPE = "deepsort"
+TRACKER_EMBEDDING_STRIDE = 1
+TRACKER_MAX_IOU_DISTANCE = 0.7
+TRACKER_HIGH_CONF_THRESH = 0.45
+TRACKER_LOW_CONF_THRESH = 0.05
+TRACKER_NEW_TRACK_CONF_THRESH = 0.30
 
 # ------------------------------------------------------------------
 # TOP TAKİBİ (BALL TRACKING) AYARLARI
@@ -240,6 +254,8 @@ TEAM_CLASSIFIER_MIN_UNIQUE_TRACKS = 10
 # Çok büyük tutmak gereksiz bellek kullanır, çok küçük tutmak tek bir kötü
 # kareden etkilenmeyi artırır.
 TEAM_COLOR_HISTORY_MAX_SAMPLES = 30
+# Henüz kilitlenmemiş (unlocked) gürültü track'leri için bellek üst sınırı
+TEAM_COLOR_HISTORY_MAX_UNLOCKED_TRACKS = 512
 
 # Forma rengi çıkarılırken bounding box'ın hangi dikey aralığı kullanılsın?
 # (0.0 = kutunun tepesi, 1.0 = kutunun tabanı)
@@ -292,6 +308,18 @@ CAMERA_MOTION_RANSAC_THRESHOLD = 3.0
 # ALTINA düşülürse "sahne kesmesi" kabul edilir ve kamera takibi sıfırlanır
 # (o kareden itibaren saha koordinatı üretilmez, yeniden kalibrasyon gerekir).
 SCENE_CUT_CORRELATION_THRESHOLD = 0.5
+SCENE_CUT_HSV_CORRELATION_THRESHOLD = 0.45
+SCENE_CUT_FADE_WINDOW = 8
+SCENE_CUT_FADE_CORRELATION_THRESHOLD = 0.58
+CAMERA_MOTION_SCALE = 0.5
+CAMERA_MOTION_SCALE_MIN_WIDTH = 960
+CAMERA_ORB_MAX_FEATURES = 600
+CAMERA_KEYFRAME_MAX_BANK = 8
+CAMERA_KEYFRAME_MIN_INTERVAL = 25
+CAMERA_RECOVERY_MIN_INLIERS = 14
+CAMERA_RECOVERY_MIN_INLIER_RATIO = 0.25
+CAMERA_DRIFT_CHECK_INTERVAL = 45
+CAMERA_MAIN_GREEN_MIN_RATIO = 0.22
 
 # ------------------------------------------------------------------
 # PERSPEKTİF DÖNÜŞÜMÜ (HOMOGRAPHY) AYARLARI
@@ -383,6 +411,9 @@ CALIBRATION_FRAME_INDEX = 0
 # çözüm (getPerspectiveTransform) kullanılır; 4'ten fazla nokta girilirse
 # RANSAC devreye girer.
 HOMOGRAPHY_RANSAC_THRESHOLD = 5.0
+HOMOGRAPHY_MIN_ABS_DET = 1e-10
+HOMOGRAPHY_MAX_CONDITION_NUMBER = 1e8
+HOMOGRAPHY_MIN_HOMOGENEOUS_W = 1e-6
 
 # Kuş bakışı 2D saha görselleştirmesi (minimap) boyutları (piksel).
 # Saha oranını (105:68) koruyacak şekilde otomatik hesaplanır.

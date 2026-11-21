@@ -53,6 +53,7 @@ AYAK NOKTASI NEDEN KULLANILIYOR (BBOX MERKEZİ DEĞİL)?
     her zaman bbox'ın "alt-orta" noktasını (bottom-center) kullanıyoruz.
 """
 
+import math
 import os
 import sys
 from typing import List, Dict, Tuple, Optional
@@ -89,13 +90,90 @@ class PerspectiveTransformer:
             Landmark ismi -> sahadaki gerçek metre koordinatı. Verilmezse
             config.PITCH_LANDMARKS_METERS kullanılır.
         """
-        self.source_points = source_points or config.SOURCE_CALIBRATION_POINTS
-        self.destination_points_meters = destination_points_meters or config.PITCH_LANDMARKS_METERS
+        self.source_points = (
+            source_points if source_points is not None else config.SOURCE_CALIBRATION_POINTS
+        )
+        self.destination_points_meters = (
+            destination_points_meters
+            if destination_points_meters is not None
+            else config.PITCH_LANDMARKS_METERS
+        )
 
         self.homography_matrix: Optional[np.ndarray] = None
         self.is_calibrated = False
+        self._cached_pitch_canvas: Optional[np.ndarray] = None
+        self._cached_pitch_canvas_key: Optional[Tuple] = None
 
         self._compute_homography()
+
+    # ----------------------------------------------------------------
+    @staticmethod
+    def _get_homography_thresholds() -> Tuple[float, float, float, float]:
+        min_abs_det = float(getattr(config, "HOMOGRAPHY_MIN_ABS_DET", 1e-10))
+        max_cond = float(
+            getattr(
+                config,
+                "HOMOGRAPHY_MAX_CONDITION_NUMBER",
+                getattr(config, "HOMOGRAPHY_MAX_COND", 1e8),
+            )
+        )
+        w_eps = float(
+            getattr(
+                config,
+                "HOMOGRAPHY_MIN_HOMOGENEOUS_W",
+                getattr(config, "HOMOGRAPHY_DIVISOR_EPS", 1e-6),
+            )
+        )
+        row2_min_norm = float(getattr(config, "HOMOGRAPHY_ROW2_MIN_NORM", 1e-12))
+        return min_abs_det, max_cond, w_eps, row2_min_norm
+
+    # ----------------------------------------------------------------
+    @staticmethod
+    def _validate_and_normalize_matrix(
+        matrix: Optional[np.ndarray],
+        min_abs_det: float = 1e-10,
+        max_cond: float = 1e8,
+        row2_min_norm: float = 1e-12,
+    ) -> Optional[np.ndarray]:
+        """
+        3x3 homografi matrisini float64 hassasiyetinde doğrular ve son satırının
+        L2 normuyla normalize eder (w' işaretini korur, sıfıra bölmeyi önler).
+        Tekil, sonlu olmayan veya aşırı koşullu matrisler için None döndürür.
+        """
+        if matrix is None:
+            return None
+
+        try:
+            m = np.asarray(matrix, dtype=np.float64)
+        except (TypeError, ValueError):
+            return None
+
+        if m.ndim != 2 or m.shape != (3, 3):
+            return None
+
+        if not bool(np.isfinite(m).all()):
+            return None
+
+        row2_norm = float(np.linalg.norm(m[2, :]))
+        if not math.isfinite(row2_norm) or row2_norm <= row2_min_norm:
+            return None
+
+        m_norm = m / row2_norm
+        if not bool(np.isfinite(m_norm).all()):
+            return None
+
+        try:
+            det = float(np.linalg.det(m_norm))
+            if not math.isfinite(det) or abs(det) <= min_abs_det:
+                return None
+
+            cond = float(np.linalg.cond(m_norm))
+            if not math.isfinite(cond) or cond > max_cond:
+                return None
+        except np.linalg.LinAlgError:
+            return None
+
+        return m_norm
 
     # ----------------------------------------------------------------
     def _compute_homography(self):
@@ -104,6 +182,9 @@ class PerspectiveTransformer:
         En az 4 nokta gereklidir (bir düzlem-düzlem dönüşümünün serbestlik derecesi 8'dir,
         her nokta 2 denklem verir -> 4 nokta = 8 denklem).
         """
+        self.homography_matrix = None
+        self.is_calibrated = False
+
         # Sadece HEM piksel HEM metre karşılığı bilinen (yani iki sözlükte de
         # ortak olan) landmark isimlerini kullanıyoruz.
         common_landmarks = [
@@ -118,28 +199,98 @@ class PerspectiveTransformer:
                 f"config.py -> SOURCE_CALIBRATION_POINTS'i doldurmalısın "
                 f"(bkz. utils/calibrate_homography.py). Saha koordinatları üretilmeyecek."
             )
-            self.is_calibrated = False
             return
 
         # Piksel noktaları (kaynak) ve metre noktaları (hedef) dizilerini hazırla.
-        # cv2.findHomography float32 array bekler, şekil (N, 2).
-        src_pts = np.array([self.source_points[name] for name in common_landmarks], dtype=np.float32)
-        dst_pts = np.array([self.destination_points_meters[name] for name in common_landmarks], dtype=np.float32)
+        try:
+            src_pts = np.array(
+                [self.source_points[name] for name in common_landmarks], dtype=np.float64
+            )
+            dst_pts = np.array(
+                [self.destination_points_meters[name] for name in common_landmarks],
+                dtype=np.float64,
+            )
+        except (TypeError, ValueError):
+            print("[PerspectiveTransformer] HATA: Kalibrasyon noktaları sayısal değil.")
+            return
+
+        if (
+            src_pts.ndim != 2
+            or src_pts.shape[1] != 2
+            or dst_pts.shape != src_pts.shape
+            or not bool(np.isfinite(src_pts).all())
+            or not bool(np.isfinite(dst_pts).all())
+        ):
+            print("[PerspectiveTransformer] HATA: Kalibrasyon noktaları geçersiz veya sonlu değil.")
+            return
 
         # cv2.RANSAC: 4'ten fazla nokta varsa, tıklama hatası gibi aykırı
         # noktaları otomatik eleyerek daha sağlam bir matris bulur.
-        # Tam 4 nokta varsa RANSAC'a gerek yok ama fonksiyon yine de çalışır.
-        self.homography_matrix, mask = cv2.findHomography(
-            src_pts, dst_pts, cv2.RANSAC, config.HOMOGRAPHY_RANSAC_THRESHOLD
+        H, mask = cv2.findHomography(
+            src_pts.astype(np.float32),
+            dst_pts.astype(np.float32),
+            cv2.RANSAC,
+            config.HOMOGRAPHY_RANSAC_THRESHOLD,
         )
 
-        if self.homography_matrix is None:
+        if H is None:
             print("[PerspectiveTransformer] HATA: Homografi matrisi hesaplanamadı (noktalar dejenere olabilir).")
-            self.is_calibrated = False
             return
 
+        H = np.asarray(H, dtype=np.float64)
+        if H.shape != (3, 3) or not bool(np.isfinite(H).all()):
+            print("[PerspectiveTransformer] HATA: Hesaplanan homografi matrisi sonlu değil.")
+            return
+
+        inlier_mask = (
+            mask.ravel().astype(bool)
+            if mask is not None
+            else np.ones(len(common_landmarks), dtype=bool)
+        )
+        inlier_count = int(inlier_mask.sum())
+        if inlier_count < 4:
+            print(
+                f"[PerspectiveTransformer] HATA: Yetersiz RANSAC inlier sayısı ({inlier_count} < 4)."
+            )
+            return
+
+        min_abs_det, max_cond, w_eps, row2_min_norm = self._get_homography_thresholds()
+
+        # Bilinen görünür kalibrasyon noktaları üzerinde w işaretini kanonikleştir:
+        # dik yayın kameralarında (ufuk kare içindeyken) findHomography H'yi ters
+        # işaretle döndürebilir; görünür noktalarda medyan w > 0 olacak şekilde hizala.
+        inlier_src = src_pts[inlier_mask]
+        w_cal = H[2, 0] * inlier_src[:, 0] + H[2, 1] * inlier_src[:, 1] + H[2, 2]
+        if not bool(np.isfinite(w_cal).all()):
+            print("[PerspectiveTransformer] HATA: Kalibrasyon noktalarında w değeri sonlu değil.")
+            return
+
+        if float(np.median(w_cal)) < 0.0:
+            H = -H
+            w_cal = -w_cal
+
+        row2_norm = float(np.linalg.norm(H[2, :]))
+        if not math.isfinite(row2_norm) or row2_norm <= row2_min_norm:
+            print("[PerspectiveTransformer] HATA: Homografi son satır normu dejenere.")
+            return
+
+        # Bükülmüş (bowtie) veya ufuk çizgisiyle çakışan kalibrasyonları reddet
+        if not bool(np.all(w_cal > w_eps * row2_norm)):
+            print("[PerspectiveTransformer] HATA: Kalibrasyon noktaları tutarsız/bükülmüş homografi üretti.")
+            return
+
+        validated_H = self._validate_and_normalize_matrix(
+            H,
+            min_abs_det=min_abs_det,
+            max_cond=max_cond,
+            row2_min_norm=row2_min_norm,
+        )
+        if validated_H is None:
+            print("[PerspectiveTransformer] HATA: Homografi matrisi tekil veya aşırı koşullu.")
+            return
+
+        self.homography_matrix = validated_H
         self.is_calibrated = True
-        inlier_count = int(mask.sum()) if mask is not None else len(common_landmarks)
         print(
             f"[PerspectiveTransformer] Homografi başarıyla hesaplandı. "
             f"{len(common_landmarks)} nokta kullanıldı ({inlier_count} tanesi RANSAC inlier)."
@@ -169,19 +320,42 @@ class PerspectiveTransformer:
         Dönüş
         -----
         Optional[Tuple[float, float]]
-            (pitch_x_metre, pitch_y_metre) ya da kalibrasyon yapılmadıysa None.
+            (pitch_x_metre, pitch_y_metre) ya da kalibrasyon/projeksiyon geçersizse None.
         """
-        matrix = homography_matrix if homography_matrix is not None else self.homography_matrix
-
-        if matrix is None:
+        try:
+            px = float(pixel_x)
+            py = float(pixel_y)
+        except (TypeError, ValueError):
             return None
 
-        # cv2.perspectiveTransform, noktaları (1, N, 2) şeklinde bekler.
-        point = np.array([[[pixel_x, pixel_y]]], dtype=np.float32)
-        transformed = cv2.perspectiveTransform(point, matrix)
+        if not (math.isfinite(px) and math.isfinite(py)):
+            return None
 
-        pitch_x, pitch_y = transformed[0][0]
-        return float(pitch_x), float(pitch_y)
+        min_abs_det, max_cond, w_eps, row2_min_norm = self._get_homography_thresholds()
+        raw_matrix = homography_matrix if homography_matrix is not None else self.homography_matrix
+        m_norm = self._validate_and_normalize_matrix(
+            raw_matrix,
+            min_abs_det=min_abs_det,
+            max_cond=max_cond,
+            row2_min_norm=row2_min_norm,
+        )
+        if m_norm is None:
+            return None
+
+        # Ufuk çizgisi (w' ~ 0) ve kamera arkası (w' <= 0) projeksiyonlarını engelle
+        w_prime = float(m_norm[2, 0] * px + m_norm[2, 1] * py + m_norm[2, 2])
+        if not math.isfinite(w_prime) or w_prime <= w_eps:
+            return None
+
+        point = np.array([[[px, py]]], dtype=np.float64)
+        transformed = cv2.perspectiveTransform(point, m_norm)
+
+        pitch_x = float(transformed[0, 0, 0])
+        pitch_y = float(transformed[0, 0, 1])
+        if not (math.isfinite(pitch_x) and math.isfinite(pitch_y)):
+            return None
+
+        return pitch_x, pitch_y
 
     # ----------------------------------------------------------------
     @staticmethod
@@ -198,6 +372,15 @@ class PerspectiveTransformer:
         return foot_x, foot_y
 
     # ----------------------------------------------------------------
+    @staticmethod
+    def _clear_pitch_fields(detections: List[Dict]) -> List[Dict]:
+        for det in detections:
+            det["pitch_x"] = None
+            det["pitch_y"] = None
+            det["on_pitch"] = None
+        return detections
+
+    # ----------------------------------------------------------------
     def add_pitch_coordinates(
         self,
         detections: List[Dict],
@@ -209,7 +392,7 @@ class PerspectiveTransformer:
         Her elemana şu alanlar eklenir:
             "pitch_x": float veya None    -> sahanın uzun kenarı boyunca metre (0-105)
             "pitch_y": float veya None    -> sahanın kısa kenarı boyunca metre (0-68)
-            "on_pitch": bool               -> hesaplanan konum saha sınırları İÇİNDE mi?
+            "on_pitch": bool veya None    -> hesaplanan konum saha sınırları İÇİNDE mi?
 
         Parametreler
         ------------
@@ -228,42 +411,139 @@ class PerspectiveTransformer:
         List[Dict]
             Aynı liste, saha koordinatları eklenmiş halde.
         """
-        if not self.is_calibrated:
-            for det in detections:
-                det["pitch_x"] = None
-                det["pitch_y"] = None
-                det["on_pitch"] = None
+        if not detections:
             return detections
 
-        # Efektif homografiyi belirle: dinamik (kamera hareketi telafili) mi,
-        # statik mi?
+        if not self.is_calibrated or self.homography_matrix is None:
+            return self._clear_pitch_fields(detections)
+
+        min_abs_det, max_cond, w_eps, row2_min_norm = self._get_homography_thresholds()
+        base_m = self._validate_and_normalize_matrix(
+            self.homography_matrix,
+            min_abs_det=min_abs_det,
+            max_cond=max_cond,
+            row2_min_norm=row2_min_norm,
+        )
+        if base_m is None:
+            return self._clear_pitch_fields(detections)
+
+        # Efektif homografiyi belirle: dinamik (kamera hareketi telafili) mi, statik mi?
         if camera_motion_matrix is not None:
-            effective_matrix = self.homography_matrix @ camera_motion_matrix
+            motion_m = self._validate_and_normalize_matrix(
+                camera_motion_matrix,
+                min_abs_det=min_abs_det,
+                max_cond=max_cond,
+                row2_min_norm=row2_min_norm,
+            )
+            if motion_m is None:
+                return self._clear_pitch_fields(detections)
+            effective_m = self._validate_and_normalize_matrix(
+                base_m @ motion_m,
+                min_abs_det=min_abs_det,
+                max_cond=max_cond,
+                row2_min_norm=row2_min_norm,
+            )
+            if effective_m is None:
+                return self._clear_pitch_fields(detections)
         else:
-            effective_matrix = self.homography_matrix
+            effective_m = base_m
 
-        for det in detections:
-            foot_x, foot_y = self.get_foot_position(det["bbox"])
-            result = self.transform_point(foot_x, foot_y, homography_matrix=effective_matrix)
+        n = len(detections)
+        pts = np.zeros((n, 2), dtype=np.float64)
+        finite_input = np.zeros(n, dtype=bool)
 
-            if result is None:
-                det["pitch_x"] = None
-                det["pitch_y"] = None
-                det["on_pitch"] = None
+        for i, det in enumerate(detections):
+            det["pitch_x"] = None
+            det["pitch_y"] = None
+            det["on_pitch"] = None
+
+            bbox = det.get("bbox")
+            if bbox is None:
+                continue
+            try:
+                fx, fy = self.get_foot_position(bbox)
+                fx_f = float(fx)
+                fy_f = float(fy)
+            except (TypeError, ValueError):
                 continue
 
-            pitch_x, pitch_y = result
-            det["pitch_x"] = round(pitch_x, 2)
-            det["pitch_y"] = round(pitch_y, 2)
+            if math.isfinite(fx_f) and math.isfinite(fy_f):
+                pts[i, 0] = fx_f
+                pts[i, 1] = fy_f
+                finite_input[i] = True
 
-            # Küçük bir tolerans payı (1m) ile saha sınırları içinde mi kontrol et.
-            margin = 1.0
-            det["on_pitch"] = (
-                -margin <= pitch_x <= config.PITCH_LENGTH_M + margin
-                and -margin <= pitch_y <= config.PITCH_WIDTH_M + margin
-            )
+        w_prime = (
+            pts[:, 0] * effective_m[2, 0]
+            + pts[:, 1] * effective_m[2, 1]
+            + effective_m[2, 2]
+        )
+        valid_mask = finite_input & np.isfinite(w_prime) & (w_prime > w_eps)
+
+        if bool(np.any(valid_mask)):
+            valid_pts = pts[valid_mask].reshape(1, -1, 2)
+            projected = cv2.perspectiveTransform(valid_pts, effective_m)[0]
+            valid_indices = np.flatnonzero(valid_mask)
+
+            margin = float(getattr(config, "PITCH_ON_PITCH_MARGIN_M", 1.0))
+            pitch_length = float(config.PITCH_LENGTH_M)
+            pitch_width = float(config.PITCH_WIDTH_M)
+
+            for idx, (px_raw, py_raw) in zip(valid_indices, projected):
+                px_f = float(px_raw)
+                py_f = float(py_raw)
+                if not (math.isfinite(px_f) and math.isfinite(py_f)):
+                    continue
+
+                det = detections[int(idx)]
+                det["pitch_x"] = round(px_f, 2)
+                det["pitch_y"] = round(py_f, 2)
+                det["on_pitch"] = bool(
+                    -margin <= px_f <= pitch_length + margin
+                    and -margin <= py_f <= pitch_width + margin
+                )
 
         return detections
+
+    # ----------------------------------------------------------------
+    def _get_static_pitch_canvas(
+        self,
+        w: int,
+        h: int,
+        margin: int,
+        pitch_length: float,
+        pitch_width: float,
+        center_circle_radius: float,
+    ) -> np.ndarray:
+        cache_key = (w, h, margin, pitch_length, pitch_width, center_circle_radius)
+        if (
+            self._cached_pitch_canvas is not None
+            and self._cached_pitch_canvas_key == cache_key
+        ):
+            return self._cached_pitch_canvas
+
+        canvas = np.full((h, w, 3), (60, 140, 30), dtype=np.uint8)  # BGR koyu yeşil
+        scale_x = (w - 2 * margin) / pitch_length
+        scale_y = (h - 2 * margin) / pitch_width
+
+        def to_px(mx: float, my: float) -> Tuple[int, int]:
+            return int(margin + mx * scale_x), int(margin + my * scale_y)
+
+        top_left = to_px(0.0, 0.0)
+        bottom_right = to_px(pitch_length, pitch_width)
+        cv2.rectangle(canvas, top_left, bottom_right, (255, 255, 255), 2)
+
+        half_x = pitch_length / 2.0
+        halfway_top = to_px(half_x, 0.0)
+        halfway_bottom = to_px(half_x, pitch_width)
+        cv2.line(canvas, halfway_top, halfway_bottom, (255, 255, 255), 2)
+
+        center = to_px(half_x, pitch_width / 2.0)
+        radius_px = int(center_circle_radius * scale_x)
+        cv2.circle(canvas, center, radius_px, (255, 255, 255), 2)
+
+        self._cached_pitch_canvas = canvas
+        self._cached_pitch_canvas_key = cache_key
+        return canvas
 
     # ----------------------------------------------------------------
     def draw_pitch_minimap(self, detections: List[Dict]) -> np.ndarray:
@@ -280,41 +560,46 @@ class PerspectiveTransformer:
             BGR formatında, sahayı ve üzerindeki oyuncu/top konumlarını
             gösteren bir görüntü (config.PITCH_MINIMAP_WIDTH_PX x HEIGHT_PX boyutunda).
         """
-        w = config.PITCH_MINIMAP_WIDTH_PX
-        h = config.PITCH_MINIMAP_HEIGHT_PX
-        margin = config.PITCH_MINIMAP_MARGIN_PX
+        w = int(config.PITCH_MINIMAP_WIDTH_PX)
+        h = int(config.PITCH_MINIMAP_HEIGHT_PX)
+        margin = int(config.PITCH_MINIMAP_MARGIN_PX)
+        pitch_length = float(config.PITCH_LENGTH_M)
+        pitch_width = float(config.PITCH_WIDTH_M)
+        center_circle_radius = float(getattr(config, "CENTER_CIRCLE_RADIUS_M", 9.15))
 
-        # Yeşil saha zemini oluştur
-        minimap = np.full((h, w, 3), (60, 140, 30), dtype=np.uint8)  # BGR koyu yeşil
+        minimap = self._get_static_pitch_canvas(
+            w, h, margin, pitch_length, pitch_width, center_circle_radius
+        ).copy()
 
         # Metre -> minimap piksel dönüşümü için ölçek faktörü
-        scale_x = (w - 2 * margin) / config.PITCH_LENGTH_M
-        scale_y = (h - 2 * margin) / config.PITCH_WIDTH_M
+        scale_x = (w - 2 * margin) / pitch_length
+        scale_y = (h - 2 * margin) / pitch_width
 
-        def to_minimap_px(meter_x, meter_y):
+        def to_minimap_px(meter_x: float, meter_y: float) -> Tuple[int, int]:
             px = int(margin + meter_x * scale_x)
             py = int(margin + meter_y * scale_y)
             return px, py
-
-        # --- Saha çizgilerini çiz (dış çizgi, orta çizgi, orta yuvarlak) ---
-        top_left = to_minimap_px(0, 0)
-        bottom_right = to_minimap_px(config.PITCH_LENGTH_M, config.PITCH_WIDTH_M)
-        cv2.rectangle(minimap, top_left, bottom_right, (255, 255, 255), 2)
-
-        halfway_top = to_minimap_px(52.5, 0)
-        halfway_bottom = to_minimap_px(52.5, 68)
-        cv2.line(minimap, halfway_top, halfway_bottom, (255, 255, 255), 2)
-
-        center = to_minimap_px(52.5, 34)
-        radius_px = int(9.15 * scale_x)  # orta yuvarlak yarıçapı FIFA standardı: 9.15m
-        cv2.circle(minimap, center, radius_px, (255, 255, 255), 2)
 
         # --- Oyuncu/top konumlarını çiz ---
         for det in detections:
             if not det.get("on_pitch"):
                 continue  # saha dışına düşen (muhtemelen hatalı) noktaları çizme
 
-            px, py = to_minimap_px(det["pitch_x"], det["pitch_y"])
+            px_m = det.get("pitch_x")
+            py_m = det.get("pitch_y")
+            if px_m is None or py_m is None:
+                continue
+
+            try:
+                px_f = float(px_m)
+                py_f = float(py_m)
+            except (TypeError, ValueError):
+                continue
+
+            if not (math.isfinite(px_f) and math.isfinite(py_f)):
+                continue
+
+            px, py = to_minimap_px(px_f, py_f)
 
             if det.get("class_name") == "ball":
                 cv2.circle(minimap, (px, py), 5, config.BBOX_COLOR_BALL, -1)
