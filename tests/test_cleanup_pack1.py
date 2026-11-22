@@ -290,3 +290,103 @@ def test_t2_calibrated_data_behavior_unchanged(tmp_path):
     assert ml_sum["tempo_and_anomalies"]["status"] == "ok"
     assert (ml_out / "player_clusters_pca.png").exists()
     assert (ml_out / "tempo_anomaly_timeline.png").exists()
+
+
+# ----------------------------------------------------------------------
+# T4 KABUL TESTLERİ: Kaleci Takımını Çoğunluk Oyuyla Kilitleme & Backfill
+# ----------------------------------------------------------------------
+def test_t4_goalkeeper_team_locks_after_majority_vote_under_noisy_x(monkeypatch):
+    from modules.team_classifier import TeamClassifier
+
+    monkeypatch.setattr(config, "USES_FINE_TUNED_FOOTBALL_MODEL", True)
+    frame = np.full((600, 1000, 3), (35, 140, 35), dtype=np.uint8)
+
+    def _paint(x1, y1, x2, y2, bgr):
+        bw, bh = x2 - x1, y2 - y1
+        frame[y1 + int(bh * 0.18):y1 + int(bh * 0.52), x1 + int(bw * 0.25):x1 + int(bw * 0.75)] = bgr
+
+    outfield_specs = []
+    for i in range(5):
+        bx1, by1, bx2, by2 = 140 + i * 45, 120, 180 + i * 45, 250
+        _paint(bx1, by1, bx2, by2, (30, 30, 210))
+        outfield_specs.append({"track_id": i + 1, "class_name": "player", "bbox": [bx1, by1, bx2, by2]})
+    for i in range(5):
+        bx1, by1, bx2, by2 = 600 + i * 45, 320, 640 + i * 45, 450
+        _paint(bx1, by1, bx2, by2, (210, 40, 30))
+        outfield_specs.append({"track_id": i + 6, "class_name": "player", "bbox": [bx1, by1, bx2, by2]})
+    _paint(40, 220, 85, 350, (40, 210, 40))
+
+    clf = TeamClassifier(n_clusters=2, min_unique_tracks=10, min_samples_for_lock=3, vote_window=7)
+    # İlk kareyi besleyip Team A / Team B etiketlerini öğren
+    first_dets = [{"track_id": s["track_id"], "class_name": "player", "bbox": s["bbox"], "team": None} for s in outfield_specs]
+    first_out = clf.assign_teams(first_dets, frame)
+    team_a_lbl = first_out[0]["team"]
+    team_b_lbl = first_out[5]["team"]
+    assert team_a_lbl != team_b_lbl
+
+    # Gürültülü dizi: ağırlıklı A tarafı (40, 910, 45, 50) -> A olarak kilitlenmeli
+    gk_xs = [40, 910, 45, 50]
+    assigned_seq = []
+    for x in gk_xs:
+        dets = [{"track_id": s["track_id"], "class_name": "player", "bbox": s["bbox"], "team": None} for s in outfield_specs]
+        dets.append({"track_id": 101, "class_name": "goalkeeper", "bbox": [x, 220, x + 45, 350], "team": None})
+        out = clf.assign_teams(dets, frame)
+        assigned_seq.append(next(d["team"] for d in out if d["track_id"] == 101))
+
+    assert 101 in clf._locked_gk_tracks
+    assert assigned_seq[-1] == team_a_lbl
+
+    # Kilit sonrası kaleci B tarafına geçse bile takım ASLA değişmemeli
+    for _ in range(15):
+        dets = [{"track_id": s["track_id"], "class_name": "player", "bbox": s["bbox"], "team": None} for s in outfield_specs]
+        dets.append({"track_id": 101, "class_name": "goalkeeper", "bbox": [910, 220, 955, 350], "team": None})
+        out = clf.assign_teams(dets, frame)
+        gk_team = next(d["team"] for d in out if d["track_id"] == 101)
+        assert gk_team == team_a_lbl
+        assert gk_team != team_b_lbl
+
+
+def test_t4_postprocess_backfills_goalkeeper_placeholder_rows_in_mem_and_stream(tmp_path):
+    from modules.data_exporter import DataExporter
+
+    for mode, kwargs in (
+        ("mem", {"flush_interval": 0}),
+        (
+            "stream",
+            {
+                "flush_interval": 3,
+                "csv_path": str(tmp_path / "gk_stream.csv"),
+                "sql_path": str(tmp_path / "gk_stream.db"),
+                "enable_csv": True,
+                "enable_sql": True,
+            },
+        ),
+    ):
+        exp = DataExporter(fps=25.0, **kwargs)
+        with exp:
+            for f in range(12):
+                team_val = None if f < 2 else ("Goalkeeper" if f < 7 else "Team A")
+                exp.append_frame_data(
+                    f,
+                    [
+                        {
+                            "track_id": 101,
+                            "class_name": "goalkeeper",
+                            "team": team_val,
+                            "confidence": 0.9,
+                            "is_predicted": False,
+                            "bbox": [40.0, 220.0, 85.0, 350.0],
+                            "pitch_x": 5.0,
+                            "pitch_y": 34.0,
+                            "on_pitch": True,
+                        }
+                    ],
+                )
+            exp.postprocess(team_map={101: "Team A"})
+            df = exp.to_dataframe()
+            assert (df["team"] == "Team A").all(), f"{mode} modunda doldurulmamış GK satırı kaldı"
+            assert "Goalkeeper" not in set(df["team"].astype(str))
+            assert "Team B" not in set(df["team"].astype(str))
+            if mode == "stream":
+                csv_df = pd.read_csv(kwargs["csv_path"])
+                assert (csv_df["team"] == "Team A").all()

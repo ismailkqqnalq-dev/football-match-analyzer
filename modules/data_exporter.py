@@ -445,6 +445,16 @@ class DataExporter:
                 self._flush_chunk(final=False)
 
     # ----------------------------------------------------------------
+    @staticmethod
+    def _needs_team_backfill(rec: Dict, resolved_team: Optional[str] = None) -> bool:
+        """Eksik (None/NaN) takım etiketleri ile kilitsiz kaleci yer tutucularını belirler."""
+        team = rec.get("team")
+        if _is_null(team):
+            return resolved_team is None or not _is_null(resolved_team)
+        if rec.get("class_name") == "goalkeeper" and team == "Goalkeeper":
+            return resolved_team is None or resolved_team != "Goalkeeper"
+        return False
+
     def _build_team_lookup(self, team_map: Optional[Dict] = None) -> Dict[str, str]:
         counts_by_tid: Dict[str, Counter] = {
             tid: Counter(counter) for tid, counter in self._team_counts_by_tid.items()
@@ -461,11 +471,15 @@ class DataExporter:
                     counts_by_tid[tid_key] = counter
                 counter[str(team)] += 1
 
-        lookup: Dict[str, str] = {
-            tid: counter.most_common(1)[0][0]
-            for tid, counter in counts_by_tid.items()
-            if counter
-        }
+        lookup: Dict[str, str] = {}
+        for tid, counter in counts_by_tid.items():
+            if not counter:
+                continue
+            real_counts = Counter({k: v for k, v in counter.items() if k != "Goalkeeper"})
+            if real_counts:
+                lookup[tid] = real_counts.most_common(1)[0][0]
+            else:
+                lookup[tid] = counter.most_common(1)[0][0]
 
         if team_map:
             for tid, team in team_map.items():
@@ -477,9 +491,9 @@ class DataExporter:
     # ----------------------------------------------------------------
     def backfill_teams(self, team_map: Optional[Dict] = None) -> int:
         """
-        K-Means fit edilmeden önceki ilk karelerde `team=None` kalan oyuncu
-        satırlarını, sonradan kesinleşen `track_id -> team` eşlemesiyle
-        geriye dönük doldurur.
+        K-Means fit edilmeden önceki ilk karelerde `team=None` veya geçici
+        `team='Goalkeeper'` kalan oyuncu/kaleci satırlarını, sonradan kesinleşen
+        `track_id -> team` eşlemesiyle geriye dönük doldurur.
 
         Dönüş: doldurulan satır sayısı.
         """
@@ -489,9 +503,9 @@ class DataExporter:
         for rec in self.records:
             if rec.get("class_name") == config.BALL_CLASS_NAME:
                 continue
-            if _is_null(rec.get("team")):
+            if self._needs_team_backfill(rec):
                 resolved = lookup.get(str(rec.get("track_id")))
-                if resolved is not None:
+                if resolved is not None and self._needs_team_backfill(rec, resolved):
                     rec["team"] = resolved
                     filled += 1
 
@@ -504,7 +518,7 @@ class DataExporter:
                 patch_csv = self._patch_csv_teams(lookup)
             filled += patch_sql if (self.enable_sql and self._active_sql_path) else patch_csv
             for tid in list(self._flushed_null_team_tids):
-                if tid in lookup:
+                if tid in lookup and lookup[tid] != "Goalkeeper":
                     self._flushed_null_team_tids.discard(tid)
 
         return filled
@@ -713,17 +727,17 @@ class DataExporter:
                 for rec in to_flush:
                     if rec.get("class_name") == config.BALL_CLASS_NAME:
                         continue
-                    if _is_null(rec.get("team")):
+                    if self._needs_team_backfill(rec):
                         tid_key = str(rec.get("track_id"))
                         resolved = lookup.get(tid_key)
-                        if resolved is not None:
+                        if resolved is not None and self._needs_team_backfill(rec, resolved):
                             rec["team"] = resolved
                             self._pre_flushed_backfill_count += 1
                         else:
                             self._flushed_null_team_tids.add(tid_key)
             else:
                 for rec in to_flush:
-                    if rec.get("class_name") != config.BALL_CLASS_NAME and _is_null(rec.get("team")):
+                    if rec.get("class_name") != config.BALL_CLASS_NAME and self._needs_team_backfill(rec):
                         self._flushed_null_team_tids.add(str(rec.get("track_id")))
 
         self._write_chunk_to_targets(to_flush)
@@ -754,11 +768,19 @@ class DataExporter:
                     team = lookup.get(tid)
                     if team is None:
                         continue
-                    cur = conn.execute(
-                        f'UPDATE "{table_name}" SET team = ? '
-                        "WHERE track_id = ? AND team IS NULL AND class_name != ?",
-                        (team, tid, config.BALL_CLASS_NAME),
-                    )
+                    if team != "Goalkeeper":
+                        cur = conn.execute(
+                            f'UPDATE "{table_name}" SET team = ? '
+                            "WHERE track_id = ? AND class_name != ? "
+                            "AND (team IS NULL OR (class_name = 'goalkeeper' AND team = 'Goalkeeper'))",
+                            (team, tid, config.BALL_CLASS_NAME),
+                        )
+                    else:
+                        cur = conn.execute(
+                            f'UPDATE "{table_name}" SET team = ? '
+                            "WHERE track_id = ? AND team IS NULL AND class_name != ?",
+                            (team, tid, config.BALL_CLASS_NAME),
+                        )
                     if cur.rowcount and cur.rowcount > 0:
                         total_updated += int(cur.rowcount)
         finally:
@@ -790,13 +812,17 @@ class DataExporter:
             cls_idx = header.index("class_name")
             team_idx = header.index("team")
             for row in reader:
-                if (
-                    row[cls_idx] != config.BALL_CLASS_NAME
-                    and row[team_idx] == ""
-                    and row[tid_idx] in target_tids
-                ):
-                    row[team_idx] = lookup[row[tid_idx]]
-                    updated += 1
+                if row[cls_idx] != config.BALL_CLASS_NAME and row[tid_idx] in target_tids:
+                    resolved = lookup[row[tid_idx]]
+                    is_empty = row[team_idx] == ""
+                    is_gk_placeholder = (
+                        row[cls_idx] == "goalkeeper"
+                        and row[team_idx] == "Goalkeeper"
+                        and resolved != "Goalkeeper"
+                    )
+                    if is_empty or is_gk_placeholder:
+                        row[team_idx] = sanitize_csv_value(resolved)
+                        updated += 1
                 writer.writerow(row)
         os.replace(tmp_csv, csv_path)
         return updated
@@ -814,9 +840,9 @@ class DataExporter:
             for rec in self.records:
                 if rec.get("class_name") == config.BALL_CLASS_NAME:
                     continue
-                if _is_null(rec.get("team")):
+                if self._needs_team_backfill(rec):
                     resolved = lookup.get(str(rec.get("track_id")))
-                    if resolved is not None:
+                    if resolved is not None and self._needs_team_backfill(rec, resolved):
                         rec["team"] = resolved
                         tail_backfilled += 1
 

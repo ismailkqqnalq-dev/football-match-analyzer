@@ -89,8 +89,10 @@ class TeamClassifier:
         self._refit_count: int = 0
         self._samples_since_fit: int = 0
 
-        # Kaleci mekânsal eşleştirme için takım yatay merkez EMA durumu
+        # Kaleci mekânsal eşleştirme ve kilitli çoğunluk oylaması durumu
         self._team_x_ema: Dict[str, float] = {}
+        self._gk_vote_history: Dict[int, Deque[str]] = {}
+        self._locked_gk_tracks: set = set()
 
         # K-Means modeli ve küme->rol haritası
         self.kmeans: Optional[KMeans] = None
@@ -480,6 +482,8 @@ class TeamClassifier:
 
         # Mevcut kilitli izleri güncellenmiş karar sınırına göre yeniden değerlendir
         for tid, cl_idx in zip(tids, new_labels):
+            if tid in self._locked_gk_tracks:
+                continue
             if tid in self.team_assignment:
                 cur_role = self.team_assignment[tid]
                 if cur_role not in ("Team A", "Team B", "Referee"):
@@ -656,17 +660,41 @@ class TeamClassifier:
                     if tid in self.team_assignment:
                         det["team"] = self.team_assignment[tid]
 
-        # Takım savunma/saha içi yatay konum EMA'larını güncelle ve kalecileri eşleştir
+        # Takım savunma/saha içi yatay konum EMA'larını güncelle ve kalecileri çoğunluk oyuyla kilitle
         self._update_team_spatial_ema(outfield_dets)
+        min_gk_agree = float(getattr(config, "TEAM_CLASSIFIER_VOTE_MIN_AGREEMENT", 0.6))
         for det in gk_dets:
             tid = det.get("track_id")
+            if tid is not None and tid in self._locked_gk_tracks and tid in self.team_assignment:
+                det["team"] = self.team_assignment[tid]
+                continue
+
             matched = self._resolve_goalkeeper_team(det["bbox"], outfield_dets)
-            det["team"] = matched
-            if tid is not None:
-                if matched in ("Team A", "Team B"):
-                    self.team_assignment[tid] = matched
-                elif self.team_assignment.get(tid) == "Goalkeeper":
-                    self.team_assignment.pop(tid, None)
+            if tid is None:
+                det["team"] = matched
+                continue
+
+            if matched in ("Team A", "Team B"):
+                votes = self._gk_vote_history.get(tid)
+                if votes is None:
+                    votes = deque(maxlen=self.vote_window)
+                    self._gk_vote_history[tid] = votes
+                votes.append(matched)
+
+                if len(votes) >= self.min_samples_for_lock:
+                    top_label, top_cnt = Counter(votes).most_common(1)[0]
+                    if (
+                        top_label in ("Team A", "Team B")
+                        and (top_cnt / len(votes)) >= min_gk_agree
+                        and top_cnt >= self.min_samples_for_lock
+                    ):
+                        self.team_assignment[tid] = top_label
+                        self._locked_gk_tracks.add(tid)
+                        self._gk_vote_history.pop(tid, None)
+                        det["team"] = top_label
+                        continue
+
+            det["team"] = "Goalkeeper"
 
         return tracked_players
 

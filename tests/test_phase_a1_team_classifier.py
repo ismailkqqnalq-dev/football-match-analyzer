@@ -96,11 +96,12 @@ def test_r1_goalkeeper_matched_by_defensive_block_and_preserves_class_name(monke
 
     frame = _make_pitch_frame(specs)
     clf = TeamClassifier(n_clusters=2, min_unique_tracks=10, min_samples_for_lock=2)
-    dets = [
-        {"track_id": s["track_id"], "class_name": s["class_name"], "bbox": s["bbox"], "team": None}
-        for s in specs
-    ]
-    out = clf.assign_teams(dets, frame)
+    for _ in range(2):
+        dets = [
+            {"track_id": s["track_id"], "class_name": s["class_name"], "bbox": s["bbox"], "team": None}
+            for s in specs
+        ]
+        out = clf.assign_teams(dets, frame)
 
     team_a_label = out[0]["team"]
     team_b_label = out[5]["team"]
