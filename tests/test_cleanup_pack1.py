@@ -390,3 +390,62 @@ def test_t4_postprocess_backfills_goalkeeper_placeholder_rows_in_mem_and_stream(
             if mode == "stream":
                 csv_df = pd.read_csv(kwargs["csv_path"])
                 assert (csv_df["team"] == "Team A").all()
+
+
+# ----------------------------------------------------------------------
+# T8 KABUL TESTİ: K-Means Refit Kilitli Takımı Oylamasız Değiştirmemeli
+# ----------------------------------------------------------------------
+def test_t8_kmeans_refit_votes_instead_of_overwriting_locked_team(monkeypatch):
+    from collections import deque
+    from modules.team_classifier import TeamClassifier
+
+    monkeypatch.setattr(config, "USES_FINE_TUNED_FOOTBALL_MODEL", True)
+    frame = np.full((600, 1000, 3), (35, 140, 35), dtype=np.uint8)
+
+    def _paint(x1, y1, x2, y2, bgr):
+        bw, bh = x2 - x1, y2 - y1
+        frame[y1 + int(bh * 0.18):y1 + int(bh * 0.52), x1 + int(bw * 0.25):x1 + int(bw * 0.75)] = bgr
+
+    specs = []
+    for i in range(5):
+        bx1, by1, bx2, by2 = 40 + i * 80, 100, 96 + i * 80, 240
+        _paint(bx1, by1, bx2, by2, (30, 30, 220))
+        specs.append({"track_id": i + 1, "class_name": "player", "bbox": [bx1, by1, bx2, by2]})
+    for i in range(5):
+        bx1, by1, bx2, by2 = 520 + i * 80, 300, 576 + i * 80, 440
+        _paint(bx1, by1, bx2, by2, (245, 245, 245))
+        specs.append({"track_id": i + 6, "class_name": "player", "bbox": [bx1, by1, bx2, by2]})
+
+    clf = TeamClassifier(
+        n_clusters=2,
+        min_unique_tracks=10,
+        min_samples_for_lock=3,
+        vote_window=7,
+        max_refits=3,
+    )
+    clf.assign_teams(
+        [{"track_id": s["track_id"], "class_name": "player", "bbox": s["bbox"], "team": None} for s in specs],
+        frame,
+    )
+    assert clf.is_fitted is True
+    tid = 1
+    orig_team = clf.team_assignment[tid]
+    other_team = "Team B" if orig_team == "Team A" else "Team A"
+    # Kilitli track'te başlangıçta 2 uyumlu oy olsun (refit sonrası [orig, orig, other] -> henüz %60 eşiğine ulaşmaz)
+    clf._vote_history[tid] = deque([orig_team, orig_team], maxlen=clf.vote_window)
+
+    # Tek bir refit track 1'i karşı küme merkezine yaklaştırsa bile hemen takımı değişmemeli
+    feat_other = clf._track_feature_bank[6].copy()
+    for extra_id in range(20, 26):
+        clf._track_feature_bank[extra_id] = clf._track_feature_bank[6].copy()
+    clf._track_feature_bank[tid] = feat_other
+    clf._samples_since_fit = 10
+
+    clf._maybe_refit_kmeans()
+    assert clf._refit_count == 1
+    assert clf.team_assignment[tid] == orig_team, "Tek refit oylamasız şekilde kilitli takımı değiştirdi!"
+
+    # Ancak oylama penceresinde min_samples_for_lock ve %60 çoğunluk sağlanınca (2 yeni oyla toplam 3/5) değişmeli
+    for _ in range(clf.min_samples_for_lock):
+        clf._record_vote_and_maybe_update(tid, other_team)
+    assert clf.team_assignment[tid] == other_team

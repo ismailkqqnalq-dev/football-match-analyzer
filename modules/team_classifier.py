@@ -489,9 +489,7 @@ class TeamClassifier:
                 if cur_role not in ("Team A", "Team B", "Referee"):
                     continue
                 new_role = self.cluster_role_map[int(cl_idx)]
-                if new_role != cur_role:
-                    self.team_assignment[tid] = new_role
-                    self._vote_history[tid] = deque([new_role], maxlen=self.vote_window)
+                self._record_vote_and_maybe_update(tid, new_role)
 
         self._refit_count += 1
         self._samples_since_fit = 0
