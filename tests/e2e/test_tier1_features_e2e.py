@@ -725,7 +725,7 @@ def test_f3_ml_analyzer_from_csv_and_sql_exports_turkish_report_and_strict_json(
         conn.close()
 
     out_dir = tmp_path / "ml_out"
-    res = MLAnalyzer.from_sql(str(db_path), fps=25.0).export_all(output_dir=str(out_dir), generate_plots=True)
+    res = MLAnalyzer.from_sql(str(db_path), fps=25.0, allow_synthetic=True).export_all(output_dir=str(out_dir), generate_plots=True)
 
     expected_files = [
         config.EXPORT_ML_PLAYER_PROFILES_FILENAME,
