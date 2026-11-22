@@ -376,10 +376,14 @@ def test_real_tracking_data_cli_csv_and_sql_and_data_safety(tmp_path):
     db_hash_before = _sha256(db_path)
 
     out_csv_dir = tmp_path / "cli_csv_out"
+    utf8_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     res_csv = subprocess.run(
         [sys.executable, "modules/ml_analyzer.py", "--input", csv_path, "--output-dir", str(out_csv_dir)],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
         check=True,
     )
     assert "[ML Özeti]" in res_csv.stdout
@@ -414,6 +418,9 @@ def test_real_tracking_data_cli_csv_and_sql_and_data_safety(tmp_path):
         [sys.executable, "modules/ml_analyzer.py", "--input", db_path, "--output-dir", str(out_db_dir), "--no-plots"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
         check=True,
     )
     assert (out_db_dir / config.EXPORT_ML_SUMMARY_FILENAME).exists()

@@ -238,6 +238,7 @@ def test_t2_f2_data_exporter_distance_summary_empty_and_uncalibrated_returns_non
 
 
 def test_t2_f2_cli_missing_input_video_and_invalid_tracker_nonzero_exit(tmp_path):
+    utf8_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     res_missing = subprocess.run(
         [
             sys.executable,
@@ -251,6 +252,9 @@ def test_t2_f2_cli_missing_input_video_and_invalid_tracker_nonzero_exit(tmp_path
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
         check=False,
     )
     assert res_missing.returncode != 0
@@ -267,6 +271,9 @@ def test_t2_f2_cli_missing_input_video_and_invalid_tracker_nonzero_exit(tmp_path
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
         check=False,
     )
     assert res_bad_tracker.returncode != 0
@@ -509,6 +516,7 @@ def test_t2_f5_match_and_ml_cli_read_only_on_baseline_exports(tmp_path):
 
     ma_out = tmp_path / "ma_out"
     ml_out = tmp_path / "ml_out"
+    utf8_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     subprocess.run(
         [
             sys.executable,
@@ -522,6 +530,9 @@ def test_t2_f5_match_and_ml_cli_read_only_on_baseline_exports(tmp_path):
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
         check=True,
     )
     subprocess.run(
@@ -537,6 +548,9 @@ def test_t2_f5_match_and_ml_cli_read_only_on_baseline_exports(tmp_path):
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
         check=True,
     )
 

@@ -342,6 +342,9 @@ def test_f2_main_cli_exposes_production_flags():
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         check=True,
     )
     for flag in [
@@ -380,6 +383,9 @@ def test_f2_main_cli_no_video_and_export_dir(tmp_path):
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         check=False,
     )
     assert res.returncode == 0, f"main.py failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
@@ -902,6 +908,8 @@ def test_f5_gitignore_ignores_pt_weights_and_no_tracked_pt():
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
     )
     assert tracked_pt.stdout.strip() == "", f"Tracked .pt weights found in git: {tracked_pt.stdout}"

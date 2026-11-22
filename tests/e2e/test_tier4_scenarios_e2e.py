@@ -54,6 +54,7 @@ def test_t4_scenario1_end_to_end_cli_broadcast_pipeline(
     export_dir = tmp_path / "cli_exports"
     out_video = tmp_path / "annotated_broadcast.mp4"
 
+    utf8_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     res = subprocess.run(
         [
             sys.executable,
@@ -72,6 +73,9 @@ def test_t4_scenario1_end_to_end_cli_broadcast_pipeline(
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
         check=False,
     )
     assert res.returncode == 0, f"main.py failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
@@ -124,6 +128,9 @@ def test_t4_scenario1_end_to_end_cli_broadcast_pipeline(
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
         check=False,
     )
     assert res_novid.returncode == 0, f"main.py --no-video failed:\n{res_novid.stderr}"
@@ -352,6 +359,8 @@ def test_t4_scenario5_secret_hygiene_and_baseline_immutability_audit():
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=True,
     )
     assert tracked_pt.stdout.strip() == ""

@@ -116,6 +116,7 @@ def _default_pipeline_executor(
 ) -> None:
     """İzole alt süreç (`shell=False`) üzerinden analiz pipeline'ını çalıştırır."""
     safe_env = os.environ.copy()
+    safe_env["PYTHONIOENCODING"] = "utf-8"
     safe_env.setdefault(
         "YOLO_CONFIG_DIR",
         os.path.join(os.path.expanduser("~"), ".cache", "ultralytics_cfg"),
@@ -140,6 +141,8 @@ def _default_pipeline_executor(
         shell=False,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
     if res.returncode != 0:

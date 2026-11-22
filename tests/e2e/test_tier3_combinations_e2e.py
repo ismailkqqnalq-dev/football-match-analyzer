@@ -88,6 +88,9 @@ def test_t3_no_video_no_minimap_export_dir_with_analytics_and_ml(tmp_path):
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         check=False,
     )
     assert res.returncode == 0, f"CLI failed:\n{res.stdout}\n{res.stderr}"
@@ -118,6 +121,9 @@ def test_t3_no_csv_flush_interval_sqlite_only_analytics_and_ml(tmp_path):
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         check=False,
     )
     assert res.returncode == 0, f"CLI failed:\n{res.stdout}\n{res.stderr}"
@@ -149,6 +155,9 @@ def test_t3_no_sql_flush_interval_csv_only_analytics_and_ml(tmp_path):
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         check=False,
     )
     assert res.returncode == 0, f"CLI failed:\n{res.stdout}\n{res.stderr}"
@@ -392,11 +401,15 @@ def test_t3_long_pan_with_scorebug_camera_motion_and_batched_perspective(synthet
 
 
 def test_t3_tracker_fast_mode_plus_flush_interval_and_no_ml_no_analytics(tmp_path):
+    utf8_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     help_res = subprocess.run(
         [sys.executable, "main.py", "--help"],
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
         check=True,
     )
     assert "--tracker" in help_res.stdout, "--tracker flag not found in main.py --help"
@@ -433,6 +446,9 @@ def test_t3_tracker_fast_mode_plus_flush_interval_and_no_ml_no_analytics(tmp_pat
         cwd=str(REPO_ROOT),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=utf8_env,
         check=False,
     )
     assert res.returncode == 0, f"CLI fast-tracker mode failed:\n{res.stdout}\n{res.stderr}"

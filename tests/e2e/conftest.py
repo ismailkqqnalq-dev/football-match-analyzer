@@ -724,7 +724,7 @@ def scan_secret_hygiene(repo_root: Path = REPO_ROOT) -> List[str]:
             capture_output=True,
             text=True,
             encoding="utf-8",
-            errors="ignore",
+            errors="replace",
             check=False,
         )
         if git_res.returncode == 0 and git_res.stdout:
