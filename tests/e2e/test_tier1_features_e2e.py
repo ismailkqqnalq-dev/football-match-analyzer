@@ -151,6 +151,7 @@ def _make_synthetic_jersey_frame(players_spec):
 # ======================================================================
 
 
+@pytest.mark.requires_model
 def test_f1_trained_football_model_weight_exists_and_configured():
     models_dir = Path(config.MODELS_DIR)
     pt_files = list(models_dir.glob("*.pt"))
@@ -207,10 +208,9 @@ def test_f1_detector_validates_model_names_and_runs_inference_mode(monkeypatch):
     assert len(batch_out) == 2
 
 
+@pytest.mark.requires_model
+@pytest.mark.gpu
 def test_f1_detector_batch_cuda_rtx4050_inference():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device unavailable in this environment")
-
     model_path = Path(config.YOLO_MODEL_PATH)
     assert model_path.is_file(), f"Missing trained football weights at {model_path}"
 
@@ -359,6 +359,7 @@ def test_f2_main_cli_exposes_production_flags():
         assert flag in res.stdout, f"Missing CLI flag {flag} in main.py --help"
 
 
+@pytest.mark.requires_model
 def test_f2_main_cli_no_video_and_export_dir(tmp_path):
     clip = build_short_tactical_clip(tmp_path / "in", n_frames=8)
     export_dir = tmp_path / "exports"

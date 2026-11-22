@@ -91,6 +91,7 @@ DEFAULT_OUTPUT_VIDEO = os.path.join(OUTPUT_VIDEO_DIR, "match_sample_annotated.mp
 # dosyasındaki "names:" listesinin SIRASINI birebir buraya kopyala -- sıra
 # yanlışsa sınıf ID'leri yanlış isimlere eşlenir.)
 YOLO_MODEL_PATH = os.path.join(MODELS_DIR, "football_yolo11s_best.pt")  # M1 futbola özel fine-tune model
+MODEL_DOWNLOAD_URL = ""  # Opsiyonel ağırlık indirme adresi (örn. GitHub Releases)
 
 # YOLO çıkarım (inference) çözünürlüğü, FP16 ve batch ayarları
 DETECTION_IMG_SIZE = 960

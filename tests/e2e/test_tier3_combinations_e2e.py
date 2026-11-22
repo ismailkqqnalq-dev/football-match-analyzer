@@ -66,6 +66,7 @@ def _make_jersey_frame(players_spec):
     return frame
 
 
+@pytest.mark.requires_model
 def test_t3_no_video_no_minimap_export_dir_with_analytics_and_ml(tmp_path):
     clip = build_short_tactical_clip(tmp_path / "in", n_frames=12)
     export_dir = tmp_path / "exports"
@@ -100,6 +101,7 @@ def test_t3_no_video_no_minimap_export_dir_with_analytics_and_ml(tmp_path):
     assert (export_dir / "ml_reports" / config.EXPORT_ML_SUMMARY_FILENAME).is_file()
 
 
+@pytest.mark.requires_model
 def test_t3_no_csv_flush_interval_sqlite_only_analytics_and_ml(tmp_path):
     clip = build_short_tactical_clip(tmp_path / "in", n_frames=12)
     export_dir = tmp_path / "exports_sql_only"
@@ -134,6 +136,7 @@ def test_t3_no_csv_flush_interval_sqlite_only_analytics_and_ml(tmp_path):
     assert (export_dir / "ml_reports" / config.EXPORT_ML_SUMMARY_FILENAME).is_file()
 
 
+@pytest.mark.requires_model
 def test_t3_no_sql_flush_interval_csv_only_analytics_and_ml(tmp_path):
     clip = build_short_tactical_clip(tmp_path / "in", n_frames=12)
     export_dir = tmp_path / "exports_csv_only"
@@ -402,6 +405,7 @@ def test_t3_long_pan_with_scorebug_camera_motion_and_batched_perspective(synthet
         cap.release()
 
 
+@pytest.mark.requires_model
 def test_t3_tracker_fast_mode_plus_flush_interval_and_no_ml_no_analytics(tmp_path):
     utf8_env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     help_res = subprocess.run(

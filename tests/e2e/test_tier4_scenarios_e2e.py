@@ -44,6 +44,7 @@ from conftest import (  # noqa: E402
 )
 
 
+@pytest.mark.requires_model
 def test_t4_scenario1_end_to_end_cli_broadcast_pipeline(
     tmp_path, synthetic_tv_broadcast_clip
 ):
@@ -230,14 +231,13 @@ def test_t4_scenario2_90min_scale_workload_memory_and_analytics_ml(
     )
 
 
+@pytest.mark.requires_model
+@pytest.mark.gpu
 def test_t4_scenario3_rtx4050_gpu_inference_and_90min_projection(synthetic_tv_broadcast_clip):
     """
     Scenario 3: Real CUDA RTX 4050 GPU inference & VRAM/FPS benchmark on trained
     4-class football YOLO model with 90-minute runtime projection (<= 6 GB VRAM).
     """
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device unavailable in this environment")
-
     model_path = Path(config.YOLO_MODEL_PATH)
     assert model_path.is_file(), f"Missing trained football model weights: {model_path}"
 

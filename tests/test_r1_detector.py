@@ -539,10 +539,8 @@ def test_train_script_save_dir_resolution_and_train_kwargs(tmp_path, monkeypatch
 # ---------------------------------------------------------------------------
 # 6. Gerçek RTX 4050 GPU çıkarım ve VRAM testi
 # ---------------------------------------------------------------------------
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not os.path.exists(config.YOLO_MODEL_PATH),
-    reason="CUDA GPU veya eğitilmiş 4 sınıflı model ağırlığı mevcut değil",
-)
+@pytest.mark.requires_model
+@pytest.mark.gpu
 def test_rtx4050_gpu_detector_inference_and_vram():
     det = detector_module.ObjectDetector(device="cuda", half=True)
     assert det.device == "cuda"

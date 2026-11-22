@@ -449,3 +449,63 @@ def test_t8_kmeans_refit_votes_instead_of_overwriting_locked_team(monkeypatch):
     for _ in range(clf.min_samples_for_lock):
         clf._record_vote_and_maybe_update(tid, other_team)
     assert clf.team_assignment[tid] == other_team
+
+
+# ----------------------------------------------------------------------
+# T5 KABUL TESTLERİ: Model İndirme Betiği ve Taşınabilir Pytest İşaretleri
+# ----------------------------------------------------------------------
+def test_t5_download_models_empty_url_sha256_and_marker_skip(tmp_path, monkeypatch, capsys):
+    import utils.download_models as dm
+    import tests.conftest as root_conftest
+
+    # 1) URL boşken anlamlı Türkçe mesajla çıkış kodu 1 dönmeli
+    monkeypatch.setattr(config, "MODEL_DOWNLOAD_URL", "")
+    rc_empty = dm.main(["--output", str(tmp_path / "m.pt")])
+    assert rc_empty == 1
+    err_out = capsys.readouterr().err
+    assert "MODEL_DOWNLOAD_URL" in err_out or "boş" in err_out
+
+    # 2) Mock URL indirme + SHA-256 doğrulama (başarılı & uyuşmazlık)
+    payload = b"FAKE_YOLO_WEIGHTS_BYTES"
+    good_sha = hashlib.sha256(payload).hexdigest()
+
+    class FakeResp:
+        def __init__(self, data: bytes):
+            self._data = data
+            self._pos = 0
+
+        def read(self, n: int = -1):
+            if self._pos >= len(self._data):
+                return b""
+            chunk = self._data[self._pos:] if n < 0 else self._data[self._pos:self._pos + n]
+            self._pos += len(chunk)
+            return chunk
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(dm.urllib.request, "urlopen", lambda req, timeout=120.0: FakeResp(payload))
+    out_pt = tmp_path / "downloaded.pt"
+    saved = dm.download_model(url="https://example.com/model.pt", output_path=out_pt, expected_sha256=good_sha)
+    assert saved.is_file() and saved.read_bytes() == payload
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        dm.download_model(
+            url="https://example.com/model.pt",
+            output_path=tmp_path / "bad.pt",
+            expected_sha256="0" * 64,
+        )
+    assert not (tmp_path / "bad.pt").exists()
+
+    # 3) Model yokken requires_model işareti beklenen mesajla atlamalı
+    monkeypatch.setattr(config, "YOLO_MODEL_PATH", str(tmp_path / "nonexistent.pt"))
+    fake_item = SimpleNamespace(
+        get_closest_marker=lambda name: object() if name == "requires_model" else None
+    )
+    with pytest.raises(pytest.skip.Exception) as exc_info:
+        root_conftest.pytest_runtest_setup(fake_item)
+    assert "models/football_yolo11s_best.pt" in str(exc_info.value)
+    assert "Model ağırlıkları" in str(exc_info.value)

@@ -15,6 +15,26 @@ Varsayılan yapılandırma `models/football_yolo11s_best.pt` konumundaki 4 sın�
 (`0: ball`, `1: goalkeeper`, `2: player`, `3: referee`) futbola özel eğitilmiş
 YOLO11s modelini kullanır.
 
+## Model ağırlıkları
+`.pt` ağırlık dosyaları boyut ve lisans/dağıtım hijyeni nedeniyle Git deposuna
+dahil edilmez. Yeni bir makinede modeli kurmak için iki yol vardır:
+
+1. **Hazır ağırlığı indirme (`utils/download_models.py`)**:
+   ```powershell
+   python utils/download_models.py --url <MODEL_INDIRME_URL>
+   ```
+   `config/config.py` içindeki `MODEL_DOWNLOAD_URL` alanını doldurduysanız
+   `python utils/download_models.py` komutu doğrudan çalışır ve
+   `SECURITY_MODEL_SHA256` (`FOOTBALL_MODEL_SHA256` ortam değişkeni) tanımlıysa
+   indirme sonrası SHA-256 bütünlük kontrolü yapar.
+
+2. **Kendi GPU ortamınızda yeniden eğitme (`utils/train_custom_yolo.py`)**:
+   Model Roboflow üzerindeki `football-players-detection` veri setiyle `yolo11s.pt`
+   tabanından eğitilmiştir; yeniden eğitim komutları aşağıda yer almaktadır.
+
+Model dosyası veya CUDA GPU bulunmayan makinelerde `pytest` çalıştırıldığında,
+`requires_model` ve `gpu` işaretli testler hata vermeden gerekçesiyle atlanır (`skipped`).
+
 ## Çalıştırma öncesi: Homografi kalibrasyonu (Adım 5 için gerekli)
 Saha (metre) koordinatları üretebilmek için, videonun uygun bir karesinde en az
 4 bilinen saha noktasını (köşe, orta yuvarlak, ceza sahası köşesi vb.)
