@@ -31,6 +31,7 @@ import sqlite3
 import sys
 import time
 from collections import Counter
+from collections.abc import Sequence
 from typing import Any, Dict, List, Optional, Tuple
 
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
@@ -67,6 +68,13 @@ from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import config
+from modules.pitch_orientation import (
+    compute_ball_kinematic_filter,
+    has_discontinuity_between,
+    lookup_attack_directions,
+    resolve_goalkeeper_teams,
+    smooth_possession_codes,
+)
 
 
 # ----------------------------------------------------------------------
@@ -375,6 +383,118 @@ def _encode_sorted_track_ids(series: pd.Series) -> Tuple[np.ndarray, List[str]]:
     return out, sorted_strs
 
 
+class _VectorizedSpikeAnomalies(Sequence):
+    """10k+ hız sıçraması anomalilerini milyonlarca dict üretmeden tembel sunan dizi."""
+
+    __slots__ = (
+        "frame_idx",
+        "timestamp_sec",
+        "tid_codes",
+        "tid_strs",
+        "team_codes",
+        "team_strs",
+        "metric_values",
+        "threshold",
+        "unit",
+    )
+
+    def __init__(
+        self,
+        frame_idx: np.ndarray,
+        timestamp_sec: np.ndarray,
+        tid_codes: np.ndarray,
+        tid_strs: List[str],
+        team_codes: np.ndarray,
+        team_strs: List[str],
+        metric_values: np.ndarray,
+        threshold: float,
+        unit: str,
+    ) -> None:
+        self.frame_idx = frame_idx
+        self.timestamp_sec = timestamp_sec
+        self.tid_codes = tid_codes
+        self.tid_strs = tid_strs
+        self.team_codes = team_codes
+        self.team_strs = team_strs
+        self.metric_values = metric_values
+        self.threshold = float(threshold)
+        self.unit = str(unit)
+
+    def __len__(self) -> int:
+        return int(len(self.frame_idx))
+
+    def _item_at(self, idx: int) -> Dict[str, Any]:
+        tid_s = self.tid_strs[int(self.tid_codes[idx])]
+        tmc = int(self.team_codes[idx])
+        team_s = self.team_strs[tmc] if 0 <= tmc < len(self.team_strs) else "Unknown"
+        ts_v = round(float(self.timestamp_sec[idx]), 2)
+        r_spd = float(self.metric_values[idx])
+        return {
+            "anomaly_type": "speed_spike",
+            "severity": "high",
+            "frame_idx": int(self.frame_idx[idx]),
+            "timestamp_sec": ts_v,
+            "track_id": tid_s,
+            "team": team_s,
+            "metric_value": round(r_spd, 2),
+            "threshold": self.threshold,
+            "description_tr": (
+                f"Oyuncu {tid_s} için fiziksel sınır üstü hız sıçraması "
+                f"({r_spd:.1f} {self.unit} > {self.threshold:.1f} {self.unit}); ortalama hesaptan dışlandı."
+            ),
+        }
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            start, stop, step = index.indices(len(self.frame_idx))
+            return [self._item_at(i) for i in range(start, stop, step)]
+        n = len(self.frame_idx)
+        if index < 0:
+            index += n
+        if index < 0 or index >= n:
+            raise IndexError("index out of range")
+        return self._item_at(int(index))
+
+    def __iter__(self):
+        for i in range(len(self.frame_idx)):
+            yield self._item_at(i)
+
+    def to_dataframe(self, columns: List[str]) -> pd.DataFrame:
+        n = len(self.frame_idx)
+        if n == 0:
+            return pd.DataFrame(columns=columns)
+        tid_lut = np.asarray(self.tid_strs, dtype=object)
+        tid_arr = tid_lut[self.tid_codes]
+        if self.team_strs:
+            tm_lut = np.asarray(self.team_strs, dtype=object)
+            tm_arr = np.where(
+                self.team_codes >= 0,
+                tm_lut[np.maximum(0, self.team_codes)],
+                "Unknown",
+            )
+        else:
+            tm_arr = np.full(n, "Unknown", dtype=object)
+        unit = self.unit
+        thresh = self.threshold
+        mvals = self.metric_values
+        desc_list = [
+            f"Oyuncu {t} için fiziksel sınır üstü hız sıçraması ({v:.1f} {unit} > {thresh:.1f} {unit}); ortalama hesaptan dışlandı."
+            for t, v in zip(tid_arr.tolist(), mvals.tolist())
+        ]
+        df = pd.DataFrame({
+            "anomaly_type": np.full(n, "speed_spike", dtype=object),
+            "severity": np.full(n, "high", dtype=object),
+            "frame_idx": self.frame_idx,
+            "timestamp_sec": np.round(self.timestamp_sec, 2),
+            "track_id": tid_arr,
+            "team": tm_arr,
+            "metric_value": np.round(mvals, 2),
+            "threshold": np.full(n, thresh, dtype=np.float64),
+            "description_tr": desc_list,
+        })
+        return df[columns]
+
+
 # ----------------------------------------------------------------------
 # ANA ML ANALİZ SINIFI
 # ----------------------------------------------------------------------
@@ -424,15 +544,37 @@ class MLAnalyzer:
         self.bounds = self._compute_coordinate_bounds()
 
         # İnceleme / test erişimi için eğitilmiş modeller, hız önbelleği ve son sonuçlar
-        self._speed_cache: Dict[bool, Tuple[Tuple[Any, ...], pd.DataFrame, List[Dict[str, Any]]]] = {}
+        self._speed_cache: Dict[bool, Tuple[Tuple[Any, ...], pd.DataFrame, Sequence[Dict[str, Any]]]] = {}
+        self._orientation_cache: Optional[Tuple[int, bool, np.ndarray, List[str], List[Dict[str, Any]]]] = None
         self.xp_models_: Dict[str, Pipeline] = {}
         self.best_xp_model_name_: Optional[str] = None
         self.best_xp_pipeline_: Optional[Pipeline] = None
         self.last_results_: Optional[Dict[str, Any]] = None
 
     def clear_cache(self) -> None:
-        """Önbelleğe alınmış adım hızı tablolarını temizler."""
+        """Önbelleğe alınmış adım hızı ve yönelim tablolarını temizler."""
         self._speed_cache.clear()
+        self._orientation_cache = None
+
+    def _get_resolved_teams_and_halves(self) -> Tuple[np.ndarray, List[str], List[Dict[str, Any]]]:
+        """Girdi DataFrame'ini değiştirmeden kaleci eşlemesini ve devre/hücum yönlerini önbellekli döndürür."""
+        n_rows = len(self.df)
+        if (
+            self._orientation_cache is not None
+            and self._orientation_cache[0] == n_rows
+            and self._orientation_cache[1] == self.is_calibrated
+        ):
+            _, _, r_codes, r_list, halves = self._orientation_cache
+            return r_codes, r_list, halves
+
+        r_codes, r_list, halves = resolve_goalkeeper_teams(
+            df=self.df,
+            fps=self.fps,
+            bounds=self.bounds,
+            is_calibrated=self.is_calibrated,
+        )
+        self._orientation_cache = (n_rows, self.is_calibrated, r_codes, r_list, halves)
+        return r_codes, r_list, halves
 
     # ----------------------------------------------------------------
     @classmethod
@@ -872,7 +1014,7 @@ class MLAnalyzer:
         }
 
     # ----------------------------------------------------------------
-    def _compute_player_step_speeds(self, exclude_referees: bool = True) -> Tuple[pd.DataFrame, List[Dict[str, Any]]]:
+    def _compute_player_step_speeds(self, exclude_referees: bool = True) -> Tuple[pd.DataFrame, Sequence[Dict[str, Any]]]:
         """
         Gözlemlenen ardışık kareler arasında oyuncu adım hızlarını hesaplar.
         Gerçek dışı hız sıçramalarını (ışınlanma / kamera kesmesi) hız ortalamalarından
@@ -889,7 +1031,13 @@ class MLAnalyzer:
         )
         cached = self._speed_cache.get(cache_key)
         if cached is not None and cached[0] == cache_sig:
-            return cached[1].copy(deep=True), [dict(a) for a in cached[2]]
+            cached_spikes = cached[2]
+            spikes_ret = (
+                cached_spikes
+                if isinstance(cached_spikes, _VectorizedSpikeAnomalies)
+                else [dict(a) for a in cached_spikes]
+            )
+            return cached[1].copy(deep=True), spikes_ret
 
         x_col, y_col = self._get_xy_columns()
         empty_cols = [
@@ -963,6 +1111,27 @@ class MLAnalyzer:
             team_codes = np.full(len(idx), -1, dtype=np.int32)
             team_strs = []
 
+        # R1: Yalnızca kaleci satırlarının ("Goalkeeper"/goalkeeper) takımını çözümle;
+        # saha oyuncularının eksik (None) etiketlerine dokunma (nedensellik korunur).
+        res_codes_all, res_team_list, _ = self._get_resolved_teams_and_halves()
+        gk_str_c = team_strs.index("Goalkeeper") if "Goalkeeper" in team_strs else -2
+        is_gk_idx = (cls_s.iloc[idx] == "goalkeeper").fillna(False).to_numpy(dtype=bool)
+        if gk_str_c >= 0:
+            is_gk_idx |= (team_codes == gk_str_c)
+        if is_gk_idx.any():
+            team_strs = list(team_strs)
+            str_to_c = {s: i for i, s in enumerate(team_strs)}
+            for s in res_team_list:
+                if s not in str_to_c:
+                    str_to_c[s] = len(team_strs)
+                    team_strs.append(s)
+            res_remap = np.array([str_to_c[s] for s in res_team_list], dtype=np.int32)
+            res_slice = res_codes_all[idx]
+            gk_valid = is_gk_idx & (res_slice >= 0)
+            if gk_valid.any():
+                team_codes = team_codes.copy()
+                team_codes[gk_valid] = res_remap[res_slice[gk_valid]]
+
         # Kararlı (track_id, frame_idx) sıralaması ve yinelenen karelerin ilkini tutma
         order = np.lexsort((fids, tid_codes))
         tid_codes = tid_codes[order]
@@ -1024,8 +1193,26 @@ class MLAnalyzer:
         dt_full = np.r_[0.0, dt_step]
 
         is_spike = step_ok_full & (raw_spd_full > max_speed_cap)
-        spike_anomalies: List[Dict[str, Any]] = []
-        if is_spike.any():
+        n_spikes = int(is_spike.sum())
+        spike_anomalies: Any = []
+        if n_spikes > 10_000:
+            unit = "km/sa" if self.is_calibrated else "px/sn"
+            sp_idx = np.flatnonzero(is_spike)
+            sp_fids = fids[sp_idx]
+            sp_ts_raw = ts_arr[sp_idx]
+            sp_ts = np.where(np.isfinite(sp_ts_raw), sp_ts_raw, sp_fids.astype(np.float64) / self.fps)
+            spike_anomalies = _VectorizedSpikeAnomalies(
+                frame_idx=sp_fids.astype(np.int64, copy=False),
+                timestamp_sec=sp_ts.astype(np.float64, copy=False),
+                tid_codes=tid_codes[sp_idx].astype(np.int32, copy=False),
+                tid_strs=tid_strs,
+                team_codes=resolved_team_codes[sp_idx].astype(np.int32, copy=False),
+                team_strs=team_strs,
+                metric_values=raw_spd_full[sp_idx].astype(np.float64, copy=False),
+                threshold=max_speed_cap,
+                unit=unit,
+            )
+        elif n_spikes > 0:
             unit = "km/sa" if self.is_calibrated else "px/sn"
             for si in np.flatnonzero(is_spike):
                 s_idx = int(si)
@@ -1053,7 +1240,12 @@ class MLAnalyzer:
         if not is_keep.any():
             empty_df = pd.DataFrame(columns=empty_cols)
             self._speed_cache[cache_key] = (cache_sig, empty_df, spike_anomalies)
-            return empty_df.copy(deep=True), [dict(a) for a in spike_anomalies]
+            spikes_ret = (
+                spike_anomalies
+                if isinstance(spike_anomalies, _VectorizedSpikeAnomalies)
+                else [dict(a) for a in spike_anomalies]
+            )
+            return empty_df.copy(deep=True), spikes_ret
 
         # Kesinlikle nedensel geriye dönük yumuşatma (segment ve sıçrama sınırlarında sıfırlanır)
         last_reset = np.maximum.accumulate(np.where(~is_keep, idx_all, -1))
@@ -1105,7 +1297,12 @@ class MLAnalyzer:
         })
 
         self._speed_cache[cache_key] = (cache_sig, speed_df, spike_anomalies)
-        return speed_df.copy(deep=True), [dict(a) for a in spike_anomalies]
+        spikes_ret = (
+            spike_anomalies
+            if isinstance(spike_anomalies, _VectorizedSpikeAnomalies)
+            else [dict(a) for a in spike_anomalies]
+        )
+        return speed_df.copy(deep=True), spikes_ret
 
     # ----------------------------------------------------------------
     def extract_proxy_pass_events(self) -> pd.DataFrame:
@@ -1122,7 +1319,8 @@ class MLAnalyzer:
             "ball_player_dist", "nearest_opponent_dist", "receiver_pressure_dist",
             "opponents_nearby", "pass_length", "forward_progress_dx",
             "pass_angle_cos", "pass_angle_sin", "passer_speed",
-            "pitch_zone_start", "pitch_zone_end",
+            "start_zone_x", "start_zone_y", "end_zone_x", "end_zone_y",
+            "pitch_zone_start", "pitch_zone_end", "attack_dir",
             "is_team_missing", "is_opponent_dist_missing",
             "is_ball_predicted", "is_passer_predicted", "pass_outcome",
         ]
@@ -1174,13 +1372,31 @@ class MLAnalyzer:
         ball_ys = b_ys[b_first]
         ball_ts = b_ts[b_first]
         ball_is_pred = b_pred[b_first]
+        n_ball = len(ball_fids)
+
+        kin = compute_ball_kinematic_filter(
+            ball_fids=ball_fids,
+            ball_xs=ball_xs,
+            ball_ys=ball_ys,
+            ball_is_pred=ball_is_pred,
+            fps=self.fps,
+            is_calibrated=self.is_calibrated,
+            bounds=self.bounds,
+        )
+
+        res_codes_all, res_team_list, halves = self._get_resolved_teams_and_halves()
+        ref_res_code = res_team_list.index("Referee") if "Referee" in res_team_list else -2
 
         valid_bbox = self._get_valid_bbox_mask(self.df).to_numpy(dtype=bool)
         human_names = _get_human_class_names()
         team_not_ref = (
-            ~((self.df["team"] == "Referee").fillna(False).to_numpy(dtype=bool))
-            if "team" in self.df.columns
-            else True
+            (res_codes_all != ref_res_code)
+            if ref_res_code >= 0
+            else (
+                ~((self.df["team"] == "Referee").fillna(False).to_numpy(dtype=bool))
+                if "team" in self.df.columns
+                else np.ones(len(self.df), dtype=bool)
+            )
         )
         p_mask = (
             cls_s.isin(human_names).fillna(False).to_numpy(dtype=bool)
@@ -1210,6 +1426,26 @@ class MLAnalyzer:
             if "team" in self.df.columns
             else (np.full(len(p_idx), -1, dtype=np.int32), [])
         )
+        p_is_gk = (cls_s.iloc[p_idx] == "goalkeeper").fillna(False).to_numpy(dtype=bool)
+        gk_raw_c = team_list.index("Goalkeeper") if "Goalkeeper" in team_list else -2
+        if gk_raw_c >= 0:
+            p_is_gk |= (p_team_codes == gk_raw_c)
+
+        # Çözümlenmiş kaleci takımlarını raw listeyle birleştir (yalnızca GK satırlarında)
+        p_res_slice = res_codes_all[p_idx]
+        if p_is_gk.any():
+            team_list = list(team_list)
+            t_str_to_c = {s: i for i, s in enumerate(team_list)}
+            for s in res_team_list:
+                if s not in t_str_to_c:
+                    t_str_to_c[s] = len(team_list)
+                    team_list.append(s)
+            res_remap = np.array([t_str_to_c[s] for s in res_team_list], dtype=np.int32)
+            gk_valid = p_is_gk & (p_res_slice >= 0)
+            if gk_valid.any():
+                p_team_codes = p_team_codes.copy()
+                p_team_codes[gk_valid] = res_remap[p_res_slice[gk_valid]]
+
         p_is_pred = (
             _bool_mask(self.df["is_predicted"].iloc[p_idx], na_value=False).astype(np.uint8)
             if "is_predicted" in self.df.columns
@@ -1301,7 +1537,13 @@ class MLAnalyzer:
         ends = np.searchsorted(p_fids, ball_fids, side="right")
         active = np.flatnonzero(ends > starts)
 
-        frame_snapshots: List[Dict[str, Any]] = []
+        raw_tid_codes = np.full(n_ball, -1, dtype=np.int32)
+        raw_team_codes = np.full(n_ball, -1, dtype=np.int32)
+        raw_win_idx = np.full(n_ball, -1, dtype=np.int64)
+        raw_min_d = np.full(n_ball, np.nan, dtype=np.float64)
+        raw_opp_d = np.full(n_ball, np.nan, dtype=np.float64)
+        raw_opp_n = np.zeros(n_ball, dtype=np.int32)
+
         if len(active) > 0:
             act_s = starts[active]
             act_e = ends[active]
@@ -1313,9 +1555,6 @@ class MLAnalyzer:
                 k_players = first_len
                 b_xs_act = ball_xs[active]
                 b_ys_act = ball_ys[active]
-                b_fids_act = ball_fids[active]
-                b_ts_act = ball_ts[active]
-                b_pred_act = ball_is_pred[active]
 
                 base_idx = act_s[:, None] + np.arange(k_players, dtype=np.int64)[None, :]
                 px_mat = p_xs[base_idx]
@@ -1334,19 +1573,9 @@ class MLAnalyzer:
                 if len(v_rows) > 0:
                     v_bi = active[v_rows]
                     v_s = act_s[v_rows]
-                    v_min_loc = min_locs[v_rows]
                     v_win_idx = win_global_idx[v_rows]
                     v_tids = chosen_tids[v_rows]
                     v_teams = p_resolved_team_codes[v_win_idx]
-                    v_fids = b_fids_act[v_rows]
-                    v_ts_raw = b_ts_act[v_rows]
-                    v_ts = np.where(np.isfinite(v_ts_raw), v_ts_raw, v_fids / self.fps)
-                    v_bx = b_xs_act[v_rows]
-                    v_by = b_ys_act[v_rows]
-                    v_min_d = min_dists[v_rows]
-                    v_raw_miss = p_raw_missing[v_win_idx]
-                    v_b_pred = b_pred_act[v_rows]
-                    v_p_pred = p_is_pred[v_win_idx]
 
                     v_base = v_s[:, None] + np.arange(k_players, dtype=np.int64)[None, :]
                     v_px_mat = p_xs[v_base]
@@ -1364,60 +1593,13 @@ class MLAnalyzer:
                     opp_d_masked = np.where(opp_mask_mat, opp_d_mat, np.inf)
                     min_opp_d = opp_d_masked.min(axis=1)
                     has_opp = np.isfinite(min_opp_d)
-                    v_nearest_opp = np.where(has_opp, min_opp_d, np.nan)
-                    v_opp_nearby = (opp_d_masked <= pressure_radius).sum(axis=1)
 
-                    # Vektörel hız araması
-                    v_spds = np.zeros(len(v_rows), dtype=np.float64)
-                    if len(sp_keys_s) > 0:
-                        in_r = (v_fids >= 0) & (v_fids < (1 << 31))
-                        if in_r.any():
-                            q_keys = (v_fids[in_r].astype(np.int64) << 32) | v_tids[in_r].astype(np.int64)
-                            q_pos = np.searchsorted(sp_keys_s, q_keys)
-                            q_pos_safe = np.minimum(q_pos, len(sp_keys_s) - 1)
-                            q_hit = (q_pos < len(sp_keys_s)) & (sp_keys_s[q_pos_safe] == q_keys)
-                            tmp_spd = np.zeros(len(q_keys), dtype=np.float64)
-                            tmp_spd[q_hit] = sp_vals_s[q_pos_safe[q_hit]]
-                            v_spds[in_r] = tmp_spd
-
-                    # Yalnızca ardışık kontrol değişimlerinin başı ve sonunu (spells) tut!
-                    n_v = len(v_rows)
-                    is_spell_start = np.empty(n_v, dtype=bool)
-                    is_spell_start[0] = True
-                    if n_v > 1:
-                        is_spell_start[1:] = v_tids[1:] != v_tids[:-1]
-                    is_spell_end = np.empty(n_v, dtype=bool)
-                    is_spell_end[-1] = True
-                    if n_v > 1:
-                        is_spell_end[:-1] = v_tids[:-1] != v_tids[1:]
-                    keep_v = np.flatnonzero(is_spell_start | is_spell_end)
-
-                    for ki in keep_v:
-                        ii = int(ki)
-                        tc_val = int(v_tids[ii])
-                        tm_val = int(v_teams[ii])
-                        fid_val = int(v_fids[ii])
-                        spd_val = float(v_spds[ii])
-                        if spd_val == 0.0 and sp_fallback:
-                            spd_val = sp_fallback.get((fid_val, tc_val), 0.0)
-                        frame_snapshots.append({
-                            "b_idx": int(v_bi[ii]),
-                            "frame_idx": fid_val,
-                            "timestamp_sec": float(v_ts[ii]),
-                            "ball_x": float(v_bx[ii]),
-                            "ball_y": float(v_by[ii]),
-                            "tid_code": tc_val,
-                            "track_id": tid_list[tc_val],
-                            "team_code": tm_val,
-                            "team": team_list[tm_val] if tm_val >= 0 else None,
-                            "ball_player_dist": float(v_min_d[ii]),
-                            "nearest_opponent_dist": float(v_nearest_opp[ii]) if has_opp[ii] else np.nan,
-                            "opponents_nearby": int(v_opp_nearby[ii]),
-                            "passer_speed": spd_val,
-                            "is_team_missing": int(v_raw_miss[ii]),
-                            "is_ball_predicted": int(v_b_pred[ii]),
-                            "is_passer_predicted": int(v_p_pred[ii]),
-                        })
+                    raw_tid_codes[v_bi] = v_tids
+                    raw_team_codes[v_bi] = v_teams
+                    raw_win_idx[v_bi] = v_win_idx
+                    raw_min_d[v_bi] = min_dists[v_rows]
+                    raw_opp_d[v_bi] = np.where(has_opp, min_opp_d, np.nan)
+                    raw_opp_n[v_bi] = (opp_d_masked <= pressure_radius).sum(axis=1)
             else:
                 for b_i in active:
                     bi = int(b_i)
@@ -1441,9 +1623,6 @@ class MLAnalyzer:
                         continue
 
                     chosen_team_c = int(p_resolved_team_codes[s + min_local])
-                    fid = int(ball_fids[bi])
-                    ts = float(ball_ts[bi]) if np.isfinite(ball_ts[bi]) else fid / self.fps
-
                     if chosen_team_c >= 0:
                         teams_slice = p_resolved_team_codes[s:e]
                         opp_mask = (teams_slice >= 0) & (teams_slice != chosen_team_c)
@@ -1461,38 +1640,152 @@ class MLAnalyzer:
                         nearest_opp = np.nan
                         opp_nearby = 0
 
-                    frame_snapshots.append({
-                        "b_idx": bi,
-                        "frame_idx": fid,
-                        "timestamp_sec": ts,
-                        "ball_x": bx,
-                        "ball_y": by,
-                        "tid_code": chosen_tid_c,
-                        "track_id": tid_list[chosen_tid_c],
-                        "team_code": chosen_team_c,
-                        "team": team_list[chosen_team_c] if chosen_team_c >= 0 else None,
-                        "ball_player_dist": min_d,
-                        "nearest_opponent_dist": nearest_opp,
-                        "opponents_nearby": opp_nearby,
-                        "passer_speed": _lookup_speed(fid, chosen_tid_c),
-                        "is_team_missing": int(p_raw_missing[s + min_local]),
-                        "is_ball_predicted": int(ball_is_pred[bi]),
-                        "is_passer_predicted": int(p_is_pred[s + min_local]),
-                    })
+                    raw_tid_codes[bi] = chosen_tid_c
+                    raw_team_codes[bi] = chosen_team_c
+                    raw_win_idx[bi] = s + min_local
+                    raw_min_d[bi] = min_d
+                    raw_opp_d[bi] = nearest_opp
+                    raw_opp_n[bi] = opp_nearby
 
-        if len(frame_snapshots) < 2:
+        # R3: Hava topu / tek karelik imkânsız sıçrama karelerinde kontrolü reddet
+        valid_ctrl_mask = kin["valid_ctrl_mask"]
+        if len(valid_ctrl_mask) == n_ball:
+            raw_tid_codes[~valid_ctrl_mask] = -1
+            raw_team_codes[~valid_ctrl_mask] = -1
+
+        # MatchAnalyzer ile birebir uyumlu çoğunluk oyu yumuşatma + min kontrol süresi
+        tid_to_team_code = np.full(len(tid_list), -1, dtype=np.int32)
+        win = max(1, int(config.POSSESSION_SMOOTHING_FRAMES))
+        sm_tids, sm_teams = smooth_possession_codes(
+            raw_tid_codes=raw_tid_codes,
+            raw_team_codes=raw_team_codes,
+            tid_to_team_code=tid_to_team_code,
+            win=win,
+            min_control_frames=int(kin["min_control_frames"]),
+            preserve_frame_team=True,
+        )
+
+        valid_sm = np.flatnonzero(sm_tids >= 0)
+        if len(valid_sm) < 2:
             return pd.DataFrame(columns=event_cols)
 
-        # Ardışık kontrol periyotları (spells) oluştur
-        spells: List[Dict[str, Any]] = []
-        for snap in frame_snapshots:
-            if spells and spells[-1]["tid_code"] == snap["tid_code"]:
-                spells[-1]["end"] = snap
+        sm_t_vals = sm_tids[valid_sm]
+        change_idx = np.flatnonzero(sm_t_vals[1:] != sm_t_vals[:-1]) + 1
+        sp_starts_idx = np.r_[0, change_idx]
+        sp_ends_idx = np.r_[change_idx - 1, len(valid_sm) - 1]
+
+        def _build_snap(bi: int, tid_c: int, team_c: int, fallback_bi: int) -> Dict[str, Any]:
+            fid = int(ball_fids[bi])
+            ts = float(ball_ts[bi]) if np.isfinite(ball_ts[bi]) else fid / self.fps
+            bx = float(ball_xs[bi])
+            by = float(ball_ys[bi])
+
+            if raw_tid_codes[bi] == tid_c and raw_win_idx[bi] >= 0:
+                w_idx = int(raw_win_idx[bi])
+                b_p_dist = float(raw_min_d[bi])
+                opp_d = float(raw_opp_d[bi]) if np.isfinite(raw_opp_d[bi]) else np.nan
+                opp_n = int(raw_opp_n[bi])
+                raw_miss = int(p_raw_missing[w_idx])
+                p_pred = int(p_is_pred[w_idx])
             else:
-                spells.append({"tid_code": snap["tid_code"], "start": snap, "end": snap})
+                # Yumuşatma köprüsü karesi: oyuncuyu bu karede (yoksa en yakın gözlenen karede) bul
+                s_sl = int(starts[bi])
+                e_sl = int(ends[bi])
+                matched_loc = -1
+                if e_sl > s_sl:
+                    locs = np.flatnonzero(p_tid_codes[s_sl:e_sl] == tid_c)
+                    if len(locs) > 0:
+                        matched_loc = s_sl + int(locs[0])
+                if matched_loc >= 0:
+                    px_v = float(p_xs[matched_loc])
+                    py_v = float(p_ys[matched_loc])
+                    b_p_dist = math.hypot(px_v - bx, py_v - by)
+                    opp_d = np.nan
+                    opp_n = 0
+                    if team_c >= 0:
+                        tms = p_resolved_team_codes[s_sl:e_sl]
+                        om = (tms >= 0) & (tms != team_c)
+                        if om.any():
+                            od = np.hypot(p_xs[s_sl:e_sl][om] - px_v, p_ys[s_sl:e_sl][om] - py_v)
+                            opp_d = float(od.min())
+                            opp_n = int((od <= pressure_radius).sum())
+                    raw_miss = int(p_raw_missing[matched_loc])
+                    p_pred = int(p_is_pred[matched_loc])
+                else:
+                    fb_w = int(raw_win_idx[fallback_bi]) if fallback_bi >= 0 and raw_win_idx[fallback_bi] >= 0 else -1
+                    b_p_dist = float(raw_min_d[fallback_bi]) if fallback_bi >= 0 and np.isfinite(raw_min_d[fallback_bi]) else 0.0
+                    opp_d = float(raw_opp_d[fallback_bi]) if fallback_bi >= 0 and np.isfinite(raw_opp_d[fallback_bi]) else np.nan
+                    opp_n = int(raw_opp_n[fallback_bi]) if fallback_bi >= 0 else 0
+                    raw_miss = 1 if team_c < 0 else (int(p_raw_missing[fb_w]) if fb_w >= 0 else 0)
+                    p_pred = int(p_is_pred[fb_w]) if fb_w >= 0 else 0
+
+            return {
+                "b_idx": bi,
+                "frame_idx": fid,
+                "timestamp_sec": ts,
+                "ball_x": bx,
+                "ball_y": by,
+                "tid_code": tid_c,
+                "track_id": tid_list[tid_c],
+                "team_code": team_c,
+                "team": team_list[team_c] if team_c >= 0 else None,
+                "ball_player_dist": b_p_dist,
+                "nearest_opponent_dist": opp_d,
+                "opponents_nearby": opp_n,
+                "passer_speed": _lookup_speed(fid, tid_c),
+                "is_team_missing": raw_miss,
+                "is_ball_predicted": int(ball_is_pred[bi]),
+                "is_passer_predicted": p_pred,
+            }
+
+        spells: List[Dict[str, Any]] = []
+        min_cf = int(kin["min_control_frames"])
+        for s_pos, e_pos in zip(sp_starts_idx, sp_ends_idx):
+            s_i = int(s_pos)
+            e_i = int(e_pos)
+            if (e_i - s_i + 1) < min_cf:
+                continue
+            bi_s = int(valid_sm[s_i])
+            bi_e = int(valid_sm[e_i])
+            tid_c = int(sm_tids[bi_s])
+            # En yakın gerçek tespit yedek indeksini bul (köprü durumları için)
+            sub_bis = valid_sm[s_i:e_i + 1]
+            obs_mask = raw_tid_codes[sub_bis] == tid_c
+            fb_s = int(sub_bis[obs_mask][0]) if obs_mask.any() else -1
+            fb_e = int(sub_bis[obs_mask][-1]) if obs_mask.any() else -1
+
+            spells.append({
+                "tid_code": tid_c,
+                "start": _build_snap(bi_s, tid_c, int(sm_teams[bi_s]), fb_s),
+                "end": _build_snap(bi_e, tid_c, int(sm_teams[bi_e]), fb_e),
+            })
+
+        if len(spells) < 2:
+            return pd.DataFrame(columns=event_cols)
 
         cols_n = int(config.ML_XT_GRID_COLS)
         rows_n = int(config.ML_XT_GRID_ROWS)
+        min_pass_dur = float(kin["min_pass_duration_sec"])
+        max_pass_spd = float(kin["max_pass_speed"])
+        disc_starts = kin["discontinuity_starts"]
+        disc_ends = kin["discontinuity_ends"]
+        single_half = len(halves) == 1
+        if single_half:
+            ad0 = halves[0].get("attack_directions") or {}
+            da0 = int(ad0.get("Team A", 1))
+            db0 = int(ad0.get("Team B", -1))
+            half_ranges: List[Tuple[int, int, int, int]] = []
+        else:
+            da0, db0 = 1, -1
+            half_ranges = [
+                (
+                    int(h["start_frame"]),
+                    int(h["end_frame"]),
+                    int((h.get("attack_directions") or {}).get("Team A", 1)),
+                    int((h.get("attack_directions") or {}).get("Team B", -1)),
+                )
+                for h in halves
+            ]
         events: List[Dict[str, Any]] = []
 
         for i in range(len(spells) - 1):
@@ -1508,6 +1801,12 @@ class MLAnalyzer:
 
             if gap_sec > config.PASS_MAX_GAP_SEC or pass_len < min_move:
                 continue
+            if gap_sec + 1e-6 < min_pass_dur:
+                continue
+            if (pass_len / max(gap_sec, 1.0 / self.fps)) > max_pass_spd:
+                continue
+            if has_discontinuity_between(s1_end["frame_idx"], s2_start["frame_idx"], disc_starts, disc_ends):
+                continue
 
             sx_n, sy_n = self._normalize_xy(s1_end["ball_x"], s1_end["ball_y"])
             ex_n, ey_n = self._normalize_xy(s2_start["ball_x"], s2_start["ball_y"])
@@ -1515,12 +1814,37 @@ class MLAnalyzer:
 
             from_team = s1_end["team"] or "Unknown"
             to_team = s2_start["team"] or "Unknown"
-            if from_team != "Unknown" and to_team != "Unknown":
+            if from_team in ("Team A", "Team B") and to_team in ("Team A", "Team B"):
                 outcome: Any = 1 if from_team == to_team else 0
+            elif from_team != "Unknown" and to_team != "Unknown":
+                outcome = 1 if from_team == to_team else 0
             else:
                 outcome = np.nan
 
-            fwd_dx = (sx_n - ex_n) if from_team == "Team B" else (ex_n - sx_n)
+            # R2: Otomatik tespit edilen devre / takım hücum yönünü kullan
+            if single_half:
+                adir = da0 if from_team == "Team A" else (db0 if from_team == "Team B" else 1)
+            else:
+                fid_ev = int(s1_end["frame_idx"])
+                adir = 1
+                n_h = len(half_ranges)
+                for h_idx, (hs, he, da_h, db_h) in enumerate(half_ranges):
+                    in_h = (
+                        (fid_ev <= he)
+                        if h_idx == 0
+                        else ((fid_ev >= hs) if h_idx == n_h - 1 else (hs <= fid_ev <= he))
+                    )
+                    if in_h:
+                        adir = da_h if from_team == "Team A" else (db_h if from_team == "Team B" else 1)
+                        break
+            fwd_dx = (ex_n - sx_n) * float(adir)
+            if adir < 0:
+                sx_eff, sy_eff = 1.0 - sx_n, 1.0 - sy_n
+                ex_eff, ey_eff = 1.0 - ex_n, 1.0 - ey_n
+            else:
+                sx_eff, sy_eff = sx_n, sy_n
+                ex_eff, ey_eff = ex_n, ey_n
+
             opp_dist = s1_end["nearest_opponent_dist"]
 
             # Alıcı baskı mesafesini gelecek kareden (s2_start) DEĞİL, serbest bırakma karesinden (s1_end) ölç
@@ -1576,12 +1900,13 @@ class MLAnalyzer:
                 "pass_angle_cos": round(float(math.cos(angle)), 4),
                 "pass_angle_sin": round(float(math.sin(angle)), 4),
                 "passer_speed": round(float(s1_end["passer_speed"]), 3),
-                "start_zone_x": min(cols_n - 1, max(0, int(sx_n * cols_n))),
-                "start_zone_y": min(rows_n - 1, max(0, int(sy_n * rows_n))),
-                "end_zone_x": min(cols_n - 1, max(0, int(ex_n * cols_n))),
-                "end_zone_y": min(rows_n - 1, max(0, int(ey_n * rows_n))),
-                "pitch_zone_start": _zone_label_from_norm(sx_n, sy_n),
-                "pitch_zone_end": _zone_label_from_norm(ex_n, ey_n),
+                "start_zone_x": min(cols_n - 1, max(0, int(sx_eff * cols_n))),
+                "start_zone_y": min(rows_n - 1, max(0, int(sy_eff * rows_n))),
+                "end_zone_x": min(cols_n - 1, max(0, int(ex_eff * cols_n))),
+                "end_zone_y": min(rows_n - 1, max(0, int(ey_eff * rows_n))),
+                "pitch_zone_start": _zone_label_from_norm(sx_eff, sy_eff),
+                "pitch_zone_end": _zone_label_from_norm(ex_eff, ey_eff),
+                "attack_dir": adir,
                 "is_team_missing": int(s1_end["is_team_missing"]),
                 "is_opponent_dist_missing": 1 if pd.isna(opp_dist) else 0,
                 "is_ball_predicted": int(s1_end["is_ball_predicted"]),
@@ -1829,25 +2154,40 @@ class MLAnalyzer:
         ex_n = np.clip((out["end_x"].to_numpy(dtype=np.float64) - min_x) / span_x, 0.0, 1.0)
         ey_n = np.clip((out["end_y"].to_numpy(dtype=np.float64) - min_y) / span_y, 0.0, 1.0)
 
-        if "from_team" in out.columns:
+        if "attack_dir" in out.columns:
+            adir_arr = pd.to_numeric(out["attack_dir"], errors="coerce").fillna(1).to_numpy(dtype=np.float64)
+            is_rtl = adir_arr < 0
+        elif "frame_idx" in out.columns and "from_team" in out.columns and not self.df.empty:
+            _, _, halves = self._get_resolved_teams_and_halves()
+            adir_arr = lookup_attack_directions(
+                out["frame_idx"].fillna(0).to_numpy(dtype=np.int64),
+                out["from_team"].fillna("Unknown").astype(str).to_numpy(),
+                halves,
+            )
+            is_rtl = adir_arr < 0
+        elif "from_team" in out.columns:
             team_codes, team_list = _encode_clean_strings(out["from_team"])
             tb_code = team_list.index("Team B") if "Team B" in team_list else -2
-            is_tb = team_codes == tb_code
+            is_rtl = team_codes == tb_code
         else:
-            is_tb = np.zeros(len(out), dtype=bool)
-        fwd_dx = np.where(is_tb, sx_n - ex_n, ex_n - sx_n)
+            is_rtl = np.zeros(len(out), dtype=bool)
+        fwd_dx = np.where(is_rtl, sx_n - ex_n, ex_n - sx_n)
+        sx_eff = np.where(is_rtl, 1.0 - sx_n, sx_n)
+        sy_eff = np.where(is_rtl, 1.0 - sy_n, sy_n)
+        ex_eff = np.where(is_rtl, 1.0 - ex_n, ex_n)
+        ey_eff = np.where(is_rtl, 1.0 - ey_n, ey_n)
 
         out["start_norm_x"] = np.round(sx_n, 4)
         out["start_norm_y"] = np.round(sy_n, 4)
         out["end_norm_x"] = np.round(ex_n, 4)
         out["end_norm_y"] = np.round(ey_n, 4)
         out["forward_progress_dx"] = np.round(fwd_dx, 4)
-        out["start_zone_x"] = np.clip((sx_n * cols_n).astype(int), 0, cols_n - 1)
-        out["start_zone_y"] = np.clip((sy_n * rows_n).astype(int), 0, rows_n - 1)
-        out["end_zone_x"] = np.clip((ex_n * cols_n).astype(int), 0, cols_n - 1)
-        out["end_zone_y"] = np.clip((ey_n * rows_n).astype(int), 0, rows_n - 1)
-        out["pitch_zone_start"] = [_zone_label_from_norm(float(x), float(y)) for x, y in zip(sx_n, sy_n)]
-        out["pitch_zone_end"] = [_zone_label_from_norm(float(x), float(y)) for x, y in zip(ex_n, ey_n)]
+        out["start_zone_x"] = np.clip((sx_eff * cols_n).astype(int), 0, cols_n - 1)
+        out["start_zone_y"] = np.clip((sy_eff * rows_n).astype(int), 0, rows_n - 1)
+        out["end_zone_x"] = np.clip((ex_eff * cols_n).astype(int), 0, cols_n - 1)
+        out["end_zone_y"] = np.clip((ey_eff * rows_n).astype(int), 0, rows_n - 1)
+        out["pitch_zone_start"] = [_zone_label_from_norm(float(x), float(y)) for x, y in zip(sx_eff, sy_eff)]
+        out["pitch_zone_end"] = [_zone_label_from_norm(float(x), float(y)) for x, y in zip(ex_eff, ey_eff)]
         return out
 
     # ----------------------------------------------------------------
@@ -2437,7 +2777,9 @@ class MLAnalyzer:
                 arr[bad] = 0.5
             return np.clip(arr, 0.0, 0.9999)
 
-        def score_df_with_xt(df_in: pd.DataFrame) -> pd.DataFrame:
+        _, _, halves = self._get_resolved_teams_and_halves()
+
+        def score_df_with_xt(df_in: pd.DataFrame, use_halves: bool = True) -> pd.DataFrame:
             if df_in.empty:
                 return df_in.copy()
             df_out = df_in.copy()
@@ -2446,20 +2788,39 @@ class MLAnalyzer:
             ex_n = _safe_norm_arr(df_out, "end_norm_x")
             ey_n = _safe_norm_arr(df_out, "end_norm_y")
 
-            # Team B sağdan sola hücum ediyorsa x eksenini kendi hücum yönüne çevir
-            if "from_team" in df_out.columns:
+            # Hücum yönü sağdan sola (-1) ise koordinatları takım perspektifine çevir
+            if "attack_dir" in df_out.columns:
+                adir_arr = pd.to_numeric(df_out["attack_dir"], errors="coerce").fillna(1).to_numpy(dtype=np.float64)
+                is_rtl = adir_arr < 0
+            elif (
+                use_halves
+                and not self.df.empty
+                and "frame_idx" in df_out.columns
+                and "from_team" in df_out.columns
+                and eval_source not in ("provided_events", "calibrated_synthetic_match")
+            ):
+                adir_arr = lookup_attack_directions(
+                    df_out["frame_idx"].fillna(0).to_numpy(dtype=np.int64),
+                    df_out["from_team"].fillna("Unknown").astype(str).to_numpy(),
+                    halves,
+                )
+                is_rtl = adir_arr < 0
+            elif "from_team" in df_out.columns:
                 ft_codes, ft_list = _encode_clean_strings(df_out["from_team"])
                 tb_c = ft_list.index("Team B") if "Team B" in ft_list else -2
-                is_tb = ft_codes == tb_c
+                is_rtl = ft_codes == tb_c
             else:
-                is_tb = np.zeros(len(df_out), dtype=bool)
-            sx_eff = np.where(is_tb, 1.0 - sx_n, sx_n)
-            ex_eff = np.where(is_tb, 1.0 - ex_n, ex_n)
+                is_rtl = np.zeros(len(df_out), dtype=bool)
+
+            sx_eff = np.where(is_rtl, 1.0 - sx_n, sx_n)
+            sy_eff = np.where(is_rtl, 1.0 - sy_n, sy_n)
+            ex_eff = np.where(is_rtl, 1.0 - ex_n, ex_n)
+            ey_eff = np.where(is_rtl, 1.0 - ey_n, ey_n)
 
             c1 = np.clip((sx_eff * cols).astype(int), 0, cols - 1)
-            r1 = np.clip((sy_n * rows).astype(int), 0, rows - 1)
+            r1 = np.clip((sy_eff * rows).astype(int), 0, rows - 1)
             c2 = np.clip((ex_eff * cols).astype(int), 0, cols - 1)
-            r2 = np.clip((ey_n * rows).astype(int), 0, rows - 1)
+            r2 = np.clip((ey_eff * rows).astype(int), 0, rows - 1)
 
             xt_s = xt_grid[r1, c1]
             xt_e = xt_grid[r2, c2]
@@ -2481,9 +2842,13 @@ class MLAnalyzer:
             df_out["expected_xT"] = np.round(exp_xt, 5)
             return df_out
 
-        scored_eval = score_df_with_xt(eval_df)
+        scored_eval = score_df_with_xt(eval_df, use_halves=True)
+        model_uses_halves = (
+            xp_results is not None
+            and xp_results.get("data_source") == "real_tracking_events"
+        )
         scored_model = (
-            score_df_with_xt(xp_results["_scored_events_df"])
+            score_df_with_xt(xp_results["_scored_events_df"], use_halves=model_uses_halves)
             if xp_results is not None and isinstance(xp_results.get("_scored_events_df"), pd.DataFrame)
             else scored_eval
         )
@@ -2516,9 +2881,25 @@ class MLAnalyzer:
                     "expected_xT": float(row["expected_xT"]),
                 })
 
+        halves_summary = [
+            {
+                "period": int(h["period"]),
+                "start_frame": int(h["start_frame"]),
+                "end_frame": int(h["end_frame"]),
+                "detection_reason": h.get("detection_reason", "initial"),
+                "attack_directions": {
+                    k: ("+x" if int(v) >= 0 else "-x")
+                    for k, v in (h.get("attack_directions") or {}).items()
+                },
+            }
+            for h in halves
+        ]
+
         return {
             "coord_mode": self.coord_mode,
             "eval_source": eval_source,
+            "halves_detected": len(halves_summary),
+            "attack_directions_by_half": halves_summary,
             "grid_shape": [rows, cols],
             "min_xt": round(float(xt_grid.min()), 5),
             "max_xt": round(float(xt_grid.max()), 5),
@@ -2648,13 +3029,39 @@ class MLAnalyzer:
         h_xs = self.df[x_col].iloc[h_idx].to_numpy(dtype=np.float64)
         h_ys = self.df[y_col].iloc[h_idx].to_numpy(dtype=np.float64)
         h_is_ref_cls = (cls_s.iloc[h_idx] == "referee").fillna(False).to_numpy(dtype=bool)
+        res_codes_all, res_team_list, halves = self._get_resolved_teams_and_halves()
         if "team" in self.df.columns:
-            h_team_codes, h_team_strs = _encode_clean_strings(self.df["team"].iloc[h_idx])
-            h_team_not_ref = ~((self.df["team"].iloc[h_idx] == "Referee").fillna(False).to_numpy(dtype=bool))
+            h_team_codes = res_codes_all[h_idx]
+            h_team_strs = list(res_team_list)
+            ref_res_c = h_team_strs.index("Referee") if "Referee" in h_team_strs else -2
+            h_team_not_ref = (h_team_codes != ref_res_c) if ref_res_c >= 0 else np.ones(len(h_idx), dtype=bool)
         else:
             h_team_codes = np.full(len(h_idx), -1, dtype=np.int32)
             h_team_strs = []
             h_team_not_ref = np.ones(len(h_idx), dtype=bool)
+
+        h_fids_arr = (
+            self.df["frame_idx"].iloc[h_idx].to_numpy(dtype=np.int64)
+            if "frame_idx" in self.df.columns
+            else np.zeros(len(h_idx), dtype=np.int64)
+        )
+        h_is_rtl = np.zeros(len(h_idx), dtype=bool)
+        ta_c = h_team_strs.index("Team A") if "Team A" in h_team_strs else -2
+        tb_c = h_team_strs.index("Team B") if "Team B" in h_team_strs else -2
+        for idx_h, h in enumerate(halves):
+            if len(halves) == 1:
+                hm = np.ones(len(h_idx), dtype=bool)
+            elif idx_h == 0:
+                hm = h_fids_arr <= int(h["end_frame"])
+            elif idx_h == len(halves) - 1:
+                hm = h_fids_arr >= int(h["start_frame"])
+            else:
+                hm = (h_fids_arr >= int(h["start_frame"])) & (h_fids_arr <= int(h["end_frame"]))
+            ad = h.get("attack_directions", {})
+            if ta_c >= 0 and int(ad.get("Team A", 1)) < 0:
+                h_is_rtl |= hm & (h_team_codes == ta_c)
+            if tb_c >= 0 and int(ad.get("Team B", -1)) < 0:
+                h_is_rtl |= hm & (h_team_codes == tb_c)
 
         # Top-oyuncu mesafesi ve kontrol oranı (np.searchsorted + np.bincount)
         b_mask = (
@@ -2759,6 +3166,7 @@ class MLAnalyzer:
         hys_s = h_ys[h_ord]
         href_s = h_is_ref_cls[h_ord]
         htm_s = h_team_codes[h_ord]
+        hrtl_s = h_is_rtl[h_ord]
 
         h_brk = np.flatnonzero(hc_s[1:] != hc_s[:-1]) + 1
         min_bx, max_bx, min_by, max_by = self.bounds
@@ -2817,6 +3225,9 @@ class MLAnalyzer:
             ys = hys_s[st_i:en_i]
             nxs = np.clip((xs - min_bx) * inv_span_x, 0.0, 1.0)
             nys = np.clip((ys - min_by) * inv_span_y, 0.0, 1.0)
+            rtl_slice = hrtl_s[st_i:en_i]
+            nxs_eff = np.where(rtl_slice, 1.0 - nxs, nxs)
+            nys_eff = np.where(rtl_slice, 1.0 - nys, nys)
 
             span_nx = float(nxs.max() - nxs.min())
             span_ny = float(nys.max() - nys.min())
@@ -2847,8 +3258,8 @@ class MLAnalyzer:
                 "observed_frames": n_obs,
                 "mean_x": round(float(np.mean(xs)), 2),
                 "mean_y": round(float(np.mean(ys)), 2),
-                "norm_mean_x": round(float(np.mean(nxs)), 4),
-                "norm_mean_y": round(float(np.mean(nys)), 4),
+                "norm_mean_x": round(float(np.mean(nxs_eff)), 4),
+                "norm_mean_y": round(float(np.mean(nys_eff)), 4),
                 "std_x": round(float(np.std(nxs)), 4),
                 "std_y": round(float(np.std(nys)), 4),
                 "pitch_coverage_area": round(cov_area, 5),
@@ -3010,10 +3421,15 @@ class MLAnalyzer:
         ]
 
         speed_df, spike_anomalies = self._compute_player_step_speeds(exclude_referees=True)
-        anomalies_list: List[Dict[str, Any]] = list(spike_anomalies)
+        spike_seq = spike_anomalies if isinstance(spike_anomalies, _VectorizedSpikeAnomalies) else None
+        anomalies_list: List[Dict[str, Any]] = [] if spike_seq is not None else list(spike_anomalies)
 
         if speed_df.empty:
-            early_anom_df = pd.DataFrame(anomalies_list, columns=anom_cols)
+            early_anom_df = (
+                spike_seq.to_dataframe(anom_cols)
+                if spike_seq is not None
+                else pd.DataFrame(anomalies_list, columns=anom_cols)
+            )
             early_counts = (
                 early_anom_df["anomaly_type"].value_counts().to_dict()
                 if not early_anom_df.empty
@@ -3372,6 +3788,24 @@ class MLAnalyzer:
 
                 if "team" in self.df.columns:
                     o_tm_codes, o_tm_strs = _encode_clean_strings(self.df["team"].iloc[obs_idx])
+                    o_is_gk = (cls_s.iloc[obs_idx] == "goalkeeper").fillna(False).to_numpy(dtype=bool)
+                    gk_raw_c = o_tm_strs.index("Goalkeeper") if "Goalkeeper" in o_tm_strs else -2
+                    if gk_raw_c >= 0:
+                        o_is_gk |= (o_tm_codes == gk_raw_c)
+                    if o_is_gk.any():
+                        res_codes_all, res_team_list, _ = self._get_resolved_teams_and_halves()
+                        o_tm_strs = list(o_tm_strs)
+                        o_str_to_c = {s: i for i, s in enumerate(o_tm_strs)}
+                        for s in res_team_list:
+                            if s not in o_str_to_c:
+                                o_str_to_c[s] = len(o_tm_strs)
+                                o_tm_strs.append(s)
+                        res_remap = np.array([o_str_to_c[s] for s in res_team_list], dtype=np.int32)
+                        o_res_slice = res_codes_all[obs_idx]
+                        gk_valid = o_is_gk & (o_res_slice >= 0)
+                        if gk_valid.any():
+                            o_tm_codes = o_tm_codes.copy()
+                            o_tm_codes[gk_valid] = res_remap[o_res_slice[gk_valid]]
                     o_tm_codes = o_tm_codes[o_ord]
                     for ts_val in o_tm_strs:
                         if ts_val not in u_team_to_code:
@@ -3393,7 +3827,7 @@ class MLAnalyzer:
                         u_team_to_code["Unknown"],
                     )
                 else:
-                    o_resolved_team = np.full(len(o_idx := obs_idx), u_team_to_code["Unknown"], dtype=np.int64)
+                    o_resolved_team = np.full(len(obs_idx), u_team_to_code["Unknown"], dtype=np.int64)
 
                 min_bx, max_bx, min_by, max_by = self.bounds
                 obs_nx = np.clip((o_xs - min_bx) / max(1e-6, max_bx - min_bx), 0.0, 1.0)
@@ -3525,10 +3959,19 @@ class MLAnalyzer:
                             ),
                         })
 
-        anomalies_df = pd.DataFrame(anomalies_list, columns=anom_cols)
+        other_anom_df = pd.DataFrame(anomalies_list, columns=anom_cols)
+        if spike_seq is not None:
+            spike_df = spike_seq.to_dataframe(anom_cols)
+            anomalies_df = (
+                pd.concat([spike_df, other_anom_df], ignore_index=True)
+                if not other_anom_df.empty
+                else spike_df
+            )
+        else:
+            anomalies_df = other_anom_df
         if not anomalies_df.empty:
             anomalies_df = anomalies_df.sort_values(
-                ["timestamp_sec", "severity"], ascending=[True, True]
+                ["timestamp_sec", "severity"], ascending=[True, True], kind="mergesort"
             ).reset_index(drop=True)
 
         all_win = windows_df[windows_df["team"] == "ALL"] if not windows_df.empty else windows_df
@@ -3783,18 +4226,34 @@ class MLAnalyzer:
             "low_coverage": "Düşük Kapsama",
         }
         if not anomalies_df.empty:
-            type_map = {t: idx for idx, t in enumerate(sorted(anomalies_df["anomaly_type"].unique()))}
+            atype_s = anomalies_df["anomaly_type"]
+            sev_s = anomalies_df["severity"]
+            ts_all = anomalies_df["timestamp_sec"].to_numpy(dtype=np.float64)
+            unique_types = sorted(atype_s.unique())
+            unique_sevs = sorted(sev_s.unique())
+            type_map = {t: idx for idx, t in enumerate(unique_types)}
             sev_colors = {"high": "#d62728", "medium": "#ff7f0e", "info": "#7f7f7f"}
-            for (atype, sev), agrp in anomalies_df.groupby(["anomaly_type", "severity"], observed=True):
+            for atype in unique_types:
                 y_pos = type_map[atype]
-                ts_vals = agrp["timestamp_sec"].to_numpy(dtype=float)
-                ax2.scatter(
-                    ts_vals,
-                    np.full(len(ts_vals), y_pos, dtype=float),
-                    color=sev_colors.get(str(sev), "#1f77b4"),
-                    s=70,
-                    alpha=0.85,
-                )
+                m_type = (atype_s == atype).to_numpy(dtype=bool)
+                for sev in unique_sevs:
+                    m_pair = m_type & (sev_s == sev).to_numpy(dtype=bool)
+                    if not m_pair.any():
+                        continue
+                    ts_vals = ts_all[m_pair]
+                    if len(ts_vals) > 5000:
+                        ts_vals = ts_vals[np.isfinite(ts_vals)]
+                        if len(ts_vals) > 0:
+                            t_span = float(np.max(ts_vals) - np.min(ts_vals))
+                            step = max(0.05, t_span / 2000.0)
+                            ts_vals = np.unique(np.round(ts_vals / step) * step)
+                    ax2.scatter(
+                        ts_vals,
+                        np.full(len(ts_vals), y_pos, dtype=float),
+                        color=sev_colors.get(str(sev), "#1f77b4"),
+                        s=70,
+                        alpha=0.85,
+                    )
             ax2.set_yticks(list(type_map.values()))
             ax2.set_yticklabels([anomaly_labels_tr.get(k, k) for k in type_map.keys()], fontsize=8.5)
         else:
@@ -3891,6 +4350,17 @@ class MLAnalyzer:
             f"- **Izgara Boyutu & Aralık:** {g_rows}x{g_cols}, `xT` aralığı: `[{float(xt.get('min_xt', 0.0)):.4f}, {float(xt.get('max_xt', 0.0)):.4f}]`",
             f"- **Ortalama `delta_xT` / `expected_xT`:** `{float(xt.get('mean_delta_xT', 0.0)):.4f}` / `{float(xt.get('mean_expected_xT', 0.0)):.4f}`",
         ])
+        halves_list = xt.get("attack_directions_by_half") or []
+        if halves_list:
+            lines.append(f"- **Tespit Edilen Devre Sayısı:** {xt.get('halves_detected', len(halves_list))}")
+            for hinfo in halves_list:
+                ad_map = hinfo.get("attack_directions") or {}
+                ta_dir_tr = "Soldan Sağa (+x)" if ad_map.get("Team A") == "+x" else "Sağdan Sola (-x)"
+                tb_dir_tr = "Soldan Sağa (+x)" if ad_map.get("Team B") == "+x" else "Sağdan Sola (-x)"
+                lines.append(
+                    f"  - **{hinfo.get('period', 1)}. Yarı (Kare {hinfo.get('start_frame', 0)}..{hinfo.get('end_frame', 0)}):** "
+                    f"Team A → {ta_dir_tr} | Team B → {tb_dir_tr}"
+                )
         for tname, tinfo in (xt.get("team_xt_summary") or {}).items():
             lines.append(
                 f"- **{tname}:** {tinfo.get('events', 0)} olay | Toplam `delta_xT`={float(tinfo.get('total_delta_xT', 0.0)):.4f} | Toplam `expected_xT`={float(tinfo.get('total_expected_xT', 0.0)):.4f}"

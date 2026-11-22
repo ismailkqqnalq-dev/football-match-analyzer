@@ -340,18 +340,30 @@ def test_perspective_and_camera_motion():
 def test_match_analytics_synthetic_and_real_csv(tmp_path):
     # 1) Sentetik kalibre veri: paslaşma, top kaybı, takım şekli ve ısı haritası
     rows = []
-    # Kare 0-9: Team A oyuncu 1 topa sahip (x=20->25)
-    # Kare 10-19: Team A oyuncu 2 topa sahip (x=35->40) => completed_pass (1 -> 2)
-    # Kare 20-29: Team B oyuncu 3 topa sahip (x=55->50) => turnover (2 -> 3)
-    for f in range(30):
+    # Kare 0-9: Team A oyuncu 1 topa sahip (x=20->24.5)
+    # Kare 10-19: top havada/yerde süzülerek 1 -> 2'ye gider (~33 m/s)
+    # Kare 20-29: Team A oyuncu 2 topa sahip (x=35->39.5) => completed_pass (1 -> 2)
+    # Kare 30-49: top 2 -> 3'e gider (~30 m/s)
+    # Kare 50-59: Team B oyuncu 3 topa sahip (x=55->50.5) => turnover (2 -> 3)
+    for f in range(60):
         if f < 10:
             bx, by = 20.0 + (f * 0.5), 34.0
             p1x, p2x, p3x = bx + 0.5, 35.0, 55.0
         elif f < 20:
-            bx, by = 35.0 + ((f - 10) * 0.5), 24.0
+            t_frac = (f - 9) / 11.0
+            bx = 24.5 + t_frac * (35.0 - 24.5)
+            by = 34.0 + t_frac * (24.0 - 34.0)
+            p1x, p2x, p3x = 25.0, 35.0, 55.0
+        elif f < 30:
+            bx, by = 35.0 + ((f - 20) * 0.5), 24.0
             p1x, p2x, p3x = 25.0, bx + 0.4, 55.0
+        elif f < 50:
+            t_frac = (f - 29) / 21.0
+            bx = 39.5 + t_frac * (55.0 - 39.5)
+            by = 24.0 + t_frac * (44.0 - 24.0)
+            p1x, p2x, p3x = 25.0, 40.0, 55.0
         else:
-            bx, by = 55.0 - ((f - 20) * 0.5), 44.0
+            bx, by = 55.0 - ((f - 50) * 0.5), 44.0
             p1x, p2x, p3x = 25.0, 40.0, bx - 0.5
 
         ts = round(f / 25.0, 3)

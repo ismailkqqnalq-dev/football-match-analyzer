@@ -54,20 +54,30 @@ def _make_controlled_match_df(use_four_class: bool = True) -> pd.DataFrame:
     ref_cls = "referee" if use_four_class else "person"
     rows = []
 
-    # 14 karelik kontrollü senaryo:
+    # 46 karelik kontrollü senaryo (gerçekçi çok-kareli pas uçuşları ile):
     # - Kare 0-4: Oyuncu 1 (Team A) topa sahip; kare 2'de top yok (köprü testi), kare 0'da duplicate ball (is_predicted=False kazanmalı)
-    # - Kare 5-9: Oyuncu 2 (Team A) topa sahip (pas 1 -> 2, kare 5'te mesafe eşiğinde)
-    # - Kare 10-13: Oyuncu 3 (Team B) topa sahip (top kaybı 2 -> 3)
+    # - Kare 5-16: Top 1 -> 2 arasında süzülüyor
+    # - Kare 17-21: Oyuncu 2 (Team A) topa sahip (pas 1 -> 2)
+    # - Kare 22-41: Top 2 -> 3 arasında süzülüyor
+    # - Kare 42-45: Oyuncu 3 (Team B) topa sahip (top kaybı 2 -> 3)
     # - Kare 6'da Oyuncu 4 on_pitch=False (dışlanmalı)
     # - Hakem (99) topun dibinde dursa bile top kontrolü almamalı
-    for f in range(14):
+    for f in range(46):
         ts = round(f / 25.0, 3)
         if f < 5:
             bx, by = 20.0 + f * 0.4, 34.0
-        elif f < 10:
-            bx, by = 34.0 + (f - 5) * 0.4, 22.0
+        elif f < 17:
+            t_f = 0.22 + (f - 5) / 11.0 * 0.56
+            bx = 21.6 + t_f * (34.0 - 21.6)
+            by = 34.0 + t_f * (22.0 - 34.0)
+        elif f < 22:
+            bx, by = 34.0 + (f - 17) * 0.4, 22.0
+        elif f < 42:
+            t_f = 0.14 + (f - 22) / 19.0 * 0.72
+            bx = 35.6 + t_f * (58.0 - 35.6)
+            by = 22.0 + t_f * (46.0 - 22.0)
         else:
-            bx, by = 58.0 - (f - 10) * 0.4, 46.0
+            bx, by = 58.0 - (f - 42) * 0.4, 46.0
 
         # Kare 2'de top yok -> 1 karelik boşluk majority vote ile köprülenmeli
         if f != 2:
@@ -89,8 +99,8 @@ def _make_controlled_match_df(use_four_class: bool = True) -> pd.DataFrame:
             })
 
         p1x, p1y = (bx + 0.5, 34.0) if f < 5 else (22.0, 34.0)
-        p2x, p2y = (bx + 0.4, 22.0) if 5 <= f < 10 else (36.0, 22.0)
-        p3x, p3y = (bx - 0.5, 46.0) if f >= 10 else (58.0, 46.0)
+        p2x, p2y = (bx + 0.4, 22.0) if 17 <= f < 22 else (36.0, 22.0)
+        p3x, p3y = (bx - 0.5, 46.0) if f >= 42 else (58.0, 46.0)
 
         rows.extend([
             {
@@ -276,16 +286,16 @@ def test_match_analyzer_parity_4class_and_legacy_person(tmp_path, monkeypatch):
         assert df.equals(df_orig), "MatchAnalyzer(copy=False) girdi DataFrame'ini bozmamalı"
 
         # Kare 2 (top yok) majority vote ile Oyuncu 1'e köprülenmiş olmalı; Hakem 99 kontrol almamalı
-        assert len(tl_mem) == 13
+        assert len(tl_mem) == 45
         row_f2_check = tl_mem[tl_mem["frame_idx"] == 1].iloc[0]
         assert row_f2_check["smoothed_track_id"] == "1"
         assert "99" not in {p["track_id"] for p in pos_mem["player_control"]}
         assert pos_mem["mode"] == "pitch_meters"
         assert pass_mem["total_completed_passes"] == 1
         assert pass_mem["total_turnovers"] == 1
-        # Kare 6'da on_pitch=False olan Oyuncu 4 dışlanmış olmalı (13 kare kalır)
+        # Kare 6'da on_pitch=False olan Oyuncu 4 dışlanmış olmalı (45 kare kalır)
         tb_pos = {p["track_id"]: p for p in shape_mem["teams"]["Team B"]["player_positions"]}
-        assert tb_pos["4"]["frames"] == 13
+        assert tb_pos["4"]["frames"] == 45
 
         # CSV ve SQLite üzerinden aynı sonuçların üretildiğini doğrula
         tag = "4cls" if use_four else "legacy"
@@ -429,12 +439,18 @@ def test_ml_analyzer_4class_compat_step_speeds_cache_and_parity(monkeypatch):
 
 
 def test_ml_analyzer_proxy_passes_causal_non_leakage_and_pressures():
-    # Kare 0..5: Oyuncu 1 (Team A) topa sahip; f<=3 iken team=None, f>=4 iken Team A (pas f=3->f=4)
+    # Kare 0..3: Oyuncu 1 (Team A) topa sahip; f<=3 iken team=None, f>=4 iken Team A (pas f=3->f=22 çok-kareli uçuşla)
     # Aynı kare içinde duplicate (tid=1, fid=3) olsa bile aynı karede sızıntı olmamalı
     rows = []
-    for f in range(8):
+    for f in range(26):
         ts = round(f / 25.0, 3)
-        bx = 15.0 if f <= 3 else 40.0
+        if f <= 3:
+            bx = 15.0
+        elif f < 22:
+            t_f = 0.14 + (f - 4) / 17.0 * 0.72
+            bx = 15.0 + t_f * 25.0
+        else:
+            bx = 40.0
         rows.append({
             "frame_idx": f, "timestamp_sec": ts, "track_id": "ball", "class_name": "ball",
             "team": None, "is_predicted": False,

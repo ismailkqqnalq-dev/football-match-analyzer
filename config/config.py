@@ -238,6 +238,18 @@ TEAM_COLOR_SPACE = "LAB"
 # Fit sonrası yeni gelen bir track_id'nin takımını kalıcı olarak önbelleğe
 # kilitlemeden önce görülmesi gereken minimum örnek sayısı
 TEAM_CLASSIFIER_MIN_SAMPLES_FOR_LOCK = 3
+# Kilitli bir track_id için periyodik forma rengi yenileme aralığı (kare/gözlem)
+TEAM_CLASSIFIER_LOCK_REFRESH_INTERVAL = 5
+# Hareketli çoğunluk oylaması pencere boyutu ve kilit güncelleme eşiği
+TEAM_CLASSIFIER_VOTE_WINDOW = 7
+TEAM_CLASSIFIER_VOTE_MIN_AGREEMENT = 0.6
+# İlk fit sonrası sınırlı K-Means küme merkezi iyileştirme sayısı ve bellek limitleri
+TEAM_CLASSIFIER_MAX_REFITS = 3
+TEAM_CLASSIFIER_MAX_TRACKED_VOTES = 2048
+TEAM_CLASSIFIER_MAX_FEATURE_BANK = 512
+# Kaleci -> takım mekânsal eşleştirmesi için minimum yatay ayrım (piksel) ve EMA katsayısı
+TEAM_CLASSIFIER_GK_MIN_SEPARATION_PX = 40.0
+TEAM_CLASSIFIER_GK_X_EMA_ALPHA = 0.15
 # Video bitiminde K-Means fit edilmeden önceki ilk karelerdeki None takım
 # etiketlerini sonradan öğrenilen track_id -> team eşlemesiyle doldur
 TEAM_CLASSIFIER_BACKFILL_TEAMS = True
@@ -459,9 +471,18 @@ GENERATE_ANALYTICS_REPORT = True
 POSSESSION_MAX_PLAYER_BALL_DIST_M = 2.5
 POSSESSION_MAX_PLAYER_BALL_DIST_PX = 80.0
 POSSESSION_SMOOTHING_FRAMES = 5
+POSSESSION_MIN_CONTROL_SEC = 0.08
+POSSESSION_MIN_CONTROL_FRAMES = 2
+POSSESSION_MAX_BALL_CONTROL_SPEED_MPS = 15.0
+BALL_AERIAL_DIRECTION_CHANGE_MIN_DEG = 25.0
+BALL_AERIAL_DECEL_MIN_RATIO = 0.35
+PASS_MIN_DURATION_SEC = 0.08
 PASS_MAX_GAP_SEC = 4.0
+PASS_MAX_SPEED_MPS = 42.0
 PASS_MIN_BALL_MOVE_M = 2.0
 PASS_MIN_BALL_MOVE_PX = 35.0
+HALFTIME_MIN_GAP_SEC = 60.0
+HALFTIME_MIN_FRAMES_FOR_SWAP = 60
 
 # ------------------------------------------------------------------
 # TAKTİK VE SCOUTING MAKİNE ÖĞRENMESİ MOTORU (ADIM 8) AYARLARI

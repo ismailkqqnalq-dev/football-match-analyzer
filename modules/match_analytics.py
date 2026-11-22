@@ -31,6 +31,13 @@ from pandas.api.types import union_categoricals
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import config
+from modules.pitch_orientation import (
+    compute_ball_kinematic_filter,
+    compute_pixel_scale_px_per_m,
+    has_discontinuity_between,
+    resolve_goalkeeper_teams,
+    smooth_possession_codes,
+)
 
 
 _ANALYTICS_COLUMNS = (
@@ -258,6 +265,62 @@ class MatchAnalyzer:
         self.df = pd.DataFrame() if df is None else (df.copy() if copy else df)
         self.fps = float(fps) if fps and fps > 0 else self._infer_fps()
         self.has_pitch_players, self.has_pitch_ball, self.is_calibrated = self._detect_calibration()
+        self._orientation_cache: Optional[Tuple[int, bool, np.ndarray, List[str], List[Dict[str, Any]]]] = None
+        self._last_kinematic_info: Optional[Dict[str, Any]] = None
+
+    # ----------------------------------------------------------------
+    def _compute_bounds(self) -> Tuple[float, float, float, float]:
+        """Kalibreli modda [0..105, 0..68], piksel modda geçerli piksel koordinat sınırlarını döndürür."""
+        if self.is_calibrated:
+            return (0.0, float(config.PITCH_LENGTH_M), 0.0, float(config.PITCH_WIDTH_M))
+        if self.df.empty or "pixel_x" not in self.df.columns or "pixel_y" not in self.df.columns:
+            return (0.0, 1920.0, 0.0, 1080.0)
+        mask = (self.df["pixel_x"].notna() & self.df["pixel_y"].notna()).to_numpy(dtype=bool)
+        if "is_predicted" in self.df.columns:
+            m = mask & (~_bool_mask(self.df["is_predicted"], na_value=False))
+            if m.any():
+                mask = m
+        if not mask.any():
+            return (0.0, 1920.0, 0.0, 1080.0)
+        px = self.df.loc[mask, "pixel_x"].to_numpy(dtype=np.float64)
+        py = self.df.loc[mask, "pixel_y"].to_numpy(dtype=np.float64)
+        min_x, max_x = float(px.min()), float(px.max())
+        min_y, max_y = float(py.min()), float(py.max())
+        if max_x - min_x < 10.0:
+            max_x = min_x + 100.0
+        if max_y - min_y < 10.0:
+            max_y = min_y + 100.0
+        return (min_x, max_x, min_y, max_y)
+
+    # ----------------------------------------------------------------
+    def _get_resolved_teams_and_halves(
+        self,
+        use_calibrated: Optional[bool] = None,
+    ) -> Tuple[np.ndarray, List[str], List[Dict[str, Any]]]:
+        """Girdi DataFrame'ini değiştirmeden kaleci eşlemesini ve devre/hücum yönlerini önbellekli döndürür."""
+        cal_flag = self.is_calibrated if use_calibrated is None else bool(use_calibrated)
+        n_rows = len(self.df)
+        if (
+            self._orientation_cache is not None
+            and self._orientation_cache[0] == n_rows
+            and self._orientation_cache[1] == cal_flag
+        ):
+            _, _, r_codes, r_list, halves = self._orientation_cache
+            return r_codes, r_list, halves
+
+        bounds = (
+            (0.0, float(config.PITCH_LENGTH_M), 0.0, float(config.PITCH_WIDTH_M))
+            if cal_flag
+            else self._compute_bounds()
+        )
+        r_codes, r_list, halves = resolve_goalkeeper_teams(
+            df=self.df,
+            fps=self.fps,
+            bounds=bounds,
+            is_calibrated=cal_flag,
+        )
+        self._orientation_cache = (n_rows, cal_flag, r_codes, r_list, halves)
+        return r_codes, r_list, halves
 
     # ----------------------------------------------------------------
     @classmethod
@@ -491,6 +554,7 @@ class MatchAnalyzer:
         b_xs = b_xs[b_ord]
         b_ys = b_ys[b_ord]
         b_ts = b_ts[b_ord]
+        b_pred = b_pred[b_ord]
 
         b_first = np.empty(len(b_fids), dtype=bool)
         b_first[0] = True
@@ -500,13 +564,31 @@ class MatchAnalyzer:
         ball_xs = b_xs[b_first]
         ball_ys = b_ys[b_first]
         ball_ts = b_ts[b_first]
+        ball_is_pred = b_pred[b_first]
         n = len(ball_fids)
 
+        bounds = self._compute_bounds()
+        kin = compute_ball_kinematic_filter(
+            ball_fids=ball_fids,
+            ball_xs=ball_xs,
+            ball_ys=ball_ys,
+            ball_is_pred=ball_is_pred,
+            fps=self.fps,
+            is_calibrated=self.is_calibrated,
+            bounds=bounds,
+        )
+        self._last_kinematic_info = kin
+
+        resolved_team_codes_all, resolved_team_list, _ = self._get_resolved_teams_and_halves(
+            use_calibrated=self.is_calibrated
+        )
+
         human_names = _get_human_class_names()
+        ref_code = resolved_team_list.index("Referee") if "Referee" in resolved_team_list else -2
         team_not_ref = (
-            ~((self.df["team"] == "Referee").fillna(False).to_numpy(dtype=bool))
-            if "team" in self.df.columns
-            else True
+            (resolved_team_codes_all != ref_code)
+            if ref_code >= 0
+            else np.ones(len(self.df), dtype=bool)
         )
         p_mask = (
             cls_s.isin(human_names).fillna(False).to_numpy(dtype=bool)
@@ -525,11 +607,8 @@ class MatchAnalyzer:
                 if "track_id" in self.df.columns
                 else (np.full(len(p_idx), -1, dtype=np.int32), [])
             )
-            p_team_codes, team_list = (
-                _encode_clean_strings(self.df["team"].iloc[p_idx])
-                if "team" in self.df.columns
-                else (np.full(len(p_idx), -1, dtype=np.int32), [])
-            )
+            p_team_codes = resolved_team_codes_all[p_idx]
+            team_list = list(resolved_team_list)
             tid_to_team_code = np.full(len(tid_list), -1, dtype=np.int32)
             valid_tt = (p_tid_codes >= 0) & (p_team_codes >= 0)
             if valid_tt.any():
@@ -585,38 +664,22 @@ class MatchAnalyzer:
                     tmc = int(tid_to_team_code[tc])
                 raw_team_codes[i] = tmc
 
-        # Çoğunluk oyuyla yumuşatma (majority vote smoothing)
+        # R3: Hava topu / tek karelik imkânsız sıçrama karelerinde kontrolü reddet
+        valid_ctrl_mask = kin["valid_ctrl_mask"]
+        if len(valid_ctrl_mask) == n:
+            raw_tid_codes[~valid_ctrl_mask] = -1
+            raw_team_codes[~valid_ctrl_mask] = -1
+
+        # Çoğunluk oyuyla yumuşatma + minimum kontrol süresi filtresi
         win = max(1, int(config.POSSESSION_SMOOTHING_FRAMES))
-        half = win // 2
-        if win <= 1:
-            smoothed_tid_codes = raw_tid_codes.copy()
-            smoothed_team_codes = raw_team_codes.copy()
-        else:
-            smoothed_tid_codes = np.full(n, -1, dtype=np.int32)
-            smoothed_team_codes = np.full(n, -1, dtype=np.int32)
-            for i in range(n):
-                lo = max(0, i - half)
-                hi = min(n, i + half + 1)
-                counts: Dict[int, int] = {}
-                for k in range(lo, hi):
-                    tc = int(raw_tid_codes[k])
-                    if tc >= 0:
-                        counts[tc] = counts.get(tc, 0) + 1
-                if not counts:
-                    continue
-                top_tc = max(counts, key=counts.__getitem__)
-                top_cnt = counts[top_tc]
-                # Tek karelik boşluklarda köprü kur ama uzun boşlukları yapay uzatma
-                min_required = 2 if raw_tid_codes[i] < 0 and (hi - lo) >= 3 else 1
-                if top_cnt >= min_required:
-                    smoothed_tid_codes[i] = top_tc
-                    stm = int(tid_to_team_code[top_tc])
-                    if stm < 0:
-                        for k in range(lo, hi):
-                            if raw_tid_codes[k] == top_tc and raw_team_codes[k] >= 0:
-                                stm = int(raw_team_codes[k])
-                                break
-                    smoothed_team_codes[i] = stm
+        smoothed_tid_codes, smoothed_team_codes = smooth_possession_codes(
+            raw_tid_codes=raw_tid_codes,
+            raw_team_codes=raw_team_codes,
+            tid_to_team_code=tid_to_team_code,
+            win=win,
+            min_control_frames=int(kin["min_control_frames"]),
+            preserve_frame_team=False,
+        )
 
         ts_out = np.where(
             np.isfinite(ball_ts),
@@ -733,10 +796,30 @@ class MatchAnalyzer:
         spell_starts = np.r_[0, change_idx]
         spell_ends = np.r_[change_idx - 1, len(c_tids) - 1]
 
+        kin = self._last_kinematic_info
+        if kin is not None:
+            min_control_frames = int(kin["min_control_frames"])
+            min_pass_duration_sec = float(kin["min_pass_duration_sec"])
+            max_pass_speed = float(kin["max_pass_speed"])
+            disc_starts = kin["discontinuity_starts"]
+            disc_ends = kin["discontinuity_ends"]
+        else:
+            scale = 1.0 if self.is_calibrated else compute_pixel_scale_px_per_m(self._compute_bounds())
+            min_control_frames = max(
+                int(getattr(config, "POSSESSION_MIN_CONTROL_FRAMES", 2)),
+                int(round(float(getattr(config, "POSSESSION_MIN_CONTROL_SEC", 0.08)) * self.fps)),
+            )
+            min_pass_duration_sec = float(getattr(config, "PASS_MIN_DURATION_SEC", 0.08))
+            max_pass_speed = float(getattr(config, "PASS_MAX_SPEED_MPS", 42.0)) * scale
+            disc_starts = np.empty(0, dtype=np.int64)
+            disc_ends = np.empty(0, dtype=np.int64)
+
         spells: List[Dict[str, Any]] = []
         for st, en in zip(spell_starts, spell_ends):
             st_i = int(st)
             en_i = int(en)
+            if (en_i - st_i + 1) < min_control_frames:
+                continue
             tmc = int(c_teams[st_i])
             if tmc < 0 and en_i > st_i:
                 sub_t = c_teams[st_i + 1:en_i + 1]
@@ -775,7 +858,14 @@ class MatchAnalyzer:
 
             if gap_sec > config.PASS_MAX_GAP_SEC or move_dist < min_move:
                 continue
-            if s1["team"] is None or s2["team"] is None:
+            if gap_sec + 1e-6 < min_pass_duration_sec:
+                continue
+            pass_speed = move_dist / max(gap_sec, 1.0 / self.fps)
+            if pass_speed > max_pass_speed:
+                continue
+            if has_discontinuity_between(s1["end_frame"], s2["start_frame"], disc_starts, disc_ends):
+                continue
+            if s1["team"] not in ("Team A", "Team B") or s2["team"] not in ("Team A", "Team B"):
                 continue
 
             if s1["team"] == s2["team"]:
@@ -836,7 +926,7 @@ class MatchAnalyzer:
     def compute_team_shape(self) -> Dict[str, Any]:
         """
         Team A ve Team B için ortalama pozisyon (centroid), saha genişliği/derinliği
-        ve oyuncu bazlı ortalama pozisyonları hesaplar.
+        ve hücum yönüne göre normalize edilmiş savunma/hücum hatlarını hesaplar.
         """
         use_pitch = self.has_pitch_players
         x_col, y_col = ("pitch_x", "pitch_y") if use_pitch else ("pixel_x", "pixel_y")
@@ -852,12 +942,23 @@ class MatchAnalyzer:
         ):
             return result
 
+        resolved_team_codes_all, resolved_team_list, halves = self._get_resolved_teams_and_halves(
+            use_calibrated=use_pitch
+        )
+        ta_code = resolved_team_list.index("Team A") if "Team A" in resolved_team_list else -2
+        tb_code = resolved_team_list.index("Team B") if "Team B" in resolved_team_list else -2
+        ab_mask = np.zeros(len(self.df), dtype=bool)
+        if ta_code >= 0:
+            ab_mask |= resolved_team_codes_all == ta_code
+        if tb_code >= 0:
+            ab_mask |= resolved_team_codes_all == tb_code
+
         cls_s = self.df["class_name"]
         human_names = _get_human_class_names()
         p_mask = (
             cls_s.isin(human_names).fillna(False).to_numpy(dtype=bool)
             & ~((cls_s == "referee").fillna(False).to_numpy(dtype=bool))
-            & self.df["team"].isin(["Team A", "Team B"]).fillna(False).to_numpy(dtype=bool)
+            & ab_mask
             & self.df[x_col].notna().to_numpy(dtype=bool)
             & self.df[y_col].notna().to_numpy(dtype=bool)
         )
@@ -872,7 +973,12 @@ class MatchAnalyzer:
 
         xs_all = self.df[x_col].iloc[p_idx].to_numpy(dtype=np.float64)
         ys_all = self.df[y_col].iloc[p_idx].to_numpy(dtype=np.float64)
-        teams_sub = self.df["team"].iloc[p_idx].astype(str).to_numpy()
+        fids_all = (
+            self.df["frame_idx"].iloc[p_idx].to_numpy(dtype=np.int64)
+            if "frame_idx" in self.df.columns
+            else np.zeros(len(p_idx), dtype=np.int64)
+        )
+        team_codes_sub = resolved_team_codes_all[p_idx]
         if "track_id" in self.df.columns:
             tid_codes_all, tid_uniques = pd.factorize(
                 self.df["track_id"].iloc[p_idx], sort=False, use_na_sentinel=True
@@ -882,56 +988,115 @@ class MatchAnalyzer:
             tid_codes_all = np.full(len(p_idx), -1, dtype=np.int32)
             tid_strs = []
 
-        for tname in ("Team A", "Team B"):
-            t_mask = teams_sub == tname
-            if not t_mask.any():
-                result["teams"][tname] = None
-                continue
+        def _shape_for_subset(sub_mask: np.ndarray, attack_dirs: Dict[str, int]) -> Dict[str, Any]:
+            teams_out: Dict[str, Any] = {}
+            for tname, tcode in (("Team A", ta_code), ("Team B", tb_code)):
+                t_mask = sub_mask & (team_codes_sub == tcode) if tcode >= 0 else np.zeros(len(p_idx), dtype=bool)
+                if not t_mask.any():
+                    teams_out[tname] = None
+                    continue
 
-            xs_t = xs_all[t_mask]
-            ys_t = ys_all[t_mask]
-            t_codes = tid_codes_all[t_mask]
-            valid_tid = t_codes >= 0
+                xs_t = xs_all[t_mask]
+                ys_t = ys_all[t_mask]
+                t_codes = tid_codes_all[t_mask]
+                valid_tid = t_codes >= 0
 
-            player_positions: List[Dict[str, Any]] = []
-            if valid_tid.any():
-                vt_codes = t_codes[valid_tid]
-                vt_xs = xs_t[valid_tid]
-                vt_ys = ys_t[valid_tid]
-                k_len = len(tid_strs)
-                cnts = np.bincount(vt_codes, minlength=k_len)
-                sum_x = np.bincount(vt_codes, weights=vt_xs, minlength=k_len)
-                sum_y = np.bincount(vt_codes, weights=vt_ys, minlength=k_len)
-                active = np.flatnonzero(cnts > 0)
-                for c in active:
-                    cnt_c = int(cnts[c])
-                    player_positions.append({
-                        "track_id": tid_strs[c],
-                        "avg_x": round(float(sum_x[c] / cnt_c), 2),
-                        "avg_y": round(float(sum_y[c] / cnt_c), 2),
-                        "frames": cnt_c,
-                    })
-                player_positions.sort(key=lambda p: p["frames"], reverse=True)
+                player_positions: List[Dict[str, Any]] = []
+                if valid_tid.any():
+                    vt_codes = t_codes[valid_tid]
+                    vt_xs = xs_t[valid_tid]
+                    vt_ys = ys_t[valid_tid]
+                    k_len = len(tid_strs)
+                    cnts = np.bincount(vt_codes, minlength=k_len)
+                    sum_x = np.bincount(vt_codes, weights=vt_xs, minlength=k_len)
+                    sum_y = np.bincount(vt_codes, weights=vt_ys, minlength=k_len)
+                    active = np.flatnonzero(cnts > 0)
+                    for c in active:
+                        cnt_c = int(cnts[c])
+                        player_positions.append({
+                            "track_id": tid_strs[c],
+                            "avg_x": round(float(sum_x[c] / cnt_c), 2),
+                            "avg_y": round(float(sum_y[c] / cnt_c), 2),
+                            "frames": cnt_c,
+                        })
+                    player_positions.sort(key=lambda p: p["frames"], reverse=True)
 
-            if not player_positions:
-                result["teams"][tname] = None
-                continue
+                if not player_positions:
+                    teams_out[tname] = None
+                    continue
 
-            xs = np.array([p["avg_x"] for p in player_positions], dtype=float)
-            ys = np.array([p["avg_y"] for p in player_positions], dtype=float)
+                xs = np.array([p["avg_x"] for p in player_positions], dtype=float)
+                ys = np.array([p["avg_y"] for p in player_positions], dtype=float)
+                adir = int(attack_dirs.get(tname, 1 if tname == "Team A" else -1))
+                def_line = float(xs.min()) if adir >= 0 else float(xs.max())
+                att_line = float(xs.max()) if adir >= 0 else float(xs.min())
 
-            result["teams"][tname] = {
-                "player_count": len(player_positions),
-                "centroid_x": round(float(xs_t.mean()), 2),
-                "centroid_y": round(float(ys_t.mean()), 2),
-                "defensive_line_x": round(float(xs.min()), 2),
-                "attacking_line_x": round(float(xs.max()), 2),
-                "depth": round(float(xs.max() - xs.min()), 2),
-                "width": round(float(ys.max() - ys.min()), 2),
-                "std_x": round(float(xs_t.std(ddof=0)), 2),
-                "std_y": round(float(ys_t.std(ddof=0)), 2),
-                "player_positions": player_positions,
-            }
+                teams_out[tname] = {
+                    "player_count": len(player_positions),
+                    "attack_direction": "+x" if adir >= 0 else "-x",
+                    "centroid_x": round(float(xs_t.mean()), 2),
+                    "centroid_y": round(float(ys_t.mean()), 2),
+                    "defensive_line_x": round(def_line, 2),
+                    "attacking_line_x": round(att_line, 2),
+                    "depth": round(float(xs.max() - xs.min()), 2),
+                    "width": round(float(ys.max() - ys.min()), 2),
+                    "std_x": round(float(xs_t.std(ddof=0)), 2),
+                    "std_y": round(float(ys_t.std(ddof=0)), 2),
+                    "player_positions": player_positions,
+                }
+            return teams_out
+
+        by_half: List[Dict[str, Any]] = []
+        for idx_h, h in enumerate(halves):
+            hs = int(h["start_frame"])
+            he = int(h["end_frame"])
+            if len(halves) == 1:
+                h_mask = np.ones(len(p_idx), dtype=bool)
+            elif idx_h == 0:
+                h_mask = fids_all <= he
+            elif idx_h == len(halves) - 1:
+                h_mask = fids_all >= hs
+            else:
+                h_mask = (fids_all >= hs) & (fids_all <= he)
+            h_dirs = h.get("attack_directions", {"Team A": 1, "Team B": -1})
+            by_half.append({
+                "period": int(h["period"]),
+                "start_frame": hs,
+                "end_frame": he,
+                "detection_reason": h.get("detection_reason", "initial"),
+                "attack_directions": {
+                    k: ("+x" if int(v) >= 0 else "-x") for k, v in h_dirs.items()
+                },
+                "teams": _shape_for_subset(h_mask, h_dirs),
+            })
+
+        result["halves_detected"] = len(by_half)
+        result["by_half"] = by_half
+        if len(by_half) == 1:
+            result["teams"] = by_half[0]["teams"]
+            result["attack_directions"] = by_half[0]["attack_directions"]
+        else:
+            # Çok devreli maçta geriye dönük uyumlu üst düzey özet: oyuncu kare toplamları
+            # tam maçtan gelirken, savunma/hücum hatları birincil (1. yarı) yönü yansıtır.
+            primary_dirs = halves[0].get("attack_directions", {"Team A": 1, "Team B": -1})
+            full_teams = _shape_for_subset(np.ones(len(p_idx), dtype=bool), primary_dirs)
+            for tname in ("Team A", "Team B"):
+                if full_teams.get(tname) is None:
+                    continue
+                first_h = next(
+                    (bh["teams"].get(tname) for bh in by_half if bh["teams"].get(tname) is not None),
+                    None,
+                )
+                if first_h is not None:
+                    full_teams[tname]["centroid_x"] = first_h["centroid_x"]
+                    full_teams[tname]["centroid_y"] = first_h["centroid_y"]
+                    full_teams[tname]["defensive_line_x"] = first_h["defensive_line_x"]
+                    full_teams[tname]["attacking_line_x"] = first_h["attacking_line_x"]
+                    full_teams[tname]["depth"] = first_h["depth"]
+                    full_teams[tname]["width"] = first_h["width"]
+                    full_teams[tname]["attack_direction"] = first_h["attack_direction"]
+            result["teams"] = full_teams
+            result["attack_directions"] = by_half[0]["attack_directions"]
 
         return result
 
@@ -1051,12 +1216,16 @@ class MatchAnalyzer:
         ):
             return saved_paths
 
+        resolved_team_codes_all, resolved_team_list, _ = self._get_resolved_teams_and_halves(
+            use_calibrated=use_pitch
+        )
         cls_s = self.df["class_name"]
         human_names = _get_human_class_names()
+        ref_code = resolved_team_list.index("Referee") if "Referee" in resolved_team_list else -2
         team_not_ref = (
-            ~((self.df["team"] == "Referee").fillna(False).to_numpy(dtype=bool))
-            if "team" in self.df.columns
-            else True
+            (resolved_team_codes_all != ref_code)
+            if ref_code >= 0
+            else np.ones(len(self.df), dtype=bool)
         )
         p_mask = (
             cls_s.isin(human_names).fillna(False).to_numpy(dtype=bool)
@@ -1094,7 +1263,8 @@ class MatchAnalyzer:
             space_suffix = "Pixel Space (Uncalibrated)"
 
         if "team" in self.df.columns:
-            p_team_codes, team_list = _encode_clean_strings(self.df["team"].iloc[p_idx])
+            p_team_codes = resolved_team_codes_all[p_idx]
+            team_list = list(resolved_team_list)
         else:
             p_team_codes = np.full(len(p_idx), -1, dtype=np.int32)
             team_list = []

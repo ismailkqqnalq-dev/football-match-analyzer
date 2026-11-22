@@ -355,7 +355,8 @@ def test_t3_cuda_oom_halving_plus_four_class_team_classifier(monkeypatch):
     ]
     assigned = tc.assign_teams(human_dets, frame)
     by_cls = {d["class_name"]: d["team"] for d in assigned}
-    assert by_cls["goalkeeper"] == "Goalkeeper"
+    assert by_cls["goalkeeper"] == "Team B"
+    assert any(d["class_name"] == "goalkeeper" and d["team"] == "Team B" for d in assigned)
     assert by_cls["referee"] == "Referee"
     assert {d["team"] for d in assigned if d["class_name"] == "player"} == {"Team A", "Team B"}
 
