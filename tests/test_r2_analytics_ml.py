@@ -321,7 +321,7 @@ def test_match_analyzer_parity_4class_and_legacy_person(tmp_path, monkeypatch):
 
 def test_match_analyzer_edge_cases_and_pixel_fallback(tmp_path, monkeypatch):
     # Boş DataFrame
-    empty_ma = MatchAnalyzer(pd.DataFrame())
+    empty_ma = MatchAnalyzer(pd.DataFrame(), allow_pixel_fallback=True)
     assert empty_ma.is_calibrated is False
     tl_e, pos_e = empty_ma.compute_possession()
     assert tl_e.empty and pos_e["total_frames"] == 0
@@ -337,7 +337,7 @@ def test_match_analyzer_edge_cases_and_pixel_fallback(tmp_path, monkeypatch):
         {"frame_idx": 1, "track_id": "2", "class_name": "player", "pixel_x": 182.0, "pixel_y": 201.0},
         {"frame_idx": 1, "track_id": np.nan, "class_name": "player", "pixel_x": 500.0, "pixel_y": 500.0},
     ])
-    ma_min = MatchAnalyzer(df_min)
+    ma_min = MatchAnalyzer(df_min, allow_pixel_fallback=True)
     assert ma_min.fps == 25.0
     assert ma_min.is_calibrated is False
     tl_m, pos_m = ma_min.compute_possession()

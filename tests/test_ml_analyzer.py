@@ -387,31 +387,32 @@ def test_real_tracking_data_cli_csv_and_sql_and_data_safety(tmp_path):
         check=True,
     )
     assert "[ML Özeti]" in res_csv.stdout
-    assert "xP hesaplanamadı" in res_csv.stdout
+    assert "Saha kalibrasyonu olmadığı için konum tabanlı metrikler üretilmedi." in res_csv.stdout
 
     expected_files = [
         config.EXPORT_ML_SUMMARY_FILENAME,
         config.EXPORT_ML_REPORT_FILENAME,
-        config.EXPORT_ML_PLAYER_PROFILES_FILENAME,
-        config.EXPORT_ML_TEMPO_WINDOWS_FILENAME,
-        config.EXPORT_ML_ANOMALIES_FILENAME,
-        config.EXPORT_ML_PASS_PREDICTIONS_FILENAME,
-        "xt_spatial_heatmap.png",
-        "player_clusters_pca.png",
-        "tempo_anomaly_timeline.png",
     ]
     for fname in expected_files:
         fpath = out_csv_dir / fname
         assert fpath.exists(), f"Eksik çıktı dosyası: {fname}"
         assert fpath.stat().st_size > 0
-    assert not (out_csv_dir / "xp_model_comparison.png").exists()
+    for suppressed_png in (
+        "xp_model_comparison.png",
+        "xt_spatial_heatmap.png",
+        "player_clusters_pca.png",
+        "tempo_anomaly_timeline.png",
+    ):
+        assert not (out_csv_dir / suppressed_png).exists()
 
     with open(out_csv_dir / config.EXPORT_ML_SUMMARY_FILENAME, "r", encoding="utf-8") as f:
         summary_json = json.load(f)
     assert summary_json["coord_mode"] == "pixel_fallback"
-    assert summary_json["player_clustering"]["eligible_players"] == 10
-    assert summary_json["xt_analysis"]["evaluated_events_count"] >= 1
-    assert summary_json["xp_modeling"]["status"] == "insufficient_data"
+    assert summary_json["is_calibrated"] is False
+    assert summary_json["player_clustering"]["status"] == "requires_calibration"
+    assert summary_json["tempo_and_anomalies"]["status"] == "requires_calibration"
+    assert summary_json["xp_modeling"]["status"] == "requires_calibration"
+    assert summary_json["xt_analysis"]["status"] == "requires_calibration"
 
     # SQLite CLI + --no-plots doğrulaması
     out_db_dir = tmp_path / "cli_db_out"
@@ -538,7 +539,7 @@ def test_degenerate_inputs_and_zero_variance_pca(tmp_path):
     }
     for name, df_case in cases.items():
         out_dir = tmp_path / name
-        analyzer = MLAnalyzer(df_case, fps=25.0, random_state=42)
+        analyzer = MLAnalyzer(df_case, fps=25.0, random_state=42, allow_pixel_fallback=True)
         summary = analyzer.export_all(output_dir=str(out_dir), generate_plots=True)
         assert summary["data_quality"]["duration_sec"] == 0.0 or name != "empty_df"
         expected_range = [0, 0] if name in ("empty_df", "single_row_df") else [0, 39]
@@ -795,7 +796,7 @@ def test_tempo_drop_ignores_small_fluctuations_and_flags_real_drops():
 # ----------------------------------------------------------------------
 def test_uncalibrated_xp_pitch_projection_non_saturated():
     csv_path = os.path.join(config.EXPORT_DIR, config.EXPORT_CSV_FILENAME)
-    analyzer = MLAnalyzer.from_csv(csv_path, allow_synthetic=True)
+    analyzer = MLAnalyzer.from_csv(csv_path, allow_synthetic=True, allow_pixel_fallback=True)
     res = analyzer.run_all()
     assert res["xp_modeling"]["scoring_unit_mode"] == "normalized_pitch_projection_105x68"
     pred_df = res["_artifacts"]["pass_predictions_df"]
@@ -871,8 +872,8 @@ def test_real_tracking_pixel_fallback_train_bounds_invariance():
             f_cursor += 105  # > PASS_MAX_GAP_SEC (4.0s @ 25fps), olaylar arası sahte devir önlenir
         return pd.DataFrame(rows)
 
-    r_clean = MLAnalyzer(_build_pixel_real_events_df(False), fps=25.0, random_state=42).run_all()
-    r_extreme = MLAnalyzer(_build_pixel_real_events_df(True), fps=25.0, random_state=42).run_all()
+    r_clean = MLAnalyzer(_build_pixel_real_events_df(False), fps=25.0, random_state=42, allow_pixel_fallback=True).run_all()
+    r_extreme = MLAnalyzer(_build_pixel_real_events_df(True), fps=25.0, random_state=42, allow_pixel_fallback=True).run_all()
 
     for res in (r_clean, r_extreme):
         assert res["xp_modeling"]["data_source"] == "real_tracking_events"
@@ -921,7 +922,7 @@ def test_all_low_coverage_no_legend_warning_and_modal_team_fatigue(tmp_path):
             })
 
     out_dir = tmp_path / "all_low_cov"
-    low_cov_analyzer = MLAnalyzer(pd.DataFrame(low_cov_rows), fps=25.0, random_state=42)
+    low_cov_analyzer = MLAnalyzer(pd.DataFrame(low_cov_rows), fps=25.0, random_state=42, allow_pixel_fallback=True)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         summary = low_cov_analyzer.export_all(output_dir=str(out_dir), generate_plots=True)

@@ -261,10 +261,23 @@ class MatchAnalyzer:
     üreten taktik analiz sınıfı.
     """
 
-    def __init__(self, df: pd.DataFrame, fps: Optional[float] = None, copy: bool = False):
+    _CALIBRATION_NOTICE_TR = "Saha kalibrasyonu olmadığı için konum tabanlı metrikler üretilmedi."
+
+    def __init__(
+        self,
+        df: pd.DataFrame,
+        fps: Optional[float] = None,
+        copy: bool = False,
+        allow_pixel_fallback: Optional[bool] = None,
+    ):
         self.df = pd.DataFrame() if df is None else (df.copy() if copy else df)
         self.fps = float(fps) if fps and fps > 0 else self._infer_fps()
         self.has_pitch_players, self.has_pitch_ball, self.is_calibrated = self._detect_calibration()
+        self.allow_pixel_fallback = bool(
+            getattr(config, "ALLOW_PIXEL_FALLBACK_METRICS", False)
+            if allow_pixel_fallback is None
+            else allow_pixel_fallback
+        )
         self._orientation_cache: Optional[Tuple[int, bool, np.ndarray, List[str], List[Dict[str, Any]]]] = None
         self._last_kinematic_info: Optional[Dict[str, Any]] = None
 
@@ -324,7 +337,12 @@ class MatchAnalyzer:
 
     # ----------------------------------------------------------------
     @classmethod
-    def from_csv(cls, csv_path: str, fps: Optional[float] = None) -> "MatchAnalyzer":
+    def from_csv(
+        cls,
+        csv_path: str,
+        fps: Optional[float] = None,
+        allow_pixel_fallback: Optional[bool] = None,
+    ) -> "MatchAnalyzer":
         """CSV takip dosyasından sütun budamalı ve kompakt tipli MatchAnalyzer oluşturur."""
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"CSV dosyası bulunamadı: {csv_path}")
@@ -332,7 +350,12 @@ class MatchAnalyzer:
         try:
             header_cols = pd.read_csv(csv_path, nrows=0).columns.tolist()
         except pd.errors.EmptyDataError:
-            return cls(df=pd.DataFrame(columns=list(_ANALYTICS_COLUMNS)), fps=fps, copy=False)
+            return cls(
+                df=pd.DataFrame(columns=list(_ANALYTICS_COLUMNS)),
+                fps=fps,
+                copy=False,
+                allow_pixel_fallback=allow_pixel_fallback,
+            )
         usecols = [c for c in header_cols if c in _ANALYTICS_COL_SET]
         usecols_arg = usecols if usecols else None
 
@@ -351,7 +374,7 @@ class MatchAnalyzer:
         except (ValueError, TypeError):
             df = pd.read_csv(csv_path, usecols=usecols_arg)
         df = _compact_analytics_df(df)
-        return cls(df=df, fps=fps, copy=False)
+        return cls(df=df, fps=fps, copy=False, allow_pixel_fallback=allow_pixel_fallback)
 
     # ----------------------------------------------------------------
     @classmethod
@@ -360,6 +383,7 @@ class MatchAnalyzer:
         db_path: str,
         table_name: Optional[str] = None,
         fps: Optional[float] = None,
+        allow_pixel_fallback: Optional[bool] = None,
     ) -> "MatchAnalyzer":
         """SQLite veritabanından parçalı (chunked) ve kompakt tipli MatchAnalyzer oluşturur."""
         if not os.path.exists(db_path):
@@ -401,7 +425,7 @@ class MatchAnalyzer:
             ordered_cols = [c for c in chunks[0].columns if c in df.columns]
             df = df[ordered_cols]
 
-        return cls(df=df, fps=fps, copy=False)
+        return cls(df=df, fps=fps, copy=False, allow_pixel_fallback=allow_pixel_fallback)
 
     # ----------------------------------------------------------------
     def _infer_fps(self) -> float:
@@ -471,7 +495,8 @@ class MatchAnalyzer:
 
         has_pitch_players = bool((has_valid_pitch & is_player).any())
         has_pitch_ball = bool((has_valid_pitch & is_ball).any())
-        is_calibrated = bool(has_pitch_players and has_pitch_ball)
+        has_any_ball = bool(is_ball.any())
+        is_calibrated = bool(has_pitch_players and (has_pitch_ball or not has_any_ball))
         return has_pitch_players, has_pitch_ball, is_calibrated
 
     # ----------------------------------------------------------------
@@ -885,7 +910,7 @@ class MatchAnalyzer:
                 "start_frame": s1["end_frame"],
                 "end_frame": s2["start_frame"],
                 "duration_sec": round(gap_sec, 2),
-                "distance": round(move_dist, 2),
+                "distance": round(move_dist, 2) if (self.is_calibrated or self.allow_pixel_fallback) else None,
             })
 
         team_stats: Dict[str, Dict[str, Any]] = {}
@@ -928,11 +953,14 @@ class MatchAnalyzer:
         Team A ve Team B için ortalama pozisyon (centroid), saha genişliği/derinliği
         ve hücum yönüne göre normalize edilmiş savunma/hücum hatlarını hesaplar.
         """
+        if not self.is_calibrated and not self.allow_pixel_fallback:
+            return {"status": "requires_calibration"}
+
         use_pitch = self.has_pitch_players
         x_col, y_col = ("pitch_x", "pitch_y") if use_pitch else ("pixel_x", "pixel_y")
         mode = "pitch_meters" if use_pitch else "pixel_fallback"
 
-        result: Dict[str, Any] = {"mode": mode, "teams": {}}
+        result: Dict[str, Any] = {"status": "ok", "mode": mode, "teams": {}}
         if (
             self.df.empty
             or x_col not in self.df.columns
@@ -1197,10 +1225,13 @@ class MatchAnalyzer:
         self,
         output_dir: Optional[str] = None,
         top_n_players: int = 3,
-    ) -> Dict[str, str]:
+    ) -> Dict[str, Any]:
         """
         Takım A, Takım B ve en sık takip edilen N oyuncu için 2D ısı haritası PNG'leri üretir.
         """
+        if not self.is_calibrated and not self.allow_pixel_fallback:
+            return {"status": "requires_calibration"}
+
         out_dir = output_dir or config.EXPORT_HEATMAP_DIR
         os.makedirs(out_dir, exist_ok=True)
 
@@ -1347,10 +1378,11 @@ class MatchAnalyzer:
         self,
         output_dir: Optional[str] = None,
         generate_heatmaps: bool = True,
+        suppress_calibration_notice: bool = False,
     ) -> Dict[str, Any]:
         """
         Tüm taktik analizleri çalıştırır ve JSON özeti, top kontrol zaman serisi CSV'si
-        ve ısı haritası PNG'lerini diske kaydeder.
+        ve (kalibre ise) ısı haritası PNG'lerini diske kaydeder.
         """
         out_dir = output_dir or config.EXPORT_DIR
         os.makedirs(out_dir, exist_ok=True)
@@ -1359,13 +1391,21 @@ class MatchAnalyzer:
         pass_stats = self.detect_passes(timeline_df)
         team_shape = self.compute_team_shape()
 
-        heatmaps: Dict[str, str] = {}
-        if generate_heatmaps:
+        if not self.is_calibrated and not self.allow_pixel_fallback:
+            heatmaps: Dict[str, Any] = {"status": "requires_calibration"}
+        elif generate_heatmaps:
             heatmaps = self.generate_heatmaps(output_dir=os.path.join(out_dir, "heatmaps"))
+        else:
+            heatmaps = {}
 
         possession_csv_path = os.path.join(out_dir, config.EXPORT_POSSESSION_FILENAME)
         timeline_df.to_csv(possession_csv_path, index=False)
 
+        cal_notice = (
+            self._CALIBRATION_NOTICE_TR
+            if (not self.is_calibrated and not self.allow_pixel_fallback)
+            else None
+        )
         summary = _to_python_scalar({
             "fps": self.fps,
             "is_calibrated": self.is_calibrated,
@@ -1374,6 +1414,8 @@ class MatchAnalyzer:
             "possession": possession_stats,
             "passes": pass_stats,
             "team_shape": team_shape,
+            "heatmaps": heatmaps,
+            "calibration_notice": cal_notice,
             "exports": {
                 "possession_timeline_csv": possession_csv_path,
                 "heatmaps": heatmaps,
@@ -1385,6 +1427,8 @@ class MatchAnalyzer:
             json.dump(summary, f, indent=2, ensure_ascii=False)
         summary["exports"]["analytics_summary_json"] = summary_json_path
 
+        if cal_notice and not suppress_calibration_notice:
+            print(f"[MatchAnalyzer] {cal_notice}")
         print(f"[MatchAnalyzer] Taktik analiz özeti kaydedildi: {summary_json_path}")
         return summary
 

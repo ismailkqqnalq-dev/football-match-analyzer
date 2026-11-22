@@ -276,12 +276,15 @@ def main():
                 )
 
             analytics_summary = None
+            _cal_notice_printed = False
             if config.GENERATE_ANALYTICS_REPORT and not args.no_analytics:
                 print("\n" + "=" * 60)
                 print("TAKTİK ANALİZ VE ISI HARİTASI (Adım 7)")
                 print("=" * 60)
                 analyzer = _load_match_analyzer()
                 analytics_summary = analyzer.export_all(output_dir=export_dir)
+                if analytics_summary.get("calibration_notice"):
+                    _cal_notice_printed = True
                 poss = analytics_summary["possession"]
                 passes = analytics_summary["passes"]
                 print(
@@ -299,7 +302,10 @@ def main():
                 print("=" * 60)
                 ml_out_dir = os.path.join(export_dir, "ml_reports")
                 ml_analyzer = _load_ml_analyzer(analytics_summary)
-                ml_summary = ml_analyzer.export_all(output_dir=ml_out_dir)
+                ml_summary = ml_analyzer.export_all(
+                    output_dir=ml_out_dir,
+                    suppress_calibration_notice=_cal_notice_printed,
+                )
                 xp = ml_summary.get("xp_modeling", {})
                 xt = ml_summary.get("xt_analysis", {})
                 if xp.get("synthetic_fallback_used") or xt.get("synthetic_fallback_used"):
@@ -319,14 +325,22 @@ def main():
                         f"xP hesaplanamadı: yeterli gerçek pas yok "
                         f"({xp.get('real_events', 0)}/{req_n})"
                     )
-                print(
-                    f"Rol Kümeleme -> Oyuncu: {cl['eligible_players']} | "
-                    f"Optimal k: {cl['optimal_k']} | Silhouette: {cl['best_silhouette']}"
-                )
-                print(
-                    f"Tempo & Anomali -> Tempo Düşüşü: {tp['tempo_drop_count']} | "
-                    f"Yorgunluk: {tp['fatigue_players_count']} | Anomali: {tp['total_anomalies']}"
-                )
+                elif xp.get("status") == "requires_calibration":
+                    print("xP Model -> Saha kalibrasyonu gerekli.")
+                if cl.get("status", "ok") == "ok":
+                    print(
+                        f"Rol Kümeleme -> Oyuncu: {cl['eligible_players']} | "
+                        f"Optimal k: {cl['optimal_k']} | Silhouette: {cl['best_silhouette']}"
+                    )
+                else:
+                    print("Rol Kümeleme -> Saha kalibrasyonu gerekli.")
+                if tp.get("status", "ok") == "ok":
+                    print(
+                        f"Tempo & Anomali -> Tempo Düşüşü: {tp['tempo_drop_count']} | "
+                        f"Yorgunluk: {tp['fatigue_players_count']} | Anomali: {tp['total_anomalies']}"
+                    )
+                else:
+                    print("Tempo & Anomali -> Saha kalibrasyonu gerekli.")
         finally:
             if hasattr(exporter, "close"):
                 exporter.close()

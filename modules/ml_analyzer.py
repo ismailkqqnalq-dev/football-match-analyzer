@@ -506,6 +506,7 @@ class MLAnalyzer:
     """
 
     _SYNTHETIC_WARNING_TR = "SENTETİK VERİ – GERÇEK MAÇ SONUCU DEĞİLDİR"
+    _CALIBRATION_NOTICE_TR = "Saha kalibrasyonu olmadığı için konum tabanlı metrikler üretilmedi."
 
     XP_NUMERIC_FEATURES = [
         "ball_player_dist",
@@ -536,6 +537,7 @@ class MLAnalyzer:
         random_state: int = config.ML_RANDOM_STATE,
         copy: bool = False,
         allow_synthetic: Optional[bool] = None,
+        allow_pixel_fallback: Optional[bool] = None,
     ):
         self.df = df.copy() if (df is not None and copy) else (df if df is not None else pd.DataFrame())
         self.fps = float(fps) if fps and fps > 0 else self._infer_fps()
@@ -545,6 +547,11 @@ class MLAnalyzer:
             getattr(config, "ML_ALLOW_SYNTHETIC_FALLBACK", False)
             if allow_synthetic is None
             else allow_synthetic
+        )
+        self.allow_pixel_fallback = bool(
+            getattr(config, "ALLOW_PIXEL_FALLBACK_METRICS", False)
+            if allow_pixel_fallback is None
+            else allow_pixel_fallback
         )
 
         self.has_pitch_players, self.has_pitch_ball, self.is_calibrated = self._detect_calibration()
@@ -593,6 +600,7 @@ class MLAnalyzer:
         analytics_summary: Optional[Dict[str, Any]] = None,
         random_state: int = config.ML_RANDOM_STATE,
         allow_synthetic: Optional[bool] = None,
+        allow_pixel_fallback: Optional[bool] = None,
     ) -> "MLAnalyzer":
         """CSV takip dosyasından sütun budamalı ve kompakt tipli MLAnalyzer örneği oluşturur."""
         if not os.path.exists(csv_path):
@@ -608,6 +616,7 @@ class MLAnalyzer:
                 random_state=random_state,
                 copy=False,
                 allow_synthetic=allow_synthetic,
+                allow_pixel_fallback=allow_pixel_fallback,
             )
         usecols = [c for c in header_cols if c in _STANDARD_TRACKING_COL_SET]
         usecols_arg = usecols if usecols else None
@@ -639,6 +648,7 @@ class MLAnalyzer:
             random_state=random_state,
             copy=False,
             allow_synthetic=allow_synthetic,
+            allow_pixel_fallback=allow_pixel_fallback,
         )
 
     # ----------------------------------------------------------------
@@ -651,6 +661,7 @@ class MLAnalyzer:
         analytics_summary: Optional[Dict[str, Any]] = None,
         random_state: int = config.ML_RANDOM_STATE,
         allow_synthetic: Optional[bool] = None,
+        allow_pixel_fallback: Optional[bool] = None,
     ) -> "MLAnalyzer":
         """SQLite veritabanından parçalı (chunked) ve kompakt tipli MLAnalyzer örneği oluşturur."""
         if not os.path.exists(db_path):
@@ -699,6 +710,7 @@ class MLAnalyzer:
             random_state=random_state,
             copy=False,
             allow_synthetic=allow_synthetic,
+            allow_pixel_fallback=allow_pixel_fallback,
         )
 
     # ----------------------------------------------------------------
@@ -768,7 +780,8 @@ class MLAnalyzer:
         )
         has_pitch_players = bool((has_valid_pitch & is_player).any())
         has_pitch_ball = bool((has_valid_pitch & is_ball).any())
-        return has_pitch_players, has_pitch_ball, bool(has_pitch_players and has_pitch_ball)
+        has_any_ball = bool(is_ball.any())
+        return has_pitch_players, has_pitch_ball, bool(has_pitch_players and (has_pitch_ball or not has_any_ball))
 
     # ----------------------------------------------------------------
     def _get_valid_bbox_mask(self, df: pd.DataFrame) -> pd.Series:
@@ -2227,6 +2240,17 @@ class MLAnalyzer:
                 f"ML_TRAIN_RATIO + ML_VAL_RATIO + ML_TEST_RATIO toplamı 1.0 olmalıdır (şu an: {total_ratio:.4f})."
             )
 
+        if (
+            events_df is None
+            and not self.is_calibrated
+            and not self.allow_pixel_fallback
+            and not self.allow_synthetic
+        ):
+            self.xp_models_ = {}
+            self.best_xp_model_name_ = None
+            self.best_xp_pipeline_ = None
+            return {"status": "requires_calibration"}
+
         proxy_events = self.extract_proxy_pass_events()
         fallback_reason: Optional[str] = None
         req_events = int(config.ML_MIN_SUPERVISED_EVENTS)
@@ -2806,6 +2830,15 @@ class MLAnalyzer:
         cols = int(config.ML_XT_GRID_COLS)
         rows = int(config.ML_XT_GRID_ROWS)
 
+        if events_df is None and not self.is_calibrated and not self.allow_pixel_fallback:
+            allow_syn_cal = self.allow_synthetic and (
+                xp_results is None
+                or xp_results.get("data_source") == "calibrated_synthetic_match"
+                or xp_results.get("status") == "requires_calibration"
+            )
+            if not allow_syn_cal:
+                return {"status": "requires_calibration"}
+
         if events_df is not None:
             eval_df = events_df.copy()
             eval_source = "provided_events"
@@ -3041,8 +3074,11 @@ class MLAnalyzer:
             "ball_control_pct", "mean_dist_to_ball",
             "cluster_id", "tactical_role_tr", "pca_1", "pca_2",
         ]
+        if not self.is_calibrated and not self.allow_pixel_fallback:
+            return pd.DataFrame(columns=profile_cols), {"status": "requires_calibration"}
         if self.df.empty or "class_name" not in self.df.columns or "track_id" not in self.df.columns:
             return pd.DataFrame(columns=profile_cols), {
+                "status": "ok",
                 "coord_mode": self.coord_mode,
                 "min_track_frames": min_frames,
                 "eligible_players": 0,
@@ -3058,6 +3094,7 @@ class MLAnalyzer:
         x_col, y_col = self._get_xy_columns()
         if x_col not in self.df.columns or y_col not in self.df.columns:
             return pd.DataFrame(columns=profile_cols), {
+                "status": "ok",
                 "coord_mode": self.coord_mode,
                 "min_track_frames": min_frames,
                 "eligible_players": 0,
@@ -3122,6 +3159,7 @@ class MLAnalyzer:
         h_idx = np.flatnonzero(h_mask)
         if len(h_idx) == 0:
             return pd.DataFrame(columns=profile_cols), {
+                "status": "ok",
                 "coord_mode": self.coord_mode,
                 "min_track_frames": min_frames,
                 "eligible_players": 0,
@@ -3382,6 +3420,7 @@ class MLAnalyzer:
 
         if not player_rows:
             return pd.DataFrame(columns=profile_cols), {
+                "status": "ok",
                 "coord_mode": self.coord_mode,
                 "min_track_frames": min_frames,
                 "eligible_players": 0,
@@ -3495,6 +3534,7 @@ class MLAnalyzer:
         profiles_df = profiles_df.sort_values(["cluster_id", "observed_frames"], ascending=[True, False]).reset_index(drop=True)
 
         summary = {
+            "status": "ok",
             "coord_mode": self.coord_mode,
             "min_track_frames": min_frames,
             "eligible_players": int(n_players),
@@ -3530,6 +3570,11 @@ class MLAnalyzer:
             "track_id", "team", "metric_value", "threshold", "description_tr",
         ]
 
+        if not self.is_calibrated and not self.allow_pixel_fallback:
+            return pd.DataFrame(columns=window_cols), pd.DataFrame(columns=anom_cols), {
+                "status": "requires_calibration"
+            }
+
         speed_df, spike_anomalies = self._compute_player_step_speeds(exclude_referees=True)
         spike_seq = spike_anomalies if isinstance(spike_anomalies, _VectorizedSpikeAnomalies) else None
         anomalies_list: List[Dict[str, Any]] = [] if spike_seq is not None else list(spike_anomalies)
@@ -3546,6 +3591,7 @@ class MLAnalyzer:
                 else {}
             )
             return pd.DataFrame(columns=window_cols), early_anom_df, {
+                "status": "ok",
                 "coord_mode": self.coord_mode,
                 "window_sec": round(win_sec, 2),
                 "total_windows": 0,
@@ -4086,6 +4132,7 @@ class MLAnalyzer:
 
         all_win = windows_df[windows_df["team"] == "ALL"] if not windows_df.empty else windows_df
         summary = {
+            "status": "ok",
             "coord_mode": self.coord_mode,
             "window_sec": round(win_sec, 2),
             "total_windows": int(len(all_win)),
@@ -4406,6 +4453,11 @@ class MLAnalyzer:
                 f"> **UYARI: {self._SYNTHETIC_WARNING_TR}**",
                 "",
             ])
+        if any(sec.get("status") == "requires_calibration" for sec in (xp, xt, cl, tp)):
+            lines.extend([
+                f"> **Not:** {self._CALIBRATION_NOTICE_TR}",
+                "",
+            ])
         lines.extend([
             "## 1. Veri Kalitesi ve Eksik/NULL Denetimi",
             "",
@@ -4426,7 +4478,9 @@ class MLAnalyzer:
             "## 2. Pas Başarı Olasılığı (xP) Modelleme ve Operasyonel Ödünleşimler",
             "",
         ])
-        if xp.get("status") == "insufficient_data":
+        if xp.get("status") == "requires_calibration":
+            lines.append("- **Durum:** Hesaplanamadı – saha kalibrasyonu gerekli")
+        elif xp.get("status") == "insufficient_data":
             lines.extend([
                 "- **Durum:** Hesaplanamadı – yetersiz veri",
                 f"- **Gerçek / Gerekli Pas Olayı:** {xp.get('real_events', 0)}/{xp.get('required', config.ML_MIN_SUPERVISED_EVENTS)}",
@@ -4472,7 +4526,9 @@ class MLAnalyzer:
             "## 3. Mekansal Beklenen Tehdit (xT) Analizi",
             "",
         ])
-        if xt.get("status") == "insufficient_data":
+        if xt.get("status") == "requires_calibration":
+            lines.append("- **Durum:** Hesaplanamadı – saha kalibrasyonu gerekli")
+        elif xt.get("status") == "insufficient_data":
             lines.extend([
                 "- **Durum:** Hesaplanamadı – yetersiz veri",
                 f"- **Neden:** {xt.get('reason', 'Yeterli gerçek pas verisi bulunamadı.')}",
@@ -4504,33 +4560,45 @@ class MLAnalyzer:
                     f"- **{tname}:** {tinfo.get('events', 0)} olay | Toplam `delta_xT`={float(tinfo.get('total_delta_xT', 0.0)):.4f} | Toplam `expected_xT`={float(tinfo.get('total_expected_xT', 0.0)):.4f}"
                 )
 
-        excluded_tracks = cl.get("excluded_tracks") or []
-        excluded_count = cl.get("excluded_tracks_count", len(excluded_tracks))
         lines.extend([
             "",
             "## 4. Oyuncu Rol Kümeleme (Silhouette & 2B PCA)",
             "",
-            f"- **Uygun Oyuncu Sayısı:** {cl.get('eligible_players', 0)} (Hariç tutulan iz: {excluded_count})",
-            f"- **Optimal Küme Sayısı (k):** `{cl.get('optimal_k')}` (En iyi Silhouette skoru: `{cl.get('best_silhouette')}`)",
-            f"- **Aday k Silhouette Skorları:** `{cl.get('candidate_k_scores', {})}`",
-            f"- **2B PCA Açıklanan Varyans Oranı:** `{cl.get('pca_explained_variance_ratio', [])}`",
-            "",
-            "| Küme ID | Taktik Rol (Türkçe) | Oyuncu Sayısı | Oyuncu ID'leri | Ort. Hız | Ort. Top Kontrol % |",
-            "|---:|---|---:|---|---:|---:|",
         ])
-        for cs in cl.get("cluster_summaries") or []:
-            lines.append(
-                f"| {cs.get('cluster_id', 0)} | {cs.get('tactical_role_tr', '')} | {cs.get('player_count', 0)} | "
-                f"{', '.join(str(tid) for tid in (cs.get('track_ids') or []))} | {float(cs.get('mean_speed', 0.0)):.2f} | %{float(cs.get('mean_ball_control_pct', 0.0)):.2f} |"
-            )
+        if cl.get("status") == "requires_calibration":
+            lines.append("- **Durum:** Hesaplanamadı – saha kalibrasyonu gerekli")
+        else:
+            excluded_tracks = cl.get("excluded_tracks") or []
+            excluded_count = cl.get("excluded_tracks_count", len(excluded_tracks))
+            lines.extend([
+                f"- **Uygun Oyuncu Sayısı:** {cl.get('eligible_players', 0)} (Hariç tutulan iz: {excluded_count})",
+                f"- **Optimal Küme Sayısı (k):** `{cl.get('optimal_k')}` (En iyi Silhouette skoru: `{cl.get('best_silhouette')}`)",
+                f"- **Aday k Silhouette Skorları:** `{cl.get('candidate_k_scores', {})}`",
+                f"- **2B PCA Açıklanan Varyans Oranı:** `{cl.get('pca_explained_variance_ratio', [])}`",
+                "",
+                "| Küme ID | Taktik Rol (Türkçe) | Oyuncu Sayısı | Oyuncu ID'leri | Ort. Hız | Ort. Top Kontrol % |",
+                "|---:|---|---:|---|---:|---:|",
+            ])
+            for cs in cl.get("cluster_summaries") or []:
+                lines.append(
+                    f"| {cs.get('cluster_id', 0)} | {cs.get('tactical_role_tr', '')} | {cs.get('player_count', 0)} | "
+                    f"{', '.join(str(tid) for tid in (cs.get('track_ids') or []))} | {float(cs.get('mean_speed', 0.0)):.2f} | %{float(cs.get('mean_ball_control_pct', 0.0)):.2f} |"
+                )
 
         lines.extend([
             "",
             "## 5. Tempo Düşüşü, Yorgunluk Eğilimi ve Anomali Tespiti",
             "",
-            f"- **Pencere Süresi / Sayısı:** {tp.get('window_sec', 0.0)} sn | Toplam={tp.get('total_windows', 0)}, Kapsanan={tp.get('covered_windows', 0)}, Düşük Kapsam={tp.get('low_coverage_windows', 0)}",
-            f"- **Bayraklanan Tempo Düşüşü / Yorgunluk:** {tp.get('tempo_drop_count', 0)} tempo düşüşü, {tp.get('fatigue_players_count', 0)} yorgunluk eğilimli oyuncu",
-            f"- **Toplam Anomali / Uyarı Kaydı:** {tp.get('total_anomalies', 0)} (`{tp.get('anomaly_counts_by_type', {})}`)",
+        ])
+        if tp.get("status") == "requires_calibration":
+            lines.append("- **Durum:** Hesaplanamadı – saha kalibrasyonu gerekli")
+        else:
+            lines.extend([
+                f"- **Pencere Süresi / Sayısı:** {tp.get('window_sec', 0.0)} sn | Toplam={tp.get('total_windows', 0)}, Kapsanan={tp.get('covered_windows', 0)}, Düşük Kapsam={tp.get('low_coverage_windows', 0)}",
+                f"- **Bayraklanan Tempo Düşüşü / Yorgunluk:** {tp.get('tempo_drop_count', 0)} tempo düşüşü, {tp.get('fatigue_players_count', 0)} yorgunluk eğilimli oyuncu",
+                f"- **Toplam Anomali / Uyarı Kaydı:** {tp.get('total_anomalies', 0)} (`{tp.get('anomaly_counts_by_type', {})}`)",
+            ])
+        lines.extend([
             "",
             "## 6. Üretilen Çıktı Dosyaları",
             "",
@@ -4574,6 +4642,7 @@ class MLAnalyzer:
         self,
         output_dir: Optional[str] = None,
         generate_plots: bool = True,
+        suppress_calibration_notice: bool = False,
     ) -> Dict[str, Any]:
         """
         Tüm ML analizlerini çalıştırır; CSV tablolarını, PNG grafikleri,
@@ -4592,24 +4661,32 @@ class MLAnalyzer:
         xt_res = results["xt_analysis"]
         xt_res.pop("_scored_xt_eval_df", None)
         xt_res.pop("_scored_xt_model_df", None)
+        cl_res = results["player_clustering"]
+        tp_res = results["tempo_and_anomalies"]
 
         profiles_df: pd.DataFrame = artifacts["player_profiles_df"]
         windows_df: pd.DataFrame = artifacts["tempo_windows_df"]
         anomalies_df: pd.DataFrame = artifacts["anomalies_df"]
         pass_pred_df: pd.DataFrame = artifacts["pass_predictions_df"]
 
-        profiles_csv = os.path.join(out_dir, config.EXPORT_ML_PLAYER_PROFILES_FILENAME)
-        windows_csv = os.path.join(out_dir, config.EXPORT_ML_TEMPO_WINDOWS_FILENAME)
-        anomalies_csv = os.path.join(out_dir, config.EXPORT_ML_ANOMALIES_FILENAME)
+        export_paths: Dict[str, Any] = {}
+        if cl_res.get("status", "ok") == "ok":
+            profiles_csv = os.path.join(out_dir, config.EXPORT_ML_PLAYER_PROFILES_FILENAME)
+            profiles_df.to_csv(profiles_csv, index=False)
+            export_paths["player_profiles_csv"] = profiles_csv
 
-        profiles_df.to_csv(profiles_csv, index=False)
-        windows_df.to_csv(windows_csv, index=False)
-        anomalies_df.to_csv(anomalies_csv, index=False)
+        if tp_res.get("status", "ok") == "ok":
+            windows_csv = os.path.join(out_dir, config.EXPORT_ML_TEMPO_WINDOWS_FILENAME)
+            anomalies_csv = os.path.join(out_dir, config.EXPORT_ML_ANOMALIES_FILENAME)
+            windows_df.to_csv(windows_csv, index=False)
+            anomalies_df.to_csv(anomalies_csv, index=False)
+            export_paths["tempo_windows_csv"] = windows_csv
+            export_paths["anomalies_csv"] = anomalies_csv
 
-        passes_csv: Optional[str] = None
         if xt_res.get("status", "ok") == "ok" and isinstance(pass_pred_df, pd.DataFrame):
             passes_csv = os.path.join(out_dir, config.EXPORT_ML_PASS_PREDICTIONS_FILENAME)
             pass_pred_df.to_csv(passes_csv, index=False)
+            export_paths["pass_predictions_csv"] = passes_csv
 
         plots: Dict[str, str] = {}
         if generate_plots:
@@ -4621,25 +4698,31 @@ class MLAnalyzer:
                 plots["xt_spatial_heatmap_png"] = self._plot_xt_heatmap(
                     xt_res, os.path.join(out_dir, "xt_spatial_heatmap.png")
                 )
-            plots["player_clusters_pca_png"] = self._plot_player_clusters_pca(
-                profiles_df, results["player_clustering"], os.path.join(out_dir, "player_clusters_pca.png")
-            )
-            plots["tempo_anomaly_timeline_png"] = self._plot_tempo_and_anomalies(
-                windows_df, anomalies_df, results["tempo_and_anomalies"], os.path.join(out_dir, "tempo_anomaly_timeline.png")
-            )
+            if cl_res.get("status", "ok") == "ok":
+                plots["player_clusters_pca_png"] = self._plot_player_clusters_pca(
+                    profiles_df, cl_res, os.path.join(out_dir, "player_clusters_pca.png")
+                )
+            if tp_res.get("status", "ok") == "ok":
+                plots["tempo_anomaly_timeline_png"] = self._plot_tempo_and_anomalies(
+                    windows_df, anomalies_df, tp_res, os.path.join(out_dir, "tempo_anomaly_timeline.png")
+                )
 
         report_md_path = os.path.join(out_dir, config.EXPORT_ML_REPORT_FILENAME)
         summary_json_path = os.path.join(out_dir, config.EXPORT_ML_SUMMARY_FILENAME)
 
-        export_paths: Dict[str, Any] = {
-            "player_profiles_csv": profiles_csv,
-            "tempo_windows_csv": windows_csv,
-            "anomalies_csv": anomalies_csv,
-            "pass_predictions_csv": passes_csv,
+        export_paths.update({
             "ml_report_md": report_md_path,
             "ml_summary_json": summary_json_path,
             **plots,
-        }
+        })
+
+        cal_notice = (
+            self._CALIBRATION_NOTICE_TR
+            if (not self.is_calibrated and not self.allow_pixel_fallback)
+            else None
+        )
+        if cal_notice:
+            results["calibration_notice"] = cal_notice
 
         md_text = self._build_turkish_markdown_report(results, export_paths)
         with open(report_md_path, "w", encoding="utf-8") as f:
@@ -4650,6 +4733,8 @@ class MLAnalyzer:
         with open(summary_json_path, "w", encoding="utf-8") as f:
             json.dump(clean_summary, f, indent=2, ensure_ascii=False, allow_nan=False)
 
+        if cal_notice and not suppress_calibration_notice:
+            print(f"[MLAnalyzer] {cal_notice}")
         if xp_res.get("synthetic_fallback_used") or xt_res.get("synthetic_fallback_used"):
             print(f"[MLAnalyzer] UYARI: {self._SYNTHETIC_WARNING_TR}")
         print(f"[MLAnalyzer] Taktik & Scouting ML raporu kaydedildi: {summary_json_path}")
@@ -4691,6 +4776,11 @@ def parse_args():
         action="store_true",
         help="Yeterli gerçek pas verisi olmadığında sentetik maç verisiyle xP/xT üretimine izin ver",
     )
+    parser.add_argument(
+        "--allow-pixel-fallback",
+        action="store_true",
+        help="Saha kalibrasyonu yokken ekran pikseli tabanlı konum metriklerine izin ver",
+    )
     return parser.parse_args()
 
 
@@ -4698,11 +4788,17 @@ if __name__ == "__main__":
     args = parse_args()
     if args.input.lower().endswith(".db"):
         ml_analyzer = MLAnalyzer.from_sql(
-            args.input, fps=args.fps, allow_synthetic=args.allow_synthetic
+            args.input,
+            fps=args.fps,
+            allow_synthetic=args.allow_synthetic,
+            allow_pixel_fallback=args.allow_pixel_fallback,
         )
     else:
         ml_analyzer = MLAnalyzer.from_csv(
-            args.input, fps=args.fps, allow_synthetic=args.allow_synthetic
+            args.input,
+            fps=args.fps,
+            allow_synthetic=args.allow_synthetic,
+            allow_pixel_fallback=args.allow_pixel_fallback,
         )
 
     summary = ml_analyzer.export_all(
@@ -4732,11 +4828,17 @@ if __name__ == "__main__":
         )
     else:
         print(f"\n[ML Özeti] Mod: {summary['coord_mode']} | xP Durum: {xp.get('status', 'skipped')}")
-    print(
-        f"[ML Özeti] Rol Kümeleme -> Uygun Oyuncu: {cl['eligible_players']} | "
-        f"Optimal k: {cl['optimal_k']} | Silhouette: {cl['best_silhouette']}"
-    )
-    print(
-        f"[ML Özeti] Tempo & Anomali -> Tempo Düşüşü: {tp['tempo_drop_count']} | "
-        f"Yorgunluk Eğilimi: {tp['fatigue_players_count']} | Toplam Anomali: {tp['total_anomalies']}"
-    )
+    if cl.get("status", "ok") == "ok":
+        print(
+            f"[ML Özeti] Rol Kümeleme -> Uygun Oyuncu: {cl['eligible_players']} | "
+            f"Optimal k: {cl['optimal_k']} | Silhouette: {cl['best_silhouette']}"
+        )
+    else:
+        print(f"[ML Özeti] Rol Kümeleme -> {cl.get('status', 'skipped')}")
+    if tp.get("status", "ok") == "ok":
+        print(
+            f"[ML Özeti] Tempo & Anomali -> Tempo Düşüşü: {tp['tempo_drop_count']} | "
+            f"Yorgunluk Eğilimi: {tp['fatigue_players_count']} | Toplam Anomali: {tp['total_anomalies']}"
+        )
+    else:
+        print(f"[ML Özeti] Tempo & Anomali -> {tp.get('status', 'skipped')}")

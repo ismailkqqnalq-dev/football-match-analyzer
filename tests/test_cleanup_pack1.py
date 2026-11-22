@@ -69,9 +69,23 @@ def test_t1_xp_returns_insufficient_data_below_30_real_events(tmp_path):
     assert xp["required"] == 30
     assert xp["models"] == []
 
-    # xT hiçbir gerçek pas olmayan boş DataFrame'de insufficient_data dönmeli
-    empty_ml = MLAnalyzer(pd.DataFrame(), fps=25.0, random_state=42)
-    xt_empty = empty_ml.compute_xt_analysis()
+    # xT hiçbir gerçek pas olmayan kalibre DataFrame'de insufficient_data dönmeli
+    no_pass_df = pd.DataFrame([
+        {
+            "frame_idx": 0, "timestamp_sec": 0.0,
+            "track_id": "ball", "class_name": "ball", "team": None, "is_predicted": False,
+            "bbox_x1": 500, "bbox_y1": 340, "bbox_x2": 510, "bbox_y2": 350,
+            "pixel_x": 505.0, "pixel_y": 345.0, "pitch_x": 50.0, "pitch_y": 34.0, "on_pitch": True,
+        },
+        {
+            "frame_idx": 0, "timestamp_sec": 0.0,
+            "track_id": 1, "class_name": "player", "team": "Team A", "is_predicted": False,
+            "bbox_x1": 490, "bbox_y1": 300, "bbox_x2": 520, "bbox_y2": 370,
+            "pixel_x": 505.0, "pixel_y": 340.0, "pitch_x": 50.0, "pitch_y": 34.0, "on_pitch": True,
+        },
+    ])
+    no_pass_ml = MLAnalyzer(no_pass_df, fps=25.0, random_state=42)
+    xt_empty = no_pass_ml.compute_xt_analysis()
     assert xt_empty["status"] == "insufficient_data"
 
     # export_all sahte grafik üretmemeli, raporda "Hesaplanamadı – yetersiz veri" yer almalı
@@ -162,3 +176,117 @@ def test_t1_allow_synthetic_true_runs_old_behavior_with_warning(tmp_path, capsys
     assert "SENTETİK VERİ – GERÇEK MAÇ SONUCU DEĞİLDİR" in stdout
     md_text = (out_dir / config.EXPORT_ML_REPORT_FILENAME).read_text(encoding="utf-8")
     assert "SENTETİK VERİ – GERÇEK MAÇ SONUCU DEĞİLDİR" in md_text
+
+
+# ----------------------------------------------------------------------
+# T2 KABUL TESTLERİ: Kalibrasyonsuz Modda Mekânsal Metriklerin Kapatılması
+# ----------------------------------------------------------------------
+def _make_uncalibrated_match_df() -> pd.DataFrame:
+    """pitch_x / pitch_y tamamen boş ama possession ve pas üretilebilen takip DataFrame'i."""
+    rows = []
+    for f in range(40):
+        ts = round(f / 25.0, 3)
+        if f < 6:
+            bx = 100.0
+        elif f < 29:
+            bx = 100.0 + ((f - 5) / 24.0) * 180.0  # ~7.5 px/frame = ~187 px/s (< max_pass_speed)
+        else:
+            bx = 280.0
+        rows.append({
+            "frame_idx": f, "timestamp_sec": ts,
+            "track_id": "ball", "class_name": "ball", "team": None, "is_predicted": False,
+            "bbox_x1": bx, "bbox_y1": 300.0, "bbox_x2": bx + 10.0, "bbox_y2": 310.0,
+            "pixel_x": bx, "pixel_y": 305.0, "pitch_x": np.nan, "pitch_y": np.nan, "on_pitch": np.nan,
+        })
+        rows.append({
+            "frame_idx": f, "timestamp_sec": ts,
+            "track_id": 1, "class_name": "player", "team": "Team A", "is_predicted": False,
+            "bbox_x1": 90.0, "bbox_y1": 280.0, "bbox_x2": 120.0, "bbox_y2": 350.0,
+            "pixel_x": 100.0, "pixel_y": 305.0, "pitch_x": np.nan, "pitch_y": np.nan, "on_pitch": np.nan,
+        })
+        rows.append({
+            "frame_idx": f, "timestamp_sec": ts,
+            "track_id": 2, "class_name": "player", "team": "Team A", "is_predicted": False,
+            "bbox_x1": 270.0, "bbox_y1": 280.0, "bbox_x2": 300.0, "bbox_y2": 350.0,
+            "pixel_x": 280.0, "pixel_y": 305.0, "pitch_x": np.nan, "pitch_y": np.nan, "on_pitch": np.nan,
+        })
+        rows.append({
+            "frame_idx": f, "timestamp_sec": ts,
+            "track_id": 3, "class_name": "player", "team": "Team B", "is_predicted": False,
+            "bbox_x1": 700.0, "bbox_y1": 280.0, "bbox_x2": 730.0, "bbox_y2": 350.0,
+            "pixel_x": 715.0, "pixel_y": 305.0, "pitch_x": np.nan, "pitch_y": np.nan, "on_pitch": np.nan,
+        })
+    return pd.DataFrame(rows)
+
+
+def test_t2_match_analyzer_uncalibrated_keeps_possession_and_passes_gates_spatial(tmp_path, capsys):
+    from modules.match_analytics import MatchAnalyzer
+
+    df = _make_uncalibrated_match_df()
+    ma = MatchAnalyzer(df, fps=25.0)
+    assert ma.is_calibrated is False
+
+    out_dir = tmp_path / "t2_ma"
+    summary = ma.export_all(output_dir=str(out_dir), generate_heatmaps=True)
+
+    assert summary["possession"]["controlled_frames"] > 0
+    assert summary["possession"]["team_a_pct"] > 0.0
+    assert summary["passes"]["total_completed_passes"] == 1
+    assert summary["passes"]["events"][0]["distance"] is None
+
+    assert summary["team_shape"] == {"status": "requires_calibration"}
+    assert summary["heatmaps"] == {"status": "requires_calibration"}
+    assert not (out_dir / "heatmaps").exists()
+    assert list(out_dir.rglob("*.png")) == []
+
+    stdout = capsys.readouterr().out
+    notice = "Saha kalibrasyonu olmadığı için konum tabanlı metrikler üretilmedi."
+    assert stdout.count(notice) == 1
+
+
+def test_t2_ml_analyzer_uncalibrated_returns_requires_calibration_no_plots(tmp_path, capsys):
+    df = _make_uncalibrated_match_df()
+    ml = MLAnalyzer(df, fps=25.0, random_state=42)
+    assert ml.is_calibrated is False
+
+    out_dir = tmp_path / "t2_ml"
+    summary = ml.export_all(output_dir=str(out_dir), generate_plots=True)
+
+    assert summary["xp_modeling"] == {"status": "requires_calibration"}
+    assert summary["xt_analysis"] == {"status": "requires_calibration"}
+    assert summary["player_clustering"] == {"status": "requires_calibration"}
+    assert summary["tempo_and_anomalies"] == {"status": "requires_calibration"}
+
+    assert list(out_dir.glob("*.png")) == []
+    assert not (out_dir / config.EXPORT_ML_PLAYER_PROFILES_FILENAME).exists()
+    assert not (out_dir / config.EXPORT_ML_TEMPO_WINDOWS_FILENAME).exists()
+    assert not (out_dir / config.EXPORT_ML_ANOMALIES_FILENAME).exists()
+    assert not (out_dir / config.EXPORT_ML_PASS_PREDICTIONS_FILENAME).exists()
+
+    notice = "Saha kalibrasyonu olmadığı için konum tabanlı metrikler üretilmedi."
+    stdout = capsys.readouterr().out
+    assert stdout.count(notice) == 1
+    md_text = (out_dir / config.EXPORT_ML_REPORT_FILENAME).read_text(encoding="utf-8")
+    assert md_text.count(notice) == 1
+
+
+def test_t2_calibrated_data_behavior_unchanged(tmp_path):
+    from modules.match_analytics import MatchAnalyzer
+
+    df = _make_few_proxy_passes_df(n_events=8)
+    ma = MatchAnalyzer(df, fps=25.0)
+    assert ma.is_calibrated is True
+    ma_out = tmp_path / "t2_cal_ma"
+    ma_sum = ma.export_all(output_dir=str(ma_out), generate_heatmaps=True)
+    assert ma_sum["team_shape"]["status"] == "ok"
+    assert isinstance(ma_sum["heatmaps"], dict) and "team_a" in ma_sum["heatmaps"]
+    assert len(list((ma_out / "heatmaps").glob("*.png"))) >= 2
+
+    ml = MLAnalyzer(df, fps=25.0, random_state=42)
+    assert ml.is_calibrated is True
+    ml_out = tmp_path / "t2_cal_ml"
+    ml_sum = ml.export_all(output_dir=str(ml_out), generate_plots=True)
+    assert ml_sum["player_clustering"]["status"] == "ok"
+    assert ml_sum["tempo_and_anomalies"]["status"] == "ok"
+    assert (ml_out / "player_clusters_pca.png").exists()
+    assert (ml_out / "tempo_anomaly_timeline.png").exists()
