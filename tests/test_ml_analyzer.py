@@ -445,7 +445,7 @@ def test_main_step8_integration_and_no_ml_flag(tmp_path, monkeypatch):
         def read_frames(self):
             return iter([])
 
-        def draw_detections(self, frame, dets):
+        def draw_detections(self, frame, dets, inplace=False):
             return frame
 
         def overlay_minimap(self, frame, mm):
@@ -458,7 +458,8 @@ def test_main_step8_integration_and_no_ml_flag(tmp_path, monkeypatch):
         device = "cpu"
 
     class DummyTracker:
-        pass
+        def __init__(self, *args, **kwargs):
+            pass
 
     class DummyTeamClassifier:
         def get_team_map(self):
@@ -468,7 +469,7 @@ def test_main_step8_integration_and_no_ml_flag(tmp_path, monkeypatch):
         is_calibrated = False
 
     class DummyExporter:
-        def __init__(self, fps=25.0):
+        def __init__(self, fps=25.0, **kwargs):
             self.fps = fps
 
         def postprocess(self, team_map=None):

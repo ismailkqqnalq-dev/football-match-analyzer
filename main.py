@@ -135,13 +135,10 @@ def main():
     )
 
     # --- Adım 3 için: Tracker'ları video döngüsünden ÖNCE bir kere oluştur ---
-    try:
-        player_tracker = PlayerTracker(
-            tracker_type=args.tracker,
-            embedding_stride=args.embedding_stride,
-        )
-    except TypeError:
-        player_tracker = PlayerTracker()
+    player_tracker = PlayerTracker(
+        tracker_type=args.tracker,
+        embedding_stride=args.embedding_stride,
+    )
     ball_tracker = BallTracker()
 
     # --- Adım 4 için: TeamClassifier ---
@@ -160,16 +157,13 @@ def main():
     motion_tracker = CameraMotionTracker()
 
     with VideoProcessor(args.input, output_video_path) as vp:
-        try:
-            exporter = DataExporter(
-                fps=vp.fps,
-                output_dir=export_dir,
-                flush_interval=args.flush_interval,
-                enable_csv=enable_csv,
-                enable_sql=enable_sql,
-            )
-        except TypeError:
-            exporter = DataExporter(fps=vp.fps)
+        exporter = DataExporter(
+            fps=vp.fps,
+            output_dir=export_dir,
+            flush_interval=args.flush_interval,
+            enable_csv=enable_csv,
+            enable_sql=enable_sql,
+        )
 
         try:
             def process_frame(frame_idx, frame, raw_detections):
@@ -214,10 +208,7 @@ def main():
 
                 # 8) Çıktı videosu aktifse kare üzerine çiz ve yaz
                 if getattr(vp, "has_writer", output_video_path is not None):
-                    try:
-                        annotated_frame = vp.draw_detections(frame, all_tracked, inplace=True)
-                    except TypeError:
-                        annotated_frame = vp.draw_detections(frame, all_tracked)
+                    annotated_frame = vp.draw_detections(frame, all_tracked, inplace=True)
                     cv2.putText(
                         annotated_frame,
                         f"Frame: {frame_idx} | Oyuncu: {len(tracked_players)} | Top: {'Var' if tracked_ball else 'Yok'}",
