@@ -1,8 +1,10 @@
-FROM python:3.12-slim
+FROM pytorch/pytorch:2.5.1-cuda12.4-runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PYTHONIOENCODING=utf-8 \
+    TMPDIR=/app/data/jobs/_tmp \
     YOLO_CONFIG_DIR=/tmp/ultralytics_cfg
 
 # OpenCV çalışma zamanı için gerekli minimum sistem kütüphaneleri
@@ -18,7 +20,11 @@ RUN groupadd --gid 10001 analyzer \
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt
-RUN pip install --upgrade pip && pip install -r /app/requirements.txt
+# Taban imajdaki CUDA'lı torch/torchvision sürümlerini ezmeden kalan bağımlılıkları kur
+RUN grep -vE '^\s*(torch|torchvision)\s*==' /app/requirements.txt > /tmp/requirements-docker.txt \
+    && pip install --upgrade pip \
+    && pip install --no-cache-dir -r /tmp/requirements-docker.txt \
+    && rm -f /tmp/requirements-docker.txt
 
 COPY --chown=analyzer:analyzer api /app/api
 COPY --chown=analyzer:analyzer config /app/config
@@ -27,7 +33,7 @@ COPY --chown=analyzer:analyzer utils /app/utils
 COPY --chown=analyzer:analyzer main.py /app/main.py
 COPY --chown=analyzer:analyzer models /app/models
 
-RUN mkdir -p /app/data/jobs /app/data/exports && chown -R analyzer:analyzer /app/data
+RUN mkdir -p /app/data/jobs/_tmp /app/data/exports && chown -R analyzer:analyzer /app/data
 
 USER analyzer
 

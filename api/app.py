@@ -343,6 +343,9 @@ def create_app(
 ) -> FastAPI:
     """Güvenlik sertleştirmeli FastAPI uygulamasını yapılandırır ve döndürür."""
     resolved_jobs_dir = Path(jobs_dir if jobs_dir is not None else config.API_JOBS_DIR).resolve()
+    env_tmpdir = os.environ.get("TMPDIR")
+    if env_tmpdir:
+        Path(env_tmpdir).mkdir(parents=True, exist_ok=True)
     configured_api_key = api_key if api_key is not None else (os.environ.get("FOOTBALL_API_KEY") or None)
     configured_jwt_secret = (
         jwt_secret

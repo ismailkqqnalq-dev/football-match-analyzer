@@ -13,6 +13,8 @@ services:
       - FOOTBALL_MODEL_SHA256=${FOOTBALL_MODEL_SHA256:-}
       - FOOTBALL_ALLOWED_ORIGINS=${FOOTBALL_ALLOWED_ORIGINS:-http://localhost:3000}
       - FOOTBALL_JOBS_DIR=/app/data/jobs
+      - TMPDIR=/app/data/jobs/_tmp
+      - PYTHONIOENCODING=utf-8
       - YOLO_CONFIG_DIR=/tmp/ultralytics_cfg
     volumes:
       # Model ağırlıkları salt-okunur bağlanır; dışarıdan değiştirilemez
@@ -20,7 +22,14 @@ services:
       - ./data/jobs:/app/data/jobs:rw
     read_only: true
     tmpfs:
-      - /tmp:size=1G,noexec,nosuid
+      - /tmp:size=128M,noexec,nosuid
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     security_opt:
       - no-new-privileges:true
     cap_drop:
