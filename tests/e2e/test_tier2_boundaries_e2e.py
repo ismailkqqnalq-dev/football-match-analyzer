@@ -1,6 +1,7 @@
 """Tier 2 E2E Tests: Boundary values, error paths & corner cases across F1-F5."""
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -339,7 +340,7 @@ def test_t2_f3_ml_analyzer_empty_and_insufficient_events_strict_json(tmp_path):
     assert direct_empty_xp["status"] == "skipped_insufficient_events"
 
     res_empty = empty_ml.export_all(output_dir=str(tmp_path / "empty_ml"), generate_plots=False)
-    assert res_empty["xp_modeling"]["status"] in {"ok", "skipped_insufficient_events", "skipped_single_class"}
+    assert res_empty["xp_modeling"]["status"] in {"ok", "insufficient_data", "skipped_insufficient_events", "skipped_single_class"}
     raw = (tmp_path / "empty_ml" / config.EXPORT_ML_SUMMARY_FILENAME).read_text(encoding="utf-8")
     json.loads(raw, parse_constant=lambda c: (_ for _ in ()).throw(ValueError(f"NaN/Inf in JSON: {c}")))
 

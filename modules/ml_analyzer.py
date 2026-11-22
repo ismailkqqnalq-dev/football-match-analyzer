@@ -500,10 +500,12 @@ class _VectorizedSpikeAnomalies(Sequence):
 # ----------------------------------------------------------------------
 class MLAnalyzer:
     """
-    Futbol takip verisi ve kalibre edilmiş sentetik maç verisi üzerinde
-    xP (Pas Başarı Olasılığı), xT (Beklenen Tehdit), Oyuncu Rol Kümeleme
-    ve Tempo/Yorgunluk/Anomali Tespiti çalıştıran taktik ML motoru.
+    Futbol takip verisi (ve yalnızca açıkça istendiğinde kalibre edilmiş sentetik
+    maç verisi) üzerinde xP (Pas Başarı Olasılığı), xT (Beklenen Tehdit),
+    Oyuncu Rol Kümeleme ve Tempo/Yorgunluk/Anomali Tespiti çalıştıran taktik ML motoru.
     """
+
+    _SYNTHETIC_WARNING_TR = "SENTETİK VERİ – GERÇEK MAÇ SONUCU DEĞİLDİR"
 
     XP_NUMERIC_FEATURES = [
         "ball_player_dist",
@@ -533,11 +535,17 @@ class MLAnalyzer:
         analytics_summary: Optional[Dict[str, Any]] = None,
         random_state: int = config.ML_RANDOM_STATE,
         copy: bool = False,
+        allow_synthetic: Optional[bool] = None,
     ):
         self.df = df.copy() if (df is not None and copy) else (df if df is not None else pd.DataFrame())
         self.fps = float(fps) if fps and fps > 0 else self._infer_fps()
         self.analytics_summary = analytics_summary
         self.random_state = int(random_state)
+        self.allow_synthetic = bool(
+            getattr(config, "ML_ALLOW_SYNTHETIC_FALLBACK", False)
+            if allow_synthetic is None
+            else allow_synthetic
+        )
 
         self.has_pitch_players, self.has_pitch_ball, self.is_calibrated = self._detect_calibration()
         self.coord_mode = "pitch_meters" if self.is_calibrated else "pixel_fallback"
@@ -584,6 +592,7 @@ class MLAnalyzer:
         fps: Optional[float] = None,
         analytics_summary: Optional[Dict[str, Any]] = None,
         random_state: int = config.ML_RANDOM_STATE,
+        allow_synthetic: Optional[bool] = None,
     ) -> "MLAnalyzer":
         """CSV takip dosyasından sütun budamalı ve kompakt tipli MLAnalyzer örneği oluşturur."""
         if not os.path.exists(csv_path):
@@ -598,6 +607,7 @@ class MLAnalyzer:
                 analytics_summary=analytics_summary,
                 random_state=random_state,
                 copy=False,
+                allow_synthetic=allow_synthetic,
             )
         usecols = [c for c in header_cols if c in _STANDARD_TRACKING_COL_SET]
         usecols_arg = usecols if usecols else None
@@ -622,7 +632,14 @@ class MLAnalyzer:
         except (ValueError, TypeError):
             df = pd.read_csv(csv_path, usecols=usecols_arg)
         df = _compact_tracking_df(df)
-        return cls(df=df, fps=fps, analytics_summary=analytics_summary, random_state=random_state, copy=False)
+        return cls(
+            df=df,
+            fps=fps,
+            analytics_summary=analytics_summary,
+            random_state=random_state,
+            copy=False,
+            allow_synthetic=allow_synthetic,
+        )
 
     # ----------------------------------------------------------------
     @classmethod
@@ -633,6 +650,7 @@ class MLAnalyzer:
         fps: Optional[float] = None,
         analytics_summary: Optional[Dict[str, Any]] = None,
         random_state: int = config.ML_RANDOM_STATE,
+        allow_synthetic: Optional[bool] = None,
     ) -> "MLAnalyzer":
         """SQLite veritabanından parçalı (chunked) ve kompakt tipli MLAnalyzer örneği oluşturur."""
         if not os.path.exists(db_path):
@@ -674,7 +692,14 @@ class MLAnalyzer:
             ordered_cols = [c for c in chunks[0].columns if c in df.columns]
             df = df[ordered_cols]
 
-        return cls(df=df, fps=fps, analytics_summary=analytics_summary, random_state=random_state, copy=False)
+        return cls(
+            df=df,
+            fps=fps,
+            analytics_summary=analytics_summary,
+            random_state=random_state,
+            copy=False,
+            allow_synthetic=allow_synthetic,
+        )
 
     # ----------------------------------------------------------------
     def _infer_fps(self) -> float:
@@ -2204,15 +2229,40 @@ class MLAnalyzer:
 
         proxy_events = self.extract_proxy_pass_events()
         fallback_reason: Optional[str] = None
+        req_events = int(config.ML_MIN_SUPERVISED_EVENTS)
+
+        def _insufficient_xp_response(reason_text: str, real_count: int) -> Dict[str, Any]:
+            self.xp_models_ = {}
+            self.best_xp_model_name_ = None
+            self.best_xp_pipeline_ = None
+            return {
+                "status": "insufficient_data",
+                "reason": reason_text,
+                "real_events": int(real_count),
+                "required": req_events,
+                "data_source": "real_tracking_events",
+                "synthetic_fallback_used": False,
+                "scoring_unit_mode": "skipped",
+                "models": [],
+                "selected_model": None,
+                "proxy_events_count": int(len(proxy_events)),
+                "_scored_events_df": pd.DataFrame(),
+                "_proxy_scored_df": proxy_events.copy(),
+            }
 
         if events_df is not None:
             model_df = events_df.copy()
             data_source = "provided_events"
         else:
             valid_proxy = proxy_events.dropna(subset=["pass_outcome"]) if not proxy_events.empty else pd.DataFrame()
-            if len(valid_proxy) < config.ML_MIN_SUPERVISED_EVENTS:
+            if len(valid_proxy) < req_events:
+                if not self.allow_synthetic:
+                    return _insufficient_xp_response(
+                        f"Yeterli gerçek pas olayı yok ({len(valid_proxy)}/{req_events}).",
+                        len(valid_proxy),
+                    )
                 fallback_reason = (
-                    f"insufficient_real_events ({len(valid_proxy)} < {config.ML_MIN_SUPERVISED_EVENTS})"
+                    f"insufficient_real_events ({len(valid_proxy)} < {req_events})"
                 )
                 model_df = self.generate_synthetic_match_passes(
                     n_events=config.ML_SYNTHETIC_MATCH_EVENTS,
@@ -2220,6 +2270,11 @@ class MLAnalyzer:
                 )
                 data_source = "calibrated_synthetic_match"
             elif valid_proxy["pass_outcome"].nunique() < 2:
+                if not self.allow_synthetic:
+                    return _insufficient_xp_response(
+                        "Tek sınıflı gerçek pas olayı (en az 2 sınıf gerekli).",
+                        len(valid_proxy),
+                    )
                 fallback_reason = "single_class_real_events"
                 model_df = self.generate_synthetic_match_passes(
                     n_events=config.ML_SYNTHETIC_MATCH_EVENTS,
@@ -2350,6 +2405,13 @@ class MLAnalyzer:
         # Kronolojik bölünme SONRASI eğitim setinde tek sınıf veya yetersiz olay varsa güvenli işlem
         if n < 15 or len(np.unique(y_train_check)) < 2:
             if events_df is None and data_source == "real_tracking_events":
+                if not self.allow_synthetic:
+                    post_reason = (
+                        "Kronolojik bölünme sonrası eğitim setinde tek sınıf kaldı."
+                        if n >= 15
+                        else f"Temizlik sonrası yeterli gerçek pas olayı yok ({n}/{req_events})."
+                    )
+                    return _insufficient_xp_response(post_reason, n)
                 fallback_reason = (
                     "single_class_y_train_after_chronological_split"
                     if n >= 15
@@ -2612,10 +2674,12 @@ class MLAnalyzer:
         baseline_test = next(m["test"] for m in model_results if m["is_baseline"])
         best_test = best_entry["test"]
 
-        return {
+        is_syn_xp = data_source == "calibrated_synthetic_match"
+        xp_out = {
             "status": "ok",
             "fallback_reason": fallback_reason,
             "data_source": data_source,
+            "synthetic_fallback_used": is_syn_xp,
             "scoring_unit_mode": scoring_unit_mode,
             "bounds_source": bounds_source,
             "total_input_events": total_input_events,
@@ -2648,6 +2712,9 @@ class MLAnalyzer:
             "_scored_events_df": scored_events_df,
             "_proxy_scored_df": proxy_scored_df,
         }
+        if is_syn_xp:
+            xp_out["warning"] = self._SYNTHETIC_WARNING_TR
+        return xp_out
 
     # ----------------------------------------------------------------
     def _build_xt_grid(self, events_df: Optional[pd.DataFrame] = None) -> np.ndarray:
@@ -2744,27 +2811,64 @@ class MLAnalyzer:
             eval_source = "provided_events"
         elif xp_results is not None:
             proxy_df = xp_results.get("_proxy_scored_df")
+            scored_cand = xp_results.get("_scored_events_df", pd.DataFrame())
             if isinstance(proxy_df, pd.DataFrame) and not proxy_df.empty:
                 eval_df = proxy_df.copy()
                 eval_source = "real_tracking_proxy_events"
+            elif (
+                isinstance(scored_cand, pd.DataFrame)
+                and not scored_cand.empty
+                and (xp_results.get("data_source") != "calibrated_synthetic_match" or self.allow_synthetic)
+            ):
+                eval_df = scored_cand.copy()
+                eval_source = xp_results.get("data_source", "real_tracking_events")
+            elif self.allow_synthetic:
+                eval_df = self.generate_synthetic_match_passes(n_events=300, seed=self.random_state)
+                eval_source = "calibrated_synthetic_match"
             else:
-                eval_df = xp_results.get("_scored_events_df", pd.DataFrame()).copy()
-                eval_source = xp_results.get("data_source", "synthetic_events")
+                return {
+                    "status": "insufficient_data",
+                    "reason": "xT analizi için gerçek pas olayı bulunamadı.",
+                    "real_events": 0,
+                    "required": 1,
+                    "coord_mode": self.coord_mode,
+                    "eval_source": "none",
+                    "synthetic_fallback_used": False,
+                    "evaluated_events_count": 0,
+                    "xt_grid": [],
+                    "_scored_xt_eval_df": pd.DataFrame(),
+                    "_scored_xt_model_df": pd.DataFrame(),
+                }
         else:
             proxy_df = self.extract_proxy_pass_events()
             if not proxy_df.empty:
                 eval_df = proxy_df
                 eval_source = "real_tracking_proxy_events"
-            else:
+            elif self.allow_synthetic:
                 eval_df = self.generate_synthetic_match_passes(n_events=300, seed=self.random_state)
                 eval_source = "calibrated_synthetic_match"
+            else:
+                return {
+                    "status": "insufficient_data",
+                    "reason": "xT analizi için gerçek pas olayı bulunamadı.",
+                    "real_events": 0,
+                    "required": 1,
+                    "coord_mode": self.coord_mode,
+                    "eval_source": "none",
+                    "synthetic_fallback_used": False,
+                    "evaluated_events_count": 0,
+                    "xt_grid": [],
+                    "_scored_xt_eval_df": pd.DataFrame(),
+                    "_scored_xt_model_df": pd.DataFrame(),
+                }
 
         # Grid'i eğitilmiş/zengin olay setiyle kur (varsa model olayları)
-        grid_ref_df = (
+        scored_ref = (
             xp_results.get("_scored_events_df")
             if xp_results is not None and isinstance(xp_results.get("_scored_events_df"), pd.DataFrame)
-            else eval_df
+            else None
         )
+        grid_ref_df = scored_ref if (scored_ref is not None and not scored_ref.empty) else eval_df
         xt_grid = self._build_xt_grid(grid_ref_df)
 
         def _safe_norm_arr(df_in: pd.DataFrame, col: str) -> np.ndarray:
@@ -2895,9 +2999,12 @@ class MLAnalyzer:
             for h in halves
         ]
 
-        return {
+        is_syn_xt = eval_source == "calibrated_synthetic_match"
+        xt_out = {
+            "status": "ok",
             "coord_mode": self.coord_mode,
             "eval_source": eval_source,
+            "synthetic_fallback_used": is_syn_xt,
             "halves_detected": len(halves_summary),
             "attack_directions_by_half": halves_summary,
             "grid_shape": [rows, cols],
@@ -2912,6 +3019,9 @@ class MLAnalyzer:
             "_scored_xt_eval_df": scored_eval,
             "_scored_xt_model_df": scored_model,
         }
+        if is_syn_xt:
+            xt_out["warning"] = self._SYNTHETIC_WARNING_TR
+        return xt_out
 
     # ----------------------------------------------------------------
     def cluster_player_roles(
@@ -4290,11 +4400,18 @@ class MLAnalyzer:
             f"- **Koordinat Modu:** `{coord_mode}` (Kalibre: `{'Evet' if is_cal else 'Hayır'}`)",
             f"- **Toplam Kayıt / Kare:** {total_rows} satır / {unique_frames} kare ({duration_sec} sn @ {fps_val} fps)",
             "",
+        ]
+        if xp.get("synthetic_fallback_used") or xt.get("synthetic_fallback_used"):
+            lines.extend([
+                f"> **UYARI: {self._SYNTHETIC_WARNING_TR}**",
+                "",
+            ])
+        lines.extend([
             "## 1. Veri Kalitesi ve Eksik/NULL Denetimi",
             "",
             "| Sütun | Tip | Eksik Sayısı | Eksik % |",
             "|---|---|---:|---:|",
-        ]
+        ])
         for col, info in (dq.get("missing_by_column") or {}).items():
             lines.append(
                 f"| `{col}` | `{info.get('dtype', 'unknown')}` | {info.get('missing_count', 0)} | %{float(info.get('missing_pct', 0.0)):.2f} |"
@@ -4304,67 +4421,88 @@ class MLAnalyzer:
         for note in dq.get("handling_strategy") or []:
             lines.append(f"- {note}")
 
-        split_info = xp.get("split_info") or {}
-        xp_models = xp.get("models") or []
-        scoring_unit_mode = xp.get("scoring_unit_mode", "native")
-        fallback_reason = xp.get("fallback_reason")
         lines.extend([
             "",
             "## 2. Pas Başarı Olasılığı (xP) Modelleme ve Operasyonel Ödünleşimler",
             "",
-            f"- **Eğitim Veri Kaynağı:** `{xp.get('data_source', 'N/A')}` ({xp.get('modeled_events', 0)} olay, pozitif sınıf oranı: %{float(xp.get('positive_rate', 0.0)) * 100:.1f})",
-            f"- **Skorlama Birim Modu:** `{scoring_unit_mode}`"
-            + (" (piksel vekil olaylar `[0..105]x[0..68]` m orantılı saha ölçeğine izdüşürüldü)" if scoring_unit_mode == "normalized_pitch_projection_105x68" else ""),
-            f"- **Kronolojik Bölünme (Ön İşlemeden Önce):** Eğitim={split_info.get('train_count', 0)} | Doğrulama={split_info.get('validation_count', 0)} | Test={split_info.get('test_count', 0)} (Kronoloji doğrulandı: `{xp.get('chronological_split_verified', False)}`)",
-            f"- **Seçilen En İyi Model (Doğrulama Setine Göre):** **{xp.get('selected_model') or 'Yok'}**",
         ])
-        if fallback_reason:
-            lines.append(f"- **Yedek (Fallback) Nedeni:** `{fallback_reason}`")
-
-        if xp_models:
+        if xp.get("status") == "insufficient_data":
             lines.extend([
-                "",
-                "| Model | Test Accuracy | Test F1 | Test ROC-AUC | Test PR-AUC | Test Brier (Düşük İyi) | Aşırı Öğrenme (Train-Test AUC) | Gecikme (ms/1000 olay) |",
-                "|---|---:|---:|---:|---:|---:|---:|---:|",
+                "- **Durum:** Hesaplanamadı – yetersiz veri",
+                f"- **Gerçek / Gerekli Pas Olayı:** {xp.get('real_events', 0)}/{xp.get('required', config.ML_MIN_SUPERVISED_EVENTS)}",
+                f"- **Neden:** {xp.get('reason', 'Yeterli gerçek pas verisi bulunamadı.')}",
             ])
-            for m in xp_models:
-                tm = m.get("test") or {}
-                lines.append(
-                    f"| {m.get('model_name', 'Model')} | {float(tm.get('accuracy', 0.0)):.4f} | {float(tm.get('f1', 0.0)):.4f} | {float(tm.get('roc_auc', 0.5)):.4f} | "
-                    f"{float(tm.get('pr_auc', 0.0)):.4f} | {float(tm.get('brier_score', 0.0)):.4f} | {float(m.get('overfitting_auc_gap', 0.0)):+.4f} | {float(m.get('latency_per_1000_events_ms', 0.0)):.2f} |"
-                )
+        else:
+            split_info = xp.get("split_info") or {}
+            xp_models = xp.get("models") or []
+            scoring_unit_mode = xp.get("scoring_unit_mode", "native")
+            fallback_reason = xp.get("fallback_reason")
+            if xp.get("synthetic_fallback_used"):
+                lines.append(f"- **UYARI:** {self._SYNTHETIC_WARNING_TR}")
+            lines.extend([
+                f"- **Eğitim Veri Kaynağı:** `{xp.get('data_source', 'N/A')}` ({xp.get('modeled_events', 0)} olay, pozitif sınıf oranı: %{float(xp.get('positive_rate', 0.0)) * 100:.1f})",
+                f"- **Skorlama Birim Modu:** `{scoring_unit_mode}`"
+                + (" (piksel vekil olaylar `[0..105]x[0..68]` m orantılı saha ölçeğine izdüşürüldü)" if scoring_unit_mode == "normalized_pitch_projection_105x68" else ""),
+                f"- **Kronolojik Bölünme (Ön İşlemeden Önce):** Eğitim={split_info.get('train_count', 0)} | Doğrulama={split_info.get('validation_count', 0)} | Test={split_info.get('test_count', 0)} (Kronoloji doğrulandı: `{xp.get('chronological_split_verified', False)}`)",
+                f"- **Seçilen En İyi Model (Doğrulama Setine Göre):** **{xp.get('selected_model') or 'Yok'}**",
+            ])
+            if fallback_reason:
+                lines.append(f"- **Yedek (Fallback) Nedeni:** `{fallback_reason}`")
 
-            lines.extend(["", "### Karmaşıklık Matrisleri (Test Seti) ve Operasyonel Ödünleşimler"])
-            for m in xp_models:
-                cm = (m.get("test") or {}).get("confusion_matrix", [])
-                lines.append(f"- **{m.get('model_name', 'Model')}**: CM=`{cm}` — {m.get('operational_tradeoff_tr', '')}")
+            if xp_models:
+                lines.extend([
+                    "",
+                    "| Model | Test Accuracy | Test F1 | Test ROC-AUC | Test PR-AUC | Test Brier (Düşük İyi) | Aşırı Öğrenme (Train-Test AUC) | Gecikme (ms/1000 olay) |",
+                    "|---|---:|---:|---:|---:|---:|---:|---:|",
+                ])
+                for m in xp_models:
+                    tm = m.get("test") or {}
+                    lines.append(
+                        f"| {m.get('model_name', 'Model')} | {float(tm.get('accuracy', 0.0)):.4f} | {float(tm.get('f1', 0.0)):.4f} | {float(tm.get('roc_auc', 0.5)):.4f} | "
+                        f"{float(tm.get('pr_auc', 0.0)):.4f} | {float(tm.get('brier_score', 0.0)):.4f} | {float(m.get('overfitting_auc_gap', 0.0)):+.4f} | {float(m.get('latency_per_1000_events_ms', 0.0)):.2f} |"
+                    )
 
-        grid_shape = xt.get("grid_shape") or [int(config.ML_XT_GRID_ROWS), int(config.ML_XT_GRID_COLS)]
-        g_rows = grid_shape[0] if len(grid_shape) >= 1 else int(config.ML_XT_GRID_ROWS)
-        g_cols = grid_shape[1] if len(grid_shape) >= 2 else int(config.ML_XT_GRID_COLS)
+                lines.extend(["", "### Karmaşıklık Matrisleri (Test Seti) ve Operasyonel Ödünleşimler"])
+                for m in xp_models:
+                    cm = (m.get("test") or {}).get("confusion_matrix", [])
+                    lines.append(f"- **{m.get('model_name', 'Model')}**: CM=`{cm}` — {m.get('operational_tradeoff_tr', '')}")
+
         lines.extend([
             "",
             "## 3. Mekansal Beklenen Tehdit (xT) Analizi",
             "",
-            f"- **Değerlendirilen Kaynak:** `{xt.get('eval_source', 'N/A')}` ({xt.get('evaluated_events_count', 0)} olay)",
-            f"- **Izgara Boyutu & Aralık:** {g_rows}x{g_cols}, `xT` aralığı: `[{float(xt.get('min_xt', 0.0)):.4f}, {float(xt.get('max_xt', 0.0)):.4f}]`",
-            f"- **Ortalama `delta_xT` / `expected_xT`:** `{float(xt.get('mean_delta_xT', 0.0)):.4f}` / `{float(xt.get('mean_expected_xT', 0.0)):.4f}`",
         ])
-        halves_list = xt.get("attack_directions_by_half") or []
-        if halves_list:
-            lines.append(f"- **Tespit Edilen Devre Sayısı:** {xt.get('halves_detected', len(halves_list))}")
-            for hinfo in halves_list:
-                ad_map = hinfo.get("attack_directions") or {}
-                ta_dir_tr = "Soldan Sağa (+x)" if ad_map.get("Team A") == "+x" else "Sağdan Sola (-x)"
-                tb_dir_tr = "Soldan Sağa (+x)" if ad_map.get("Team B") == "+x" else "Sağdan Sola (-x)"
+        if xt.get("status") == "insufficient_data":
+            lines.extend([
+                "- **Durum:** Hesaplanamadı – yetersiz veri",
+                f"- **Neden:** {xt.get('reason', 'Yeterli gerçek pas verisi bulunamadı.')}",
+            ])
+        else:
+            if xt.get("synthetic_fallback_used"):
+                lines.append(f"- **UYARI:** {self._SYNTHETIC_WARNING_TR}")
+            grid_shape = xt.get("grid_shape") or [int(config.ML_XT_GRID_ROWS), int(config.ML_XT_GRID_COLS)]
+            g_rows = grid_shape[0] if len(grid_shape) >= 1 else int(config.ML_XT_GRID_ROWS)
+            g_cols = grid_shape[1] if len(grid_shape) >= 2 else int(config.ML_XT_GRID_COLS)
+            lines.extend([
+                f"- **Değerlendirilen Kaynak:** `{xt.get('eval_source', 'N/A')}` ({xt.get('evaluated_events_count', 0)} olay)",
+                f"- **Izgara Boyutu & Aralık:** {g_rows}x{g_cols}, `xT` aralığı: `[{float(xt.get('min_xt', 0.0)):.4f}, {float(xt.get('max_xt', 0.0)):.4f}]`",
+                f"- **Ortalama `delta_xT` / `expected_xT`:** `{float(xt.get('mean_delta_xT', 0.0)):.4f}` / `{float(xt.get('mean_expected_xT', 0.0)):.4f}`",
+            ])
+            halves_list = xt.get("attack_directions_by_half") or []
+            if halves_list:
+                lines.append(f"- **Tespit Edilen Devre Sayısı:** {xt.get('halves_detected', len(halves_list))}")
+                for hinfo in halves_list:
+                    ad_map = hinfo.get("attack_directions") or {}
+                    ta_dir_tr = "Soldan Sağa (+x)" if ad_map.get("Team A") == "+x" else "Sağdan Sola (-x)"
+                    tb_dir_tr = "Soldan Sağa (+x)" if ad_map.get("Team B") == "+x" else "Sağdan Sola (-x)"
+                    lines.append(
+                        f"  - **{hinfo.get('period', 1)}. Yarı (Kare {hinfo.get('start_frame', 0)}..{hinfo.get('end_frame', 0)}):** "
+                        f"Team A → {ta_dir_tr} | Team B → {tb_dir_tr}"
+                    )
+            for tname, tinfo in (xt.get("team_xt_summary") or {}).items():
                 lines.append(
-                    f"  - **{hinfo.get('period', 1)}. Yarı (Kare {hinfo.get('start_frame', 0)}..{hinfo.get('end_frame', 0)}):** "
-                    f"Team A → {ta_dir_tr} | Team B → {tb_dir_tr}"
+                    f"- **{tname}:** {tinfo.get('events', 0)} olay | Toplam `delta_xT`={float(tinfo.get('total_delta_xT', 0.0)):.4f} | Toplam `expected_xT`={float(tinfo.get('total_expected_xT', 0.0)):.4f}"
                 )
-        for tname, tinfo in (xt.get("team_xt_summary") or {}).items():
-            lines.append(
-                f"- **{tname}:** {tinfo.get('events', 0)} olay | Toplam `delta_xT`={float(tinfo.get('total_delta_xT', 0.0)):.4f} | Toplam `expected_xT`={float(tinfo.get('total_expected_xT', 0.0)):.4f}"
-            )
 
         excluded_tracks = cl.get("excluded_tracks") or []
         excluded_count = cl.get("excluded_tracks_count", len(excluded_tracks))
@@ -4463,21 +4601,26 @@ class MLAnalyzer:
         profiles_csv = os.path.join(out_dir, config.EXPORT_ML_PLAYER_PROFILES_FILENAME)
         windows_csv = os.path.join(out_dir, config.EXPORT_ML_TEMPO_WINDOWS_FILENAME)
         anomalies_csv = os.path.join(out_dir, config.EXPORT_ML_ANOMALIES_FILENAME)
-        passes_csv = os.path.join(out_dir, config.EXPORT_ML_PASS_PREDICTIONS_FILENAME)
 
         profiles_df.to_csv(profiles_csv, index=False)
         windows_df.to_csv(windows_csv, index=False)
         anomalies_df.to_csv(anomalies_csv, index=False)
-        pass_pred_df.to_csv(passes_csv, index=False)
+
+        passes_csv: Optional[str] = None
+        if xt_res.get("status", "ok") == "ok" and isinstance(pass_pred_df, pd.DataFrame):
+            passes_csv = os.path.join(out_dir, config.EXPORT_ML_PASS_PREDICTIONS_FILENAME)
+            pass_pred_df.to_csv(passes_csv, index=False)
 
         plots: Dict[str, str] = {}
         if generate_plots:
-            plots["xp_model_comparison_png"] = self._plot_xp_comparison(
-                xp_res, os.path.join(out_dir, "xp_model_comparison.png")
-            )
-            plots["xt_spatial_heatmap_png"] = self._plot_xt_heatmap(
-                xt_res, os.path.join(out_dir, "xt_spatial_heatmap.png")
-            )
+            if xp_res.get("status") == "ok" and xp_res.get("models"):
+                plots["xp_model_comparison_png"] = self._plot_xp_comparison(
+                    xp_res, os.path.join(out_dir, "xp_model_comparison.png")
+                )
+            if xt_res.get("status", "ok") == "ok" and xt_res.get("xt_grid"):
+                plots["xt_spatial_heatmap_png"] = self._plot_xt_heatmap(
+                    xt_res, os.path.join(out_dir, "xt_spatial_heatmap.png")
+                )
             plots["player_clusters_pca_png"] = self._plot_player_clusters_pca(
                 profiles_df, results["player_clustering"], os.path.join(out_dir, "player_clusters_pca.png")
             )
@@ -4507,6 +4650,8 @@ class MLAnalyzer:
         with open(summary_json_path, "w", encoding="utf-8") as f:
             json.dump(clean_summary, f, indent=2, ensure_ascii=False, allow_nan=False)
 
+        if xp_res.get("synthetic_fallback_used") or xt_res.get("synthetic_fallback_used"):
+            print(f"[MLAnalyzer] UYARI: {self._SYNTHETIC_WARNING_TR}")
         print(f"[MLAnalyzer] Taktik & Scouting ML raporu kaydedildi: {summary_json_path}")
         return clean_summary
 
@@ -4541,31 +4686,49 @@ def parse_args():
         action="store_true",
         help="PNG grafik üretimini atla",
     )
+    parser.add_argument(
+        "--allow-synthetic",
+        action="store_true",
+        help="Yeterli gerçek pas verisi olmadığında sentetik maç verisiyle xP/xT üretimine izin ver",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     if args.input.lower().endswith(".db"):
-        ml_analyzer = MLAnalyzer.from_sql(args.input, fps=args.fps)
+        ml_analyzer = MLAnalyzer.from_sql(
+            args.input, fps=args.fps, allow_synthetic=args.allow_synthetic
+        )
     else:
-        ml_analyzer = MLAnalyzer.from_csv(args.input, fps=args.fps)
+        ml_analyzer = MLAnalyzer.from_csv(
+            args.input, fps=args.fps, allow_synthetic=args.allow_synthetic
+        )
 
     summary = ml_analyzer.export_all(
         output_dir=args.output_dir,
         generate_plots=not args.no_plots,
     )
     xp = summary.get("xp_modeling", {})
+    xt = summary.get("xt_analysis", {})
     models_list = xp.get("models", [])
     best_m = next((m for m in models_list if m["model_name"] == xp.get("selected_model")), None)
     cl = summary.get("player_clustering", {})
     tp = summary.get("tempo_and_anomalies", {})
 
-    if best_m is not None:
+    if xp.get("synthetic_fallback_used") or xt.get("synthetic_fallback_used"):
+        print(f"\n[ML Özeti] UYARI: {MLAnalyzer._SYNTHETIC_WARNING_TR}")
+    if xp.get("status") == "ok" and best_m is not None:
         print(
             f"\n[ML Özeti] Mod: {summary['coord_mode']} | "
             f"xP Model ({xp.get('selected_model')}) -> ROC-AUC: {best_m['test']['roc_auc']} | "
             f"PR-AUC: {best_m['test']['pr_auc']} | Brier: {best_m['test']['brier_score']}"
+        )
+    elif xp.get("status") == "insufficient_data":
+        req_n = xp.get("required", config.ML_MIN_SUPERVISED_EVENTS)
+        print(
+            f"\n[ML Özeti] xP hesaplanamadı: yeterli gerçek pas yok "
+            f"({xp.get('real_events', 0)}/{req_n})"
         )
     else:
         print(f"\n[ML Özeti] Mod: {summary['coord_mode']} | xP Durum: {xp.get('status', 'skipped')}")

@@ -261,7 +261,7 @@ def test_xp_chronological_split_and_zero_data_leakage():
 # 3. MODEL KARŞILAŞTIRMASI, METRİKLER VE XT ANALİZİ
 # ----------------------------------------------------------------------
 def test_xp_model_comparison_beats_baseline_and_xt_grid():
-    analyzer = MLAnalyzer(pd.DataFrame(), fps=25.0, random_state=42)
+    analyzer = MLAnalyzer(pd.DataFrame(), fps=25.0, random_state=42, allow_synthetic=True)
     xp_res = analyzer.run_xp_modeling()
 
     assert xp_res["data_source"] == "calibrated_synthetic_match"
@@ -387,6 +387,7 @@ def test_real_tracking_data_cli_csv_and_sql_and_data_safety(tmp_path):
         check=True,
     )
     assert "[ML Özeti]" in res_csv.stdout
+    assert "xP hesaplanamadı" in res_csv.stdout
 
     expected_files = [
         config.EXPORT_ML_SUMMARY_FILENAME,
@@ -395,7 +396,6 @@ def test_real_tracking_data_cli_csv_and_sql_and_data_safety(tmp_path):
         config.EXPORT_ML_TEMPO_WINDOWS_FILENAME,
         config.EXPORT_ML_ANOMALIES_FILENAME,
         config.EXPORT_ML_PASS_PREDICTIONS_FILENAME,
-        "xp_model_comparison.png",
         "xt_spatial_heatmap.png",
         "player_clusters_pca.png",
         "tempo_anomaly_timeline.png",
@@ -404,13 +404,14 @@ def test_real_tracking_data_cli_csv_and_sql_and_data_safety(tmp_path):
         fpath = out_csv_dir / fname
         assert fpath.exists(), f"Eksik çıktı dosyası: {fname}"
         assert fpath.stat().st_size > 0
+    assert not (out_csv_dir / "xp_model_comparison.png").exists()
 
     with open(out_csv_dir / config.EXPORT_ML_SUMMARY_FILENAME, "r", encoding="utf-8") as f:
         summary_json = json.load(f)
     assert summary_json["coord_mode"] == "pixel_fallback"
     assert summary_json["player_clustering"]["eligible_players"] == 10
     assert summary_json["xt_analysis"]["evaluated_events_count"] >= 1
-    assert summary_json["xp_modeling"]["beats_naive_baseline"]["passed"] is True
+    assert summary_json["xp_modeling"]["status"] == "insufficient_data"
 
     # SQLite CLI + --no-plots doğrulaması
     out_db_dir = tmp_path / "cli_db_out"
@@ -511,12 +512,12 @@ def test_main_step8_integration_and_no_ml_flag(tmp_path, monkeypatch):
     main_module.main()
     assert not (tmp_path / "ml_reports" / config.EXPORT_ML_SUMMARY_FILENAME).exists()
 
-    # 2) Varsayılan modda Adım 8 çalışıp rapor ve grafik üretmeli
+    # 2) Varsayılan modda Adım 8 çalışıp rapor ve yeterli verisi olan grafikleri üretmeli (yetersiz xP için sahte PNG üretilmemeli)
     monkeypatch.setattr(sys, "argv", ["main.py", "--no-analytics"])
     main_module.main()
     assert (tmp_path / "ml_reports" / config.EXPORT_ML_SUMMARY_FILENAME).exists()
     assert (tmp_path / "ml_reports" / config.EXPORT_ML_REPORT_FILENAME).exists()
-    assert (tmp_path / "ml_reports" / "xp_model_comparison.png").exists()
+    assert not (tmp_path / "ml_reports" / "xp_model_comparison.png").exists()
 
 
 # ----------------------------------------------------------------------
@@ -657,7 +658,7 @@ def test_single_class_y_train_after_chronological_split(tmp_path):
             f_cursor += 1
         f_cursor += 105
 
-    auto_analyzer = MLAnalyzer(pd.DataFrame(rows), fps=25.0, random_state=42)
+    auto_analyzer = MLAnalyzer(pd.DataFrame(rows), fps=25.0, random_state=42, allow_synthetic=True)
     proxy_check = auto_analyzer.extract_proxy_pass_events()
     assert len(proxy_check) >= config.ML_MIN_SUPERVISED_EVENTS
     assert proxy_check["pass_outcome"].nunique() == 2
@@ -794,7 +795,7 @@ def test_tempo_drop_ignores_small_fluctuations_and_flags_real_drops():
 # ----------------------------------------------------------------------
 def test_uncalibrated_xp_pitch_projection_non_saturated():
     csv_path = os.path.join(config.EXPORT_DIR, config.EXPORT_CSV_FILENAME)
-    analyzer = MLAnalyzer.from_csv(csv_path)
+    analyzer = MLAnalyzer.from_csv(csv_path, allow_synthetic=True)
     res = analyzer.run_all()
     assert res["xp_modeling"]["scoring_unit_mode"] == "normalized_pitch_projection_105x68"
     pred_df = res["_artifacts"]["pass_predictions_df"]

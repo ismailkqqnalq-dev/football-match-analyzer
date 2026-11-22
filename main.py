@@ -300,14 +300,24 @@ def main():
                 ml_out_dir = os.path.join(export_dir, "ml_reports")
                 ml_analyzer = _load_ml_analyzer(analytics_summary)
                 ml_summary = ml_analyzer.export_all(output_dir=ml_out_dir)
-                xp = ml_summary["xp_modeling"]
-                best_m = next((m for m in xp["models"] if m["model_name"] == xp["selected_model"]), None)
-                cl = ml_summary["player_clustering"]
-                tp = ml_summary["tempo_and_anomalies"]
-                if best_m is not None:
+                xp = ml_summary.get("xp_modeling", {})
+                xt = ml_summary.get("xt_analysis", {})
+                if xp.get("synthetic_fallback_used") or xt.get("synthetic_fallback_used"):
+                    print(f"UYARI: {MLAnalyzer._SYNTHETIC_WARNING_TR}")
+                models_list = xp.get("models") or []
+                best_m = next((m for m in models_list if m["model_name"] == xp.get("selected_model")), None)
+                cl = ml_summary.get("player_clustering", {})
+                tp = ml_summary.get("tempo_and_anomalies", {})
+                if xp.get("status") == "ok" and best_m is not None:
                     print(
                         f"xP Model ({xp['selected_model']}) -> ROC-AUC: {best_m['test']['roc_auc']} | "
                         f"PR-AUC: {best_m['test']['pr_auc']} | Brier: {best_m['test']['brier_score']}"
+                    )
+                elif xp.get("status") == "insufficient_data":
+                    req_n = xp.get("required", config.ML_MIN_SUPERVISED_EVENTS)
+                    print(
+                        f"xP hesaplanamadı: yeterli gerçek pas yok "
+                        f"({xp.get('real_events', 0)}/{req_n})"
                     )
                 print(
                     f"Rol Kümeleme -> Oyuncu: {cl['eligible_players']} | "
