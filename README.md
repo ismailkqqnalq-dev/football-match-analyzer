@@ -1,5 +1,7 @@
 # Futbol Maç Analiz ve Oyuncu Takip Sistemi
 
+[![Tests](https://github.com/ismailkqqnalq-dev/football-match-analyzer/actions/workflows/tests.yml/badge.svg)](https://github.com/ismailkqqnalq-dev/football-match-analyzer/actions/workflows/tests.yml)
+
 Video → futbola özel 4 sınıflı YOLO ile oyuncu/kaleci/hakem/top tespiti →
 kalıcı takip (DeepSORT / ByteTrack) → takım sınıflandırma → TV yayını sahne
 kesmesi ve tekrar dönüşü telafili saha (metre) koordinatları → görsel çıktı +

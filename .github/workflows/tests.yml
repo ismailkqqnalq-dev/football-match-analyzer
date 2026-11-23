@@ -1,0 +1,43 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: "requirements.txt"
+
+      - name: Install system libraries for OpenCV
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
+      - name: Install CPU PyTorch and project dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cpu
+          grep -vE '^(torch|torchvision)==' requirements.txt > "${RUNNER_TEMP}/reqs-nocuda.txt"
+          pip install -r "${RUNNER_TEMP}/reqs-nocuda.txt" pytest
+
+      - name: Run pytest suite
+        env:
+          YOLO_CONFIG_DIR: ${{ runner.temp }}/ultralytics_cfg
+          PYTHONIOENCODING: utf-8
+        run: |
+          mkdir -p "${YOLO_CONFIG_DIR}"
+          python -m pytest -q -rs
