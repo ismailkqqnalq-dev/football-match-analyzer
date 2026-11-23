@@ -227,3 +227,10 @@ datasets/
 football-players-detection-*/
 *.onnx
 *.engine
+
+# Analiz calistirma ciktilari (tracking_data.csv ve tracking_data.db takipte kalir)
+data/exports/heatmaps/
+data/exports/ml_reports/
+data/exports/match_analytics_summary.json
+data/exports/possession_timeline.csv
+data/exports/player_distance_summary.csv

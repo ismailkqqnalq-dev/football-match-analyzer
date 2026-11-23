@@ -4,8 +4,7 @@
 # ============================================================
 
 # --- Video işleme ---
-opencv-python==4.10.0.84        # Frame okuma, çizim, video yazma
-opencv-contrib-python==4.10.0.84 # Ekstra OpenCV modülleri (bazı homografi/çizim yardımcıları için)
+opencv-contrib-python==4.10.0.84 # Frame okuma, çizim, video yazma ve ekstra OpenCV modülleri
 
 # --- Nesne Tespiti (YOLO) ---
 ultralytics==8.3.28             # YOLOv8 / YOLOv11 modelleri
