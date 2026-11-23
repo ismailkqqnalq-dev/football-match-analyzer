@@ -66,6 +66,9 @@ class TeamClassifier:
         refresh_interval: int = getattr(config, "TEAM_CLASSIFIER_LOCK_REFRESH_INTERVAL", 5),
         vote_window: int = getattr(config, "TEAM_CLASSIFIER_VOTE_WINDOW", 7),
         max_refits: int = getattr(config, "TEAM_CLASSIFIER_MAX_REFITS", 3),
+        gk_lock_min_votes: int = getattr(config, "TEAM_CLASSIFIER_GK_LOCK_MIN_VOTES", 25),
+        gk_lock_min_agreement: float = getattr(config, "TEAM_CLASSIFIER_GK_LOCK_MIN_AGREEMENT", 0.8),
+        gk_vote_window: int = getattr(config, "TEAM_CLASSIFIER_GK_VOTE_WINDOW", 40),
     ):
         self.n_clusters = n_clusters
         self.min_unique_tracks = min_unique_tracks
@@ -75,6 +78,9 @@ class TeamClassifier:
         self.refresh_interval = max(1, int(refresh_interval))
         self.vote_window = max(3, int(vote_window))
         self.max_refits = max(0, int(max_refits))
+        self.gk_lock_min_votes = max(1, int(gk_lock_min_votes))
+        self.gk_lock_min_agreement = float(gk_lock_min_agreement)
+        self.gk_vote_window = max(self.gk_lock_min_votes, int(gk_vote_window))
 
         # Kilitlenmemiş izler için geçici ön-örnek tamponu (kilitlenince pop edilir!)
         self.color_history: Dict[int, List[np.ndarray]] = defaultdict(list)
@@ -660,7 +666,6 @@ class TeamClassifier:
 
         # Takım savunma/saha içi yatay konum EMA'larını güncelle ve kalecileri çoğunluk oyuyla kilitle
         self._update_team_spatial_ema(outfield_dets)
-        min_gk_agree = float(getattr(config, "TEAM_CLASSIFIER_VOTE_MIN_AGREEMENT", 0.6))
         for det in gk_dets:
             tid = det.get("track_id")
             if tid is not None and tid in self._locked_gk_tracks and tid in self.team_assignment:
@@ -675,16 +680,15 @@ class TeamClassifier:
             if matched in ("Team A", "Team B"):
                 votes = self._gk_vote_history.get(tid)
                 if votes is None:
-                    votes = deque(maxlen=self.vote_window)
+                    votes = deque(maxlen=self.gk_vote_window)
                     self._gk_vote_history[tid] = votes
                 votes.append(matched)
 
-                if len(votes) >= self.min_samples_for_lock:
+                if len(votes) >= self.gk_lock_min_votes:
                     top_label, top_cnt = Counter(votes).most_common(1)[0]
                     if (
                         top_label in ("Team A", "Team B")
-                        and (top_cnt / len(votes)) >= min_gk_agree
-                        and top_cnt >= self.min_samples_for_lock
+                        and (top_cnt / len(votes)) >= self.gk_lock_min_agreement
                     ):
                         self.team_assignment[tid] = top_label
                         self._locked_gk_tracks.add(tid)

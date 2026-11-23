@@ -96,7 +96,7 @@ def test_r1_goalkeeper_matched_by_defensive_block_and_preserves_class_name(monke
 
     frame = _make_pitch_frame(specs)
     clf = TeamClassifier(n_clusters=2, min_unique_tracks=10, min_samples_for_lock=2)
-    for _ in range(2):
+    for _ in range(int(config.TEAM_CLASSIFIER_GK_LOCK_MIN_VOTES)):
         dets = [
             {"track_id": s["track_id"], "class_name": s["class_name"], "bbox": s["bbox"], "team": None}
             for s in specs
@@ -155,9 +155,9 @@ def test_r1_goalkeeper_follows_halftime_side_swap(monkeypatch):
 
     clf = TeamClassifier(n_clusters=2, min_unique_tracks=10, min_samples_for_lock=2)
 
-    # 1. Yarı: 20 kare
+    # 1. Yarı: kaleci kilidi eşiği kadar kare (25 oy)
     specs1, frame1 = _build_half(a_on_left=True)
-    for _ in range(20):
+    for _ in range(int(config.TEAM_CLASSIFIER_GK_LOCK_MIN_VOTES)):
         dets1 = [{"track_id": s["track_id"], "class_name": s["class_name"], "bbox": s["bbox"], "team": None} for s in specs1]
         out1 = clf.assign_teams(dets1, frame1)
 

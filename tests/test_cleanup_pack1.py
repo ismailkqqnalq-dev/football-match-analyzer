@@ -326,8 +326,8 @@ def test_t4_goalkeeper_team_locks_after_majority_vote_under_noisy_x(monkeypatch)
     team_b_lbl = first_out[5]["team"]
     assert team_a_lbl != team_b_lbl
 
-    # Gürültülü dizi: ağırlıklı A tarafı (40, 910, 45, 50) -> A olarak kilitlenmeli
-    gk_xs = [40, 910, 45, 50]
+    # Gürültülü dizi: 22x A tarafı, 3x B tarafı, kalanı A tarafı (25+ oy, %80+ A uyumu) -> A olarak kilitlenmeli
+    gk_xs = [40] * 10 + [910] * 3 + [45] * 13
     assigned_seq = []
     for x in gk_xs:
         dets = [{"track_id": s["track_id"], "class_name": "player", "bbox": s["bbox"], "team": None} for s in outfield_specs]

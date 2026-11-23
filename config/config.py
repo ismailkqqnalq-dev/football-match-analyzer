@@ -248,9 +248,12 @@ TEAM_CLASSIFIER_VOTE_MIN_AGREEMENT = 0.6
 TEAM_CLASSIFIER_MAX_REFITS = 3
 TEAM_CLASSIFIER_MAX_TRACKED_VOTES = 2048
 TEAM_CLASSIFIER_MAX_FEATURE_BANK = 512
-# Kaleci -> takım mekânsal eşleştirmesi için minimum yatay ayrım (piksel) ve EMA katsayısı
+# Kaleci -> takım mekânsal eşleştirmesi ve kilitleme eşikleri
 TEAM_CLASSIFIER_GK_MIN_SEPARATION_PX = 40.0
 TEAM_CLASSIFIER_GK_X_EMA_ALPHA = 0.15
+TEAM_CLASSIFIER_GK_LOCK_MIN_VOTES = 25
+TEAM_CLASSIFIER_GK_LOCK_MIN_AGREEMENT = 0.8
+TEAM_CLASSIFIER_GK_VOTE_WINDOW = 40
 # Video bitiminde K-Means fit edilmeden önceki ilk karelerdeki None takım
 # etiketlerini sonradan öğrenilen track_id -> team eşlemesiyle doldur
 TEAM_CLASSIFIER_BACKFILL_TEAMS = True

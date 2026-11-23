@@ -268,3 +268,66 @@ def test_r7_draw_detections_distinguishes_predicted_and_real_boxes():
     bottom_pred = img_pred[180, 70:130].sum(axis=1) > 0
     assert int(bottom_real.sum()) == 60
     assert 0 < int(bottom_pred.sum()) < 60
+
+
+# ----------------------------------------------------------------------
+# R3 KABUL TESTLERİ: Kaleci Kilidi İçin Daha Güçlü Eşik (25 oy, %80 uyum, pencere 40)
+# ----------------------------------------------------------------------
+def test_r3_goalkeeper_lock_requires_25_votes_and_80_pct_agreement(monkeypatch):
+    from modules.team_classifier import TeamClassifier
+
+    monkeypatch.setattr(config, "USES_FINE_TUNED_FOOTBALL_MODEL", True)
+    assert config.TEAM_CLASSIFIER_GK_LOCK_MIN_VOTES == 25
+    assert config.TEAM_CLASSIFIER_GK_LOCK_MIN_AGREEMENT == pytest.approx(0.8)
+    assert config.TEAM_CLASSIFIER_GK_VOTE_WINDOW >= 25
+
+    frame = np.full((600, 1000, 3), (35, 140, 35), dtype=np.uint8)
+
+    def _paint(x1, y1, x2, y2, bgr):
+        bw, bh = x2 - x1, y2 - y1
+        frame[y1 + int(bh * 0.18):y1 + int(bh * 0.52), x1 + int(bw * 0.25):x1 + int(bw * 0.75)] = bgr
+
+    outfield_specs = []
+    for i in range(5):
+        bx1, by1, bx2, by2 = 140 + i * 45, 120, 180 + i * 45, 250
+        _paint(bx1, by1, bx2, by2, (30, 30, 210))
+        outfield_specs.append({"track_id": i + 1, "class_name": "player", "bbox": [bx1, by1, bx2, by2]})
+    for i in range(5):
+        bx1, by1, bx2, by2 = 600 + i * 45, 320, 640 + i * 45, 450
+        _paint(bx1, by1, bx2, by2, (210, 40, 30))
+        outfield_specs.append({"track_id": i + 6, "class_name": "player", "bbox": [bx1, by1, bx2, by2]})
+    _paint(40, 220, 85, 350, (40, 210, 40))
+
+    # 1) 24 tutarlı oy -> kilit yok; 25. oyda kilit var
+    clf = TeamClassifier(n_clusters=2, min_unique_tracks=10, min_samples_for_lock=3, vote_window=7)
+    init_dets = [{"track_id": s["track_id"], "class_name": "player", "bbox": s["bbox"], "team": None} for s in outfield_specs]
+    first_out = clf.assign_teams(init_dets, frame)
+    team_a_lbl = first_out[0]["team"]
+
+    for _ in range(24):
+        dets = [{"track_id": s["track_id"], "class_name": "player", "bbox": s["bbox"], "team": None} for s in outfield_specs]
+        dets.append({"track_id": 201, "class_name": "goalkeeper", "bbox": [40, 220, 85, 350], "team": None})
+        out = clf.assign_teams(dets, frame)
+        gk_team = next(d["team"] for d in out if d["track_id"] == 201)
+        assert gk_team == "Goalkeeper"
+        assert 201 not in clf._locked_gk_tracks
+
+    dets25 = [{"track_id": s["track_id"], "class_name": "player", "bbox": s["bbox"], "team": None} for s in outfield_specs]
+    dets25.append({"track_id": 201, "class_name": "goalkeeper", "bbox": [40, 220, 85, 350], "team": None})
+    out25 = clf.assign_teams(dets25, frame)
+    assert next(d["team"] for d in out25 if d["track_id"] == 201) == team_a_lbl
+    assert 201 in clf._locked_gk_tracks
+
+    # 2) 30 oyun %70'i (21 A, 9 B) aynı takım -> %80 eşiğini geçemediği için kilit olmamalı
+    clf2 = TeamClassifier(n_clusters=2, min_unique_tracks=10, min_samples_for_lock=3, vote_window=7)
+    clf2.assign_teams(
+        [{"track_id": s["track_id"], "class_name": "player", "bbox": s["bbox"], "team": None} for s in outfield_specs],
+        frame,
+    )
+    seq_70pct = [40] * 16 + [910] * 9 + [40] * 5  # ilk 24 oy: 16A/8B; 25..30 arası en çok 21/30 (%70) A
+    for x in seq_70pct:
+        dets = [{"track_id": s["track_id"], "class_name": "player", "bbox": s["bbox"], "team": None} for s in outfield_specs]
+        dets.append({"track_id": 202, "class_name": "goalkeeper", "bbox": [x, 220, x + 45, 350], "team": None})
+        out_mix = clf2.assign_teams(dets, frame)
+        assert 202 not in clf2._locked_gk_tracks
+        assert next(d["team"] for d in out_mix if d["track_id"] == 202) == "Goalkeeper"
