@@ -505,12 +505,11 @@ def test_train_script_save_dir_resolution_and_train_kwargs(tmp_path, monkeypatch
             train_calls.append(kwargs)
             return SimpleNamespace()
 
-    import roboflow
     import ultralytics
 
     monkeypatch.setenv("ROBOFLOW_API_KEY", "DUMMY_TEST_KEY")
     monkeypatch.setattr(train_custom_yolo, "__file__", str(fake_script))
-    monkeypatch.setattr(roboflow, "Roboflow", FakeRoboflow)
+    monkeypatch.setitem(sys.modules, "roboflow", SimpleNamespace(Roboflow=FakeRoboflow))
     monkeypatch.setattr(ultralytics, "YOLO", FakeYOLO)
 
     train_custom_yolo.main(
