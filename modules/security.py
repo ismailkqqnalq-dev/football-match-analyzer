@@ -71,7 +71,7 @@ def resolve_safe_path(
         raise SecurityViolationError("Ağ (UNC) yollarına izin verilmiyor.")
 
     root_resolved = Path(allowed_root).resolve()
-    p = Path(raw)
+    p = Path(raw.replace("\\", "/") if os.name != "nt" else raw)
 
     # Göreceli yollar her zaman allowed_root altında değerlendirilir
     candidate = p if p.is_absolute() else (root_resolved / p)
