@@ -42,10 +42,12 @@ def download_model(
     expected_sha256: Optional[str] = None,
     overwrite: bool = False,
     timeout_sec: float = 120.0,
+    insecure_skip_sha256: bool = False,
 ) -> Path:
     """
     Model ağırlığını belirtilen URL'den indirir ve SHA-256 doğrulamasından
-    geçirdikten sonra hedef konuma atomik olarak taşır.
+    geçirdikten sonra hedef konuma atomik olarak taşır. SHA-256 zorunludur;
+    bilinçli atlama için `insecure_skip_sha256=True` gerekir.
     """
     resolved_url = (url if url is not None else getattr(config, "MODEL_DOWNLOAD_URL", "")).strip()
     if not resolved_url:
@@ -69,6 +71,20 @@ def download_model(
         if expected_sha256 is not None
         else (getattr(config, "SECURITY_MODEL_SHA256", None) or "")
     ).strip().lower()
+
+    if not sha_expected:
+        if not insecure_skip_sha256:
+            raise ValueError(
+                "SHA-256 sağlama toplamı tanımlı değil (`--sha256` verilmedi ve "
+                "`config.SECURITY_MODEL_SHA256` / `FOOTBALL_MODEL_SHA256` boş).\n"
+                "PyTorch .pt dosyaları yüklenirken keyfi kod çalıştırabildiğinden doğrulanmamış "
+                "indirme güvenlik riski taşır ve varsayılan olarak reddedilir.\n"
+                "Doğrulamayı bilerek atlamak istiyorsanız `--insecure-skip-sha256` bayrağını ekleyin."
+            )
+        print(
+            "[download_models] UYARI: --insecure-skip-sha256 ETKİN – SHA-256 DOĞRULAMASI ATLANDI! "
+            "DOĞRULANMAMIŞ .pt DOSYASI GÜVENLİK RİSKİ TAŞIR."
+        )
 
     if target_path.is_file() and not overwrite:
         if sha_expected:
@@ -139,6 +155,11 @@ def parse_args(argv: Optional[list] = None):
         action="store_true",
         help="Hedef dosya varsa üzerine yaz",
     )
+    parser.add_argument(
+        "--insecure-skip-sha256",
+        action="store_true",
+        help="UYARI: SHA-256 doğrulamasını bilinçli olarak atla (yalnızca güvenilir kaynaklar için)",
+    )
     return parser.parse_args(argv)
 
 
@@ -150,6 +171,7 @@ def main(argv: Optional[list] = None) -> int:
             output_path=Path(args.output),
             expected_sha256=args.sha256,
             overwrite=bool(args.overwrite),
+            insecure_skip_sha256=bool(args.insecure_skip_sha256),
         )
         return 0
     except (ValueError, urllib.error.URLError, OSError) as exc:
