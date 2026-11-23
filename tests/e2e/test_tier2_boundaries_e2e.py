@@ -34,7 +34,7 @@ import utils.train_custom_yolo as train_script  # noqa: E402
 
 from conftest import (  # noqa: E402
     BASELINE_CSV,
-    BASELINE_CSV_SHA256,
+    BASELINE_CSV_SHA256_SET,
     BASELINE_DB,
     BASELINE_DB_SHA256,
     BASELINE_ROW_COUNT,
@@ -557,7 +557,7 @@ def test_t2_f5_match_and_ml_cli_read_only_on_baseline_exports(tmp_path):
 
     assert (ma_out / config.EXPORT_ANALYTICS_SUMMARY_FILENAME).is_file()
     assert (ml_out / config.EXPORT_ML_SUMMARY_FILENAME).is_file()
-    assert sha256_file(BASELINE_CSV) == before_csv == BASELINE_CSV_SHA256
+    assert sha256_file(BASELINE_CSV) == before_csv and before_csv in BASELINE_CSV_SHA256_SET
     assert sha256_file(BASELINE_DB) == before_db == BASELINE_DB_SHA256
 
 

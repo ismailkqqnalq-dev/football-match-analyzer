@@ -40,4 +40,18 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           mkdir -p "${YOLO_CONFIG_DIR}"
-          python -m pytest -q -rs
+          set +e
+          python -m pytest -q -rs --junitxml="${RUNNER_TEMP}/pytest-results.xml"
+          rc=$?
+          if [ $rc -ne 0 ] && [ -f "${RUNNER_TEMP}/pytest-results.xml" ]; then
+            python -c '
+          import xml.etree.ElementTree as ET, os
+          root = ET.parse(os.environ["RUNNER_TEMP"] + "/pytest-results.xml").getroot()
+          for tc in root.iter("testcase"):
+              fail = tc.find("failure") or tc.find("error")
+              if fail is not None:
+                  msg = (fail.get("message") or fail.text or "")[:300].replace("\n", " ")
+                  print(f"::error title={tc.get(\"classname\")}.{tc.get(\"name\")}::{msg}")
+          '
+          fi
+          exit $rc

@@ -36,7 +36,7 @@ import utils.train_custom_yolo as train_script  # noqa: E402
 
 from conftest import (  # noqa: E402
     BASELINE_CSV,
-    BASELINE_CSV_SHA256,
+    BASELINE_CSV_SHA256_SET,
     BASELINE_DB,
     BASELINE_DB_SHA256,
     BASELINE_ROW_COUNT,
@@ -945,7 +945,7 @@ def test_f5_config_py_has_no_credentials():
 
 
 def test_f5_baseline_exports_sha256_and_row_counts_intact():
-    assert sha256_file(BASELINE_CSV) == BASELINE_CSV_SHA256
+    assert sha256_file(BASELINE_CSV) in BASELINE_CSV_SHA256_SET
     assert sha256_file(BASELINE_DB) == BASELINE_DB_SHA256
     df = pd.read_csv(BASELINE_CSV)
     assert len(df) == BASELINE_ROW_COUNT

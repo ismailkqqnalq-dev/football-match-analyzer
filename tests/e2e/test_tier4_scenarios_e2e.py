@@ -32,7 +32,8 @@ from modules.perspective_transformer import PerspectiveTransformer  # noqa: E402
 
 from conftest import (  # noqa: E402
     BASELINE_CSV,
-    BASELINE_CSV_SHA256,
+    BASELINE_CSV_SHA256_SET,
+    BASELINE_CSV_VALID_SIZES,
     BASELINE_DB,
     BASELINE_DB_SHA256,
     BASELINE_ROW_COUNT,
@@ -378,9 +379,9 @@ def test_t4_scenario5_secret_hygiene_and_baseline_immutability_audit():
     assert not violations, f"Secret hygiene violations found: {violations}"
 
     # 3) Baseline export immutability & row counts
-    assert sha256_file(BASELINE_CSV) == BASELINE_CSV_SHA256
+    assert sha256_file(BASELINE_CSV) in BASELINE_CSV_SHA256_SET
     assert sha256_file(BASELINE_DB) == BASELINE_DB_SHA256
-    assert BASELINE_CSV.stat().st_size == 441546
+    assert BASELINE_CSV.stat().st_size in BASELINE_CSV_VALID_SIZES
     assert BASELINE_DB.stat().st_size == 688128
     assert len(pd.read_csv(BASELINE_CSV)) == BASELINE_ROW_COUNT
     assert query_sqlite_count_readonly(BASELINE_DB) == BASELINE_ROW_COUNT

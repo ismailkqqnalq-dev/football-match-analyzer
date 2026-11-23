@@ -30,6 +30,9 @@ from config import config  # noqa: E402
 BASELINE_CSV = REPO_ROOT / "data" / "exports" / "tracking_data.csv"
 BASELINE_DB = REPO_ROOT / "data" / "exports" / "tracking_data.db"
 BASELINE_CSV_SHA256 = "723fc5754cf5c777c524b37e8d9083e0c5f35cb3d27b83244ddf8aa25dff2982"
+BASELINE_CSV_LF_SHA256 = "c0a7bb5761388959d182310877318cb5f7365af4c679cb566fbc794d998453c0"
+BASELINE_CSV_SHA256_SET = {BASELINE_CSV_SHA256, BASELINE_CSV_LF_SHA256}
+BASELINE_CSV_VALID_SIZES = {441546, 435503}
 BASELINE_DB_SHA256 = "1667a4b102fb13e12a04b5c785f1721b4ddc29392cd8f188a74f0432acd40672"
 BASELINE_ROW_COUNT = 6042
 
@@ -100,7 +103,7 @@ def baseline_data_immutability_guard():
     assert BASELINE_DB.is_file(), f"Missing baseline DB: {BASELINE_DB}"
     before_csv = sha256_file(BASELINE_CSV)
     before_db = sha256_file(BASELINE_DB)
-    assert before_csv == BASELINE_CSV_SHA256, (
+    assert before_csv in BASELINE_CSV_SHA256_SET, (
         f"Baseline CSV hash mismatch BEFORE E2E session: {before_csv}"
     )
     assert before_db == BASELINE_DB_SHA256, (
@@ -109,7 +112,7 @@ def baseline_data_immutability_guard():
     yield
     after_csv = sha256_file(BASELINE_CSV)
     after_db = sha256_file(BASELINE_DB)
-    assert after_csv == BASELINE_CSV_SHA256, (
+    assert after_csv == before_csv and after_csv in BASELINE_CSV_SHA256_SET, (
         f"Baseline CSV was MUTATED during E2E session! after={after_csv}"
     )
     assert after_db == BASELINE_DB_SHA256, (
