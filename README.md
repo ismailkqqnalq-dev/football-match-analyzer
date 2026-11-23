@@ -134,3 +134,13 @@ $env:FOOTBALL_JWT_SECRET = "EN_AZ_32_KARAKTERLIK_GIZLI_ANAHTAR"
 $env:YOLO_CONFIG_DIR = "$env:TEMP\ultralytics_cfg"
 uvicorn api.app:app --host 127.0.0.1 --port 8000 --workers 1
 ```
+
+Docker Compose ile başlatma:
+- **CPU modu (varsayılan, GPU gerektirmez):**
+  ```bash
+  docker compose up
+  ```
+- **GPU modu (ana makinede NVIDIA Container Toolkit gerekir):**
+  ```bash
+  docker compose -f docker-compose.yml -f docker-compose.gpu.yml up
+  ```
