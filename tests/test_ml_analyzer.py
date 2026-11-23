@@ -508,13 +508,16 @@ def test_main_step8_integration_and_no_ml_flag(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "EXPORT_ML_DIR", str(tmp_path / "ml_reports"))
     monkeypatch.setattr(config, "EXPORT_HEATMAP_DIR", str(tmp_path / "heatmaps"))
 
+    dummy_video = tmp_path / "dummy_input.mp4"
+    dummy_video.write_bytes(b"")
+
     # 1) --no-ml verildiğinde Adım 8 atlanmalı
-    monkeypatch.setattr(sys, "argv", ["main.py", "--no-analytics", "--no-ml"])
+    monkeypatch.setattr(sys, "argv", ["main.py", "--input", str(dummy_video), "--no-analytics", "--no-ml"])
     main_module.main()
     assert not (tmp_path / "ml_reports" / config.EXPORT_ML_SUMMARY_FILENAME).exists()
 
     # 2) Varsayılan modda Adım 8 çalışıp rapor ve yeterli verisi olan grafikleri üretmeli (yetersiz xP için sahte PNG üretilmemeli)
-    monkeypatch.setattr(sys, "argv", ["main.py", "--no-analytics"])
+    monkeypatch.setattr(sys, "argv", ["main.py", "--input", str(dummy_video), "--no-analytics"])
     main_module.main()
     assert (tmp_path / "ml_reports" / config.EXPORT_ML_SUMMARY_FILENAME).exists()
     assert (tmp_path / "ml_reports" / config.EXPORT_ML_REPORT_FILENAME).exists()

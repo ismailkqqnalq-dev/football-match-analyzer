@@ -154,7 +154,9 @@ def test_t1_main_cli_short_video_prints_insufficient_not_roc_auc(tmp_path, monke
     monkeypatch.setattr(main_module, "PerspectiveTransformer", DummyPerspective)
     monkeypatch.setattr(main_module, "CameraMotionTracker", DummyObj)
     monkeypatch.setattr(main_module, "DataExporter", DummyExporter)
-    monkeypatch.setattr(sys, "argv", ["main.py", "--no-video", "--no-analytics", "--export-dir", str(tmp_path)])
+    dummy_video = tmp_path / "dummy_short.mp4"
+    dummy_video.write_bytes(b"")
+    monkeypatch.setattr(sys, "argv", ["main.py", "--input", str(dummy_video), "--no-video", "--no-analytics", "--export-dir", str(tmp_path)])
 
     main_module.main()
     stdout = capsys.readouterr().out

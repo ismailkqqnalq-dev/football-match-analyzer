@@ -111,3 +111,41 @@ def test_r4_download_models_insecure_skip_sha256_warns_and_saves(tmp_path, monke
     out_txt = capsys.readouterr().out
     assert "UYARI" in out_txt
     assert "SHA-256" in out_txt
+
+
+# ----------------------------------------------------------------------
+# R5 KABUL TESTİ: Geçersiz Video Yolunda Model Yüklenmeden Erken Hata
+# ----------------------------------------------------------------------
+def test_r5_invalid_input_exits_before_loading_object_detector(tmp_path, monkeypatch, capsys):
+    import main as main_mod
+
+    missing_video = tmp_path / "does_not_exist.mp4"
+    export_dir = tmp_path / "should_not_create"
+    detector_calls = {"count": 0}
+
+    def _forbidden_detector(*args, **kwargs):
+        detector_calls["count"] += 1
+        raise AssertionError("Geçersiz video yolunda ObjectDetector başlatılmamalıydı!")
+
+    monkeypatch.setattr(main_mod, "ObjectDetector", _forbidden_detector)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "main.py",
+            "--input",
+            str(missing_video),
+            "--export-dir",
+            str(export_dir),
+            "--no-video",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        main_mod.main()
+
+    assert exc_info.value.code != 0
+    assert detector_calls["count"] == 0
+    assert not export_dir.exists()
+    err_txt = capsys.readouterr().err
+    assert "bulunamadı" in err_txt

@@ -111,6 +111,10 @@ def parse_args():
 def main():
     args = parse_args()
 
+    if not args.input or not os.path.isfile(args.input):
+        print(f"[HATA] Giriş video dosyası bulunamadı: {args.input}", file=sys.stderr)
+        sys.exit(1)
+
     export_dir = os.path.abspath(args.export_dir) if args.export_dir else os.path.abspath(config.EXPORT_DIR)
     os.makedirs(export_dir, exist_ok=True)
     output_video_path = None if args.no_video else args.output
