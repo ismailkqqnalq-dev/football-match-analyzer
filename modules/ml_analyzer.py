@@ -119,6 +119,63 @@ def _get_human_class_names() -> set:
     return set(getattr(config, "HUMAN_CLASS_NAMES", ())) | {"person"}
 
 
+def load_xt_grid(json_path: Optional[str] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Yayınlanmış 8x12 Beklenen Tehdit (xT) tablosunu JSON dosyasından yükler ve
+    boyut (8x12), sonlu sayısal tip ve negatif olmama kurallarını doğrular.
+    """
+    expected_rows = int(getattr(config, "ML_XT_GRID_ROWS", 8))
+    expected_cols = int(getattr(config, "ML_XT_GRID_COLS", 12))
+    path = json_path or getattr(
+        config,
+        "ML_XT_GRID_PATH",
+        os.path.join(config.BASE_DIR, "data", "reference", "xt_grid_karun_singh_12x8.json"),
+    )
+    if not path or not os.path.isfile(path):
+        raise FileNotFoundError(f"xT tablo dosyası bulunamadı: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if not isinstance(payload, dict) or "grid" not in payload:
+        raise ValueError(f"Geçersiz xT JSON yapısı ('grid' anahtarı eksik): {path}")
+
+    raw_grid = payload["grid"]
+    if not isinstance(raw_grid, list) or len(raw_grid) != expected_rows:
+        raise ValueError(
+            f"xT tablosu {expected_rows} satır olmalıdır (bulunan: {len(raw_grid) if isinstance(raw_grid, list) else type(raw_grid).__name__})."
+        )
+
+    validated = np.empty((expected_rows, expected_cols), dtype=np.float64)
+    for r_idx, row in enumerate(raw_grid):
+        if not isinstance(row, list) or len(row) != expected_cols:
+            raise ValueError(
+                f"xT tablosu satır {r_idx} uzunluğu {expected_cols} olmalıdır "
+                f"(bulunan: {len(row) if isinstance(row, list) else type(row).__name__})."
+            )
+        for c_idx, val in enumerate(row):
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                raise ValueError(
+                    f"xT tablosu [{r_idx}, {c_idx}] hücresi sayısal olmalıdır (bulunan: {val!r})."
+                )
+            fval = float(val)
+            if not math.isfinite(fval) or fval < 0.0:
+                raise ValueError(
+                    f"xT tablosu [{r_idx}, {c_idx}] hücresi negatif veya sonlu değil (bulunan: {fval!r})."
+                )
+            validated[r_idx, c_idx] = fval
+
+    meta = {
+        "source": str(payload.get("source", "https://karun.in/blog/expected-threat.html")),
+        "author": str(payload.get("author", "Karun Singh")),
+        "year": int(payload.get("year", 2018)),
+        "license_note": str(payload.get("license_note", "")),
+        "orientation": str(payload.get("orientation", "")),
+        "path": str(path),
+    }
+    return validated, meta
+
+
 def _clean_str(val: Any) -> Optional[str]:
     """NaN / None / boş metinleri güvenli biçimde None'a dönüştürür."""
     if val is None:
@@ -2743,91 +2800,14 @@ class MLAnalyzer:
         return xp_out
 
     # ----------------------------------------------------------------
-    def _build_xt_grid(self, events_df: Optional[pd.DataFrame] = None) -> np.ndarray:
-        """
-        12x8 Markov Değer İterasyonu (Expected Threat - xT) ızgarası hesaplar.
-        Hücum yönü soldan sağa (col=0 -> col=cols-1) normalize [0..1]x[0..1] uzaydadır.
-        """
-        cols = int(config.ML_XT_GRID_COLS)
-        rows = int(config.ML_XT_GRID_ROWS)
-
-        shot_prob = np.zeros((rows, cols), dtype=float)
-        goal_prob = np.zeros((rows, cols), dtype=float)
-
-        for r in range(rows):
-            y_norm = (r + 0.5) / rows
-            y_center_dist = abs(y_norm - 0.5)
-            for c in range(cols):
-                x_norm = (c + 0.5) / cols
-                goal_dist = math.hypot(1.0 - x_norm, (y_norm - 0.5) * 0.65)
-                # Şut olasılığı ceza sahası yakınında yükselir
-                sp = 0.005 + 0.42 * math.exp(-((goal_dist / 0.22) ** 2))
-                # Gol olasılığı kale ağzına yaklaştıkça ve merkezde artar
-                gp = 0.01 + 0.34 * math.exp(-((goal_dist / 0.16) ** 2)) * max(0.25, 1.0 - y_center_dist * 1.4)
-                shot_prob[r, c] = float(np.clip(sp, 0.002, 0.55))
-                goal_prob[r, c] = float(np.clip(gp, 0.005, 0.45))
-
-        move_prob = 1.0 - shot_prob
-
-        # Uzamsal geçiş matrisi (ileri doğru yumuşak Gauss prior + yeterli veri varsa ampirik karışım)
-        n_cells = rows * cols
-        T_prior = np.zeros((n_cells, n_cells), dtype=float)
-        for r1 in range(rows):
-            for c1 in range(cols):
-                idx1 = r1 * cols + c1
-                weights = np.zeros(n_cells, dtype=float)
-                for r2 in range(rows):
-                    for c2 in range(cols):
-                        idx2 = r2 * cols + c2
-                        dc = c2 - c1
-                        dr = r2 - r1
-                        # İleri ve yakın komşulara doğal pas/sürüş dağılımı
-                        forward_bias = 1.35 if dc > 0 else (0.75 if dc == 0 else 0.45)
-                        w = forward_bias * math.exp(-((dc - 1.0) ** 2) / 6.5 - (dr ** 2) / 4.0)
-                        weights[idx2] = w
-                T_prior[idx1] = weights / max(1e-9, float(weights.sum()))
-
-        T = T_prior.copy()
-        if (
-            events_df is not None
-            and len(events_df) >= 50
-            and {"start_zone_x", "start_zone_y", "end_zone_x", "end_zone_y"}.issubset(events_df.columns)
-        ):
-            counts = np.zeros((n_cells, n_cells), dtype=float)
-            z_sx = pd.to_numeric(events_df["start_zone_x"], errors="coerce").to_numpy(dtype=np.float64)
-            z_sy = pd.to_numeric(events_df["start_zone_y"], errors="coerce").to_numpy(dtype=np.float64)
-            z_ex = pd.to_numeric(events_df["end_zone_x"], errors="coerce").to_numpy(dtype=np.float64)
-            z_ey = pd.to_numeric(events_df["end_zone_y"], errors="coerce").to_numpy(dtype=np.float64)
-            valid_z = np.isfinite(z_sx) & np.isfinite(z_sy) & np.isfinite(z_ex) & np.isfinite(z_ey)
-            if valid_z.any():
-                c1 = np.clip(z_sx[valid_z].astype(int), 0, cols - 1)
-                r1 = np.clip(z_sy[valid_z].astype(int), 0, rows - 1)
-                c2 = np.clip(z_ex[valid_z].astype(int), 0, cols - 1)
-                r2 = np.clip(z_ey[valid_z].astype(int), 0, rows - 1)
-                np.add.at(counts, (r1 * cols + c1, r2 * cols + c2), 1.0)
-            # Dirichlet / Laplace karışımı (prior gücü = 15.0)
-            row_sums = counts.sum(axis=1, keepdims=True)
-            T = (counts + 15.0 * T_prior) / (row_sums + 15.0)
-
-        # Markov Değer İterasyonu (25 adım)
-        xt = np.zeros(n_cells, dtype=float)
-        immediate = (shot_prob * goal_prob).reshape(-1)
-        move_flat = move_prob.reshape(-1)
-        for _ in range(25):
-            xt = immediate + move_flat * (T @ xt)
-
-        return xt.reshape((rows, cols))
-
-    # ----------------------------------------------------------------
     def compute_xt_analysis(
         self,
         events_df: Optional[pd.DataFrame] = None,
         xp_results: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Mekansal xT (Expected Threat) ızgarasını hesaplar ve hem gerçek takip
-        vekil olaylarını hem de kalibre olayları xT_start, xT_end, delta_xT ve
-        expected_xT (= xP * delta_xT) ile skorlar.
+        Karun Singh (2018) açık 12x8 xT (Expected Threat) tablosunu yükleyerek
+        olayları xT_start, xT_end, delta_xT ve (xP mevcutsa) expected_xT ile skorlar.
         """
         cols = int(config.ML_XT_GRID_COLS)
         rows = int(config.ML_XT_GRID_ROWS)
@@ -2897,14 +2877,8 @@ class MLAnalyzer:
                     "_scored_xt_model_df": pd.DataFrame(),
                 }
 
-        # Grid'i eğitilmiş/zengin olay setiyle kur (varsa model olayları)
-        scored_ref = (
-            xp_results.get("_scored_events_df")
-            if xp_results is not None and isinstance(xp_results.get("_scored_events_df"), pd.DataFrame)
-            else None
-        )
-        grid_ref_df = scored_ref if (scored_ref is not None and not scored_ref.empty) else eval_df
-        xt_grid = self._build_xt_grid(grid_ref_df)
+        xt_grid, xt_meta = load_xt_grid()
+        xp_unavailable = xp_results is not None and xp_results.get("status") != "ok"
 
         def _safe_norm_arr(df_in: pd.DataFrame, col: str) -> np.ndarray:
             if col not in df_in.columns:
@@ -2965,20 +2939,16 @@ class MLAnalyzer:
             xt_e = xt_grid[r2, c2]
             d_xt = xt_e - xt_s
 
-            if "predicted_xp" in df_out.columns:
+            if not xp_unavailable and "predicted_xp" in df_out.columns:
                 xp_arr = pd.to_numeric(df_out["predicted_xp"], errors="coerce").to_numpy(dtype=np.float64)
-                bad_xp = ~np.isfinite(xp_arr)
-                if bad_xp.any():
-                    xp_arr = xp_arr.copy()
-                    xp_arr[bad_xp] = 0.75
+                exp_xt = np.where(np.isfinite(xp_arr), xp_arr * d_xt, np.nan)
             else:
-                xp_arr = np.full(len(df_out), 0.75, dtype=np.float64)
-            exp_xt = xp_arr * d_xt
+                exp_xt = np.full(len(df_out), np.nan, dtype=np.float64)
 
             df_out["xT_start"] = np.round(xt_s, 5)
             df_out["xT_end"] = np.round(xt_e, 5)
             df_out["delta_xT"] = np.round(d_xt, 5)
-            df_out["expected_xT"] = np.round(exp_xt, 5)
+            df_out["expected_xT"] = np.where(np.isfinite(exp_xt), np.round(exp_xt, 5), np.nan)
             return df_out
 
         scored_eval = score_df_with_xt(eval_df, use_halves=True)
@@ -2997,17 +2967,24 @@ class MLAnalyzer:
             for tname in ("Team A", "Team B"):
                 t_df = scored_eval[scored_eval["from_team"] == tname]
                 if not t_df.empty:
+                    t_exp = pd.to_numeric(t_df["expected_xT"], errors="coerce")
+                    t_exp_valid = t_exp[np.isfinite(t_exp)]
                     team_xt_summary[tname] = {
                         "events": int(len(t_df)),
                         "total_delta_xT": round(float(t_df["delta_xT"].sum()), 4),
                         "mean_delta_xT": round(float(t_df["delta_xT"].mean()), 4),
-                        "total_expected_xT": round(float(t_df["expected_xT"].sum()), 4),
+                        "total_expected_xT": (
+                            round(float(t_exp_valid.sum()), 4) if len(t_exp_valid) > 0 else None
+                        ),
                     }
 
         top_events: List[Dict[str, Any]] = []
         if not scored_eval.empty:
-            top_df = scored_eval.sort_values("expected_xT", ascending=False).head(5)
+            has_any_exp = bool(scored_eval["expected_xT"].notna().any())
+            sort_col = "expected_xT" if has_any_exp else "delta_xT"
+            top_df = scored_eval.sort_values(sort_col, ascending=False, na_position="last").head(5)
             for _, row in top_df.iterrows():
+                exp_val = row.get("expected_xT")
                 top_events.append({
                     "frame_idx": int(row["frame_idx"]) if "frame_idx" in row and not pd.isna(row["frame_idx"]) else None,
                     "from_track_id": _clean_str(row.get("from_track_id")),
@@ -3017,7 +2994,7 @@ class MLAnalyzer:
                     "xT_start": float(row["xT_start"]),
                     "xT_end": float(row["xT_end"]),
                     "delta_xT": float(row["delta_xT"]),
-                    "expected_xT": float(row["expected_xT"]),
+                    "expected_xT": float(exp_val) if exp_val is not None and not pd.isna(exp_val) else None,
                 })
 
         halves_summary = [
@@ -3034,11 +3011,21 @@ class MLAnalyzer:
             for h in halves
         ]
 
+        exp_valid = (
+            pd.to_numeric(scored_eval["expected_xT"], errors="coerce")
+            if not scored_eval.empty and "expected_xT" in scored_eval.columns
+            else pd.Series(dtype=np.float64)
+        )
+        exp_valid = exp_valid[np.isfinite(exp_valid)]
+        mean_expected_xt = round(float(exp_valid.mean()), 5) if len(exp_valid) > 0 else None
+
         is_syn_xt = eval_source == "calibrated_synthetic_match"
         xt_out = {
             "status": "ok",
             "coord_mode": self.coord_mode,
             "eval_source": eval_source,
+            "xt_source": "Karun Singh (2018) açık xT tablosu",
+            "xt_source_url": xt_meta["source"],
             "synthetic_fallback_used": is_syn_xt,
             "halves_detected": len(halves_summary),
             "attack_directions_by_half": halves_summary,
@@ -3048,7 +3035,7 @@ class MLAnalyzer:
             "xt_grid": [[round(float(v), 5) for v in row] for row in xt_grid],
             "evaluated_events_count": int(len(scored_eval)),
             "mean_delta_xT": round(float(scored_eval["delta_xT"].mean()), 5) if not scored_eval.empty else 0.0,
-            "mean_expected_xT": round(float(scored_eval["expected_xT"].mean()), 5) if not scored_eval.empty else 0.0,
+            "mean_expected_xT": mean_expected_xt,
             "team_xt_summary": team_xt_summary,
             "top_threat_events": top_events,
             "_scored_xt_eval_df": scored_eval,
@@ -4231,7 +4218,10 @@ class MLAnalyzer:
             if xt_res["coord_mode"] == "pitch_meters"
             else "Kalibresiz Piksel Fallback (Göreli Saha)"
         )
-        ax.set_title(f"Mekansal Beklenen Tehdit (xT) Izgarası - {mode_label}\n(Hücum Yönü: Soldan Sağa →)")
+        ax.set_title(
+            f"Mekansal Beklenen Tehdit (xT) Izgarası - {mode_label}\n"
+            f"Kaynak: Karun Singh (2018) açık xT tablosu | Hücum Yönü: Soldan Sağa →"
+        )
         ax.set_xlabel("Saha Uzunluk Bölgesi (1 → 12)")
         ax.set_ylabel("Saha Genişlik Koridoru (1 → 8)")
         ax.set_xticks(range(cols))
@@ -4541,10 +4531,13 @@ class MLAnalyzer:
             grid_shape = xt.get("grid_shape") or [int(config.ML_XT_GRID_ROWS), int(config.ML_XT_GRID_COLS)]
             g_rows = grid_shape[0] if len(grid_shape) >= 1 else int(config.ML_XT_GRID_ROWS)
             g_cols = grid_shape[1] if len(grid_shape) >= 2 else int(config.ML_XT_GRID_COLS)
+            mean_exp_xt = xt.get("mean_expected_xT")
+            mean_exp_str = f"{float(mean_exp_xt):.4f}" if mean_exp_xt is not None else "Hesaplanamadı (xP yetersiz)"
             lines.extend([
+                f"- **xT Değerleri Kaynağı:** {xt.get('xt_source', 'Karun Singh (2018) açık xT tablosu')} (`{xt.get('xt_source_url', 'https://karun.in/blog/expected-threat.html')}`)",
                 f"- **Değerlendirilen Kaynak:** `{xt.get('eval_source', 'N/A')}` ({xt.get('evaluated_events_count', 0)} olay)",
                 f"- **Izgara Boyutu & Aralık:** {g_rows}x{g_cols}, `xT` aralığı: `[{float(xt.get('min_xt', 0.0)):.4f}, {float(xt.get('max_xt', 0.0)):.4f}]`",
-                f"- **Ortalama `delta_xT` / `expected_xT`:** `{float(xt.get('mean_delta_xT', 0.0)):.4f}` / `{float(xt.get('mean_expected_xT', 0.0)):.4f}`",
+                f"- **Ortalama `delta_xT` / `expected_xT`:** `{float(xt.get('mean_delta_xT', 0.0)):.4f}` / `{mean_exp_str}`",
             ])
             halves_list = xt.get("attack_directions_by_half") or []
             if halves_list:
@@ -4558,8 +4551,10 @@ class MLAnalyzer:
                         f"Team A → {ta_dir_tr} | Team B → {tb_dir_tr}"
                     )
             for tname, tinfo in (xt.get("team_xt_summary") or {}).items():
+                t_exp = tinfo.get("total_expected_xT")
+                t_exp_str = f"{float(t_exp):.4f}" if t_exp is not None else "N/A"
                 lines.append(
-                    f"- **{tname}:** {tinfo.get('events', 0)} olay | Toplam `delta_xT`={float(tinfo.get('total_delta_xT', 0.0)):.4f} | Toplam `expected_xT`={float(tinfo.get('total_expected_xT', 0.0)):.4f}"
+                    f"- **{tname}:** {tinfo.get('events', 0)} olay | Toplam `delta_xT`={float(tinfo.get('total_delta_xT', 0.0)):.4f} | Toplam `expected_xT`={t_exp_str}"
                 )
 
         lines.extend([

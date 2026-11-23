@@ -331,3 +331,115 @@ def test_r3_goalkeeper_lock_requires_25_votes_and_80_pct_agreement(monkeypatch):
         out_mix = clf2.assign_teams(dets, frame)
         assert 202 not in clf2._locked_gk_tracks
         assert next(d["team"] for d in out_mix if d["track_id"] == 202) == "Goalkeeper"
+
+
+# ----------------------------------------------------------------------
+# R1 KABUL TESTLERİ: Karun Singh (2018) Açık 12x8 xT Tablosu
+# ----------------------------------------------------------------------
+def test_r1_xt_json_loads_validates_orientation_and_rejects_corrupt(tmp_path):
+    import json
+    from modules.ml_analyzer import load_xt_grid
+
+    grid, meta = load_xt_grid()
+    assert grid.shape == (8, 12)
+    assert bool(np.all(grid >= 0.0))
+    assert meta["author"] == "Karun Singh"
+    assert meta["year"] == 2018
+    # Yön doğrulaması: rakip kaleye en yakın sütun ortalaması > kendi kalemize en yakın sütun ortalaması
+    assert float(grid[:, 11].mean()) > float(grid[:, 0].mean())
+    assert float(grid[3:5, 11].mean()) > float(grid[3:5, 0].mean())
+
+    # Yanlış boyut (6x12) -> ValueError
+    bad_shape = tmp_path / "bad_shape.json"
+    bad_shape.write_text(json.dumps({"grid": grid[:6, :].tolist()}), encoding="utf-8")
+    with pytest.raises(ValueError, match="8 satır"):
+        load_xt_grid(str(bad_shape))
+
+    # Negatif değer -> ValueError
+    bad_neg = grid.copy()
+    bad_neg[0, 0] = -0.01
+    bad_neg_path = tmp_path / "bad_neg.json"
+    bad_neg_path.write_text(json.dumps({"grid": bad_neg.tolist()}), encoding="utf-8")
+    with pytest.raises(ValueError, match="negatif"):
+        load_xt_grid(str(bad_neg_path))
+
+    # Sayısal olmayan değer -> ValueError
+    bad_type = grid.tolist()
+    bad_type[2][3] = "not_a_number"
+    bad_type_path = tmp_path / "bad_type.json"
+    bad_type_path.write_text(json.dumps({"grid": bad_type}), encoding="utf-8")
+    with pytest.raises(ValueError, match="sayısal"):
+        load_xt_grid(str(bad_type_path))
+
+
+def test_r1_xt_lookup_rtl_mirroring_insufficient_xp_and_markdown_source(tmp_path):
+    from modules.ml_analyzer import MLAnalyzer, load_xt_grid
+
+    grid, _ = load_xt_grid()
+
+    # Kalibre küçük bir takip DataFrame'i + iki aynı fiziksel konumda L->R ve R->L pas
+    cal_df = pd.DataFrame([
+        {
+            "frame_idx": 0, "timestamp_sec": 0.0, "track_id": 1, "class_name": "player",
+            "team": "Team A", "is_predicted": False,
+            "bbox_x1": 100.0, "bbox_y1": 100.0, "bbox_x2": 130.0, "bbox_y2": 170.0,
+            "pixel_x": 115.0, "pixel_y": 170.0, "pitch_x": 15.0, "pitch_y": 34.0, "on_pitch": True,
+        },
+        {
+            "frame_idx": 0, "timestamp_sec": 0.0, "track_id": 2, "class_name": "player",
+            "team": "Team B", "is_predicted": False,
+            "bbox_x1": 500.0, "bbox_y1": 100.0, "bbox_x2": 530.0, "bbox_y2": 170.0,
+            "pixel_x": 515.0, "pixel_y": 170.0, "pitch_x": 90.0, "pitch_y": 34.0, "on_pitch": True,
+        },
+    ])
+
+    sx, sy = 0.20, 0.45
+    ex, ey = 0.95, 0.45
+    events = pd.DataFrame([
+        {
+            "frame_idx": 1, "from_track_id": "1", "to_track_id": "3", "from_team": "Team A",
+            "start_norm_x": sx, "start_norm_y": sy, "end_norm_x": ex, "end_norm_y": ey,
+            "attack_dir": 1, "pass_outcome": 1,
+        },
+        {
+            "frame_idx": 2, "from_track_id": "2", "to_track_id": "4", "from_team": "Team B",
+            "start_norm_x": sx, "start_norm_y": sy, "end_norm_x": ex, "end_norm_y": ey,
+            "attack_dir": -1, "pass_outcome": 1,
+        },
+    ])
+
+    ml = MLAnalyzer(cal_df, fps=25.0)
+    xt_res = ml.compute_xt_analysis(events_df=events, xp_results={"status": "insufficient_data"})
+
+    assert xt_res["status"] == "ok"
+    assert "Karun Singh (2018)" in xt_res["xt_source"]
+    assert xt_res["mean_expected_xT"] is None
+    assert xt_res["team_xt_summary"]["Team A"]["total_expected_xT"] is None
+
+    scored = xt_res["_scored_xt_eval_df"]
+    ltr = scored.iloc[0]
+    rtl = scored.iloc[1]
+
+    c1_ltr, r1_ltr = int(sx * 12), int(sy * 8)
+    c2_ltr, r2_ltr = int(ex * 12), int(ey * 8)
+    assert ltr["xT_start"] == pytest.approx(round(float(grid[r1_ltr, c1_ltr]), 5), abs=1e-5)
+    assert ltr["xT_end"] == pytest.approx(round(float(grid[r2_ltr, c2_ltr]), 5), abs=1e-5)
+    assert np.isnan(ltr["expected_xT"])
+
+    c1_rtl, r1_rtl = int((1.0 - sx) * 12), int((1.0 - sy) * 8)
+    c2_rtl, r2_rtl = int((1.0 - ex) * 12), int((1.0 - ey) * 8)
+    assert rtl["xT_start"] == pytest.approx(round(float(grid[r1_rtl, c1_rtl]), 5), abs=1e-5)
+    assert rtl["xT_end"] == pytest.approx(round(float(grid[r2_rtl, c2_rtl]), 5), abs=1e-5)
+    assert np.isnan(rtl["expected_xT"])
+
+    md_text = ml._build_turkish_markdown_report(
+        {
+            "data_quality": ml.audit_data_quality(),
+            "xp_modeling": {"status": "insufficient_data", "real_events": 2, "required": 30},
+            "xt_analysis": xt_res,
+            "player_clustering": {"status": "ok", "eligible_players": 0},
+            "tempo_and_anomalies": {"status": "ok", "window_sec": 4.0},
+        },
+        {},
+    )
+    assert "Karun Singh (2018)" in md_text
