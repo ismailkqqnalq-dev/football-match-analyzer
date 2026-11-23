@@ -169,6 +169,41 @@ class VideoProcessor:
             progress_bar.close()
 
     # ----------------------------------------------------------------
+    @staticmethod
+    def _draw_dashed_rectangle(
+        img: np.ndarray,
+        pt1: tuple,
+        pt2: tuple,
+        color: tuple,
+        thickness: int = 1,
+        dash_len: int = 8,
+        gap_len: int = 6,
+    ) -> None:
+        """Tahmini (is_predicted) kutuları gerçeklerden ayırmak için kesikli dikdörtgen çizer."""
+        x1, y1 = int(pt1[0]), int(pt1[1])
+        x2, y2 = int(pt2[0]), int(pt2[1])
+        step = max(2, int(dash_len) + int(gap_len))
+        edges = [
+            ((x1, y1), (x2, y1)),
+            ((x2, y1), (x2, y2)),
+            ((x2, y2), (x1, y2)),
+            ((x1, y2), (x1, y1)),
+        ]
+        for (sx, sy), (ex, ey) in edges:
+            dist = float(np.hypot(ex - sx, ey - sy))
+            if dist <= 0.0:
+                continue
+            dx = (ex - sx) / dist
+            dy = (ey - sy) / dist
+            pos = 0.0
+            while pos < dist:
+                end_pos = min(dist, pos + dash_len)
+                p_start = (int(round(sx + dx * pos)), int(round(sy + dy * pos)))
+                p_end = (int(round(sx + dx * end_pos)), int(round(sy + dy * end_pos)))
+                cv2.line(img, p_start, p_end, color, thickness, lineType=cv2.LINE_AA)
+                pos += step
+
+    # ----------------------------------------------------------------
     def draw_detections(
         self,
         frame: np.ndarray,
@@ -208,6 +243,7 @@ class VideoProcessor:
             class_name = det.get("class_name", "object")
             track_id = det.get("track_id", None)
             team = det.get("team", None)
+            is_predicted = bool(det.get("is_predicted", False))
 
             # Renk seçimi: top turuncu; takım bilgisi varsa (Adım 4'ten sonra
             # dolar) takıma özel renk; yoksa varsayılan yeşil kullanılır.
@@ -224,8 +260,17 @@ class VideoProcessor:
             else:
                 color = config.BBOX_COLOR_DEFAULT
 
+            draw_color = (
+                tuple(int(round(c * 0.55 + 160 * 0.45)) for c in color)
+                if is_predicted
+                else color
+            )
+
             # --- Bounding box çizimi ---
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, config.BBOX_THICKNESS)
+            if is_predicted:
+                self._draw_dashed_rectangle(annotated, (x1, y1), (x2, y2), draw_color, thickness=1)
+            else:
+                cv2.rectangle(annotated, (x1, y1), (x2, y2), draw_color, config.BBOX_THICKNESS)
 
             # --- Etiket metni oluşturma (ID + varsa takım bilgisi) ---
             label_parts = []
@@ -246,7 +291,7 @@ class VideoProcessor:
                 annotated,
                 (x1, max(0, y1 - text_h - 10)),
                 (x1 + text_w + 4, y1),
-                color,
+                draw_color,
                 thickness=-1,  # -1 -> içi dolu dikdörtgen
             )
 

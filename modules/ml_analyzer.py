@@ -1444,6 +1444,8 @@ class MLAnalyzer:
             & xy_notna
             & f_notna
         )
+        if "is_predicted" in self.df.columns:
+            p_mask &= ~_bool_mask(self.df["is_predicted"], na_value=False)
         if self.is_calibrated and "on_pitch" in self.df.columns:
             p_mask &= _bool_mask(self.df["on_pitch"], na_value=True)
 
