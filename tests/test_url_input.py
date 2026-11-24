@@ -107,6 +107,32 @@ def test_url_is_downloaded_to_cache_with_expected_options(tmp_path, monkeypatch)
     assert "avc1" in options["format"]
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.ornek-kulup.com/haberler/mac-ozeti-video",  # gömülü videolu sayfa
+        "https://cdn.ornek.com/videolar/mac.mp4",  # doğrudan dosya
+        "https://cdn.ornek.com/videolar/mac.webm",
+        "https://yayin.ornek.com/canli/mac/index.m3u8",  # HLS akışı
+        "https://yayin.ornek.com/mac/manifest.mpd",  # DASH akışı
+    ],
+)
+def test_any_http_link_type_is_passed_to_yt_dlp(url, tmp_path, monkeypatch):
+    def _write_file(options, urls):
+        with open(options["outtmpl"], "wb") as f:
+            f.write(b"video")
+
+    fake, calls = _fake_yt_dlp(_write_file)
+    monkeypatch.setattr(url_input, "_load_yt_dlp", lambda: fake)
+
+    path = resolve_input(url, cache_dir=str(tmp_path))
+    assert path == cache_path_for(url, str(tmp_path))
+    assert os.path.isfile(path)
+    options, urls = calls[0]
+    assert urls == [url]
+    assert options["playlist_items"] == "1"
+
+
 def test_cached_url_is_not_downloaded_again(tmp_path, monkeypatch):
     url = "https://www.youtube.com/watch?v=abc"
     cached = cache_path_for(url, str(tmp_path))
@@ -136,6 +162,28 @@ def test_download_error_gives_turkish_message(tmp_path, monkeypatch):
     with pytest.raises(VideoUrlError, match="indirilemedi") as excinfo:
         resolve_input("https://youtu.be/yok", cache_dir=str(tmp_path))
     assert "Video unavailable" in str(excinfo.value)
+
+
+def test_page_without_video_gives_not_found_message(tmp_path, monkeypatch):
+    def _fail(options, urls):
+        raise _FakeDownloadError("ERROR: Unsupported URL: https://www.ornek.com/iletisim")
+
+    fake, _ = _fake_yt_dlp(_fail)
+    monkeypatch.setattr(url_input, "_load_yt_dlp", lambda: fake)
+
+    with pytest.raises(VideoUrlError, match="indirilebilir video bulunamadı"):
+        resolve_input("https://www.ornek.com/iletisim", cache_dir=str(tmp_path))
+
+
+def test_drm_protected_video_gives_protected_message(tmp_path, monkeypatch):
+    def _fail(options, urls):
+        raise _FakeDownloadError("ERROR: [generic] This video is DRM protected")
+
+    fake, _ = _fake_yt_dlp(_fail)
+    monkeypatch.setattr(url_input, "_load_yt_dlp", lambda: fake)
+
+    with pytest.raises(VideoUrlError, match="korumalı"):
+        resolve_input("https://ucretli-yayin.ornek.com/mac/123", cache_dir=str(tmp_path))
 
 
 def test_download_without_output_file_raises(tmp_path, monkeypatch):

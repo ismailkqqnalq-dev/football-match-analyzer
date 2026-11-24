@@ -1,17 +1,23 @@
 """
 url_input.py
 ------------
-`main.py --input` parametresine dosya yolu yerine maç linki (http/https,
-ör. YouTube) verilebilmesini sağlar.
+`main.py --input` parametresine dosya yolu yerine bir video/maç linki
+(http/https) verilebilmesini sağlar. Desteklenen link türleri:
+  * video paylaşım siteleri (ör. https://www.youtube.com/watch?v=...),
+  * içinde gömülü video olan sayfalar (haber, kulüp, maç siteleri),
+  * doğrudan video dosyası linkleri (.mp4, .webm, .mkv),
+  * HLS / DASH akış linkleri (.m3u8, .mpd).
+Hepsi tek yoldan, yt-dlp ile çözülür (doğrudan dosya ve akış linklerini de
+yt-dlp'nin genel "generic" çözücüsü tanır), böylece ayrı indirme kodu gerekmez.
 
-Yaklaşım: link yt-dlp ile bir kez işletim sisteminin geçici klasörüne
+Yaklaşım: video bir kez işletim sisteminin geçici klasörüne
 (`%TEMP%/fma_url_cache`) indirilir; aynı link tekrar verilirse önbellekteki
 dosya kullanılır. Doğrudan akış (stream) adresini cv2.VideoCapture'a vermek
 yerine indirme seçildi, çünkü:
   * VideoProcessor yerel dosya bekliyor (os.path.exists kontrolü),
   * akışta FPS / toplam kare sayısı bilinmeyebilir; FPS zaman damgası, hız
     ve mesafe hesaplarının temelidir,
-  * YouTube akış adresleri birkaç saat içinde geçersiz olur.
+  * çoğu sitenin akış adresi birkaç saat içinde geçersiz olur.
 """
 
 import hashlib
@@ -56,6 +62,28 @@ def _load_yt_dlp():
     return yt_dlp
 
 
+def _download_error_message(exc) -> str:
+    """yt-dlp hatasını kullanıcının anlayacağı Türkçe mesaja çevirir."""
+    detail = str(exc)
+    lowered = detail.lower()
+    if "drm" in lowered:
+        reason = (
+            "Bu video korumalı (DRM); indirilemez. Ücretli yayın platformlarındaki "
+            "korumalı videolar desteklenmez."
+        )
+    elif "unsupported url" in lowered or "no video formats" in lowered:
+        reason = (
+            "Bu sayfada indirilebilir video bulunamadı. Videonun kendi sayfasının "
+            "veya doğrudan video dosyasının (.mp4, .m3u8 ...) linkini deneyin."
+        )
+    else:
+        reason = (
+            "Video linkten indirilemedi. Linkin doğru olduğunu, videonun herkese "
+            "açık olduğunu ve internet bağlantınızı kontrol edin."
+        )
+    return f"{reason} Ayrıntı: {detail}"
+
+
 def resolve_input(input_arg: str, cache_dir: str = None) -> str:
     """
     Girdi bir link ise videoyu önbelleğe indirip yerel dosya yolunu döner;
@@ -76,19 +104,17 @@ def resolve_input(input_arg: str, cache_dir: str = None) -> str:
         "format": YTDLP_FORMAT,
         "outtmpl": path,
         "noplaylist": True,
+        # Sayfada birden çok gömülü video varsa yalnızca ilki alınır.
+        "playlist_items": "1",
         "quiet": True,
         "no_warnings": True,
     }
-    print(f"[URL] Video indiriliyor (en fazla 1080p): {url}")
+    print(f"[URL] Video linkten indiriliyor (en fazla 1080p): {url}")
     try:
         with yt_dlp.YoutubeDL(options) as ydl:
             ydl.download([url])
     except yt_dlp.utils.DownloadError as exc:
-        raise VideoUrlError(
-            "Video linkten indirilemedi. Linkin doğru olduğunu, videonun herkese "
-            "açık olduğunu ve internet bağlantınızı kontrol edin. "
-            f"Ayrıntı: {exc}"
-        ) from exc
+        raise VideoUrlError(_download_error_message(exc)) from exc
 
     if not os.path.isfile(path):
         raise VideoUrlError(f"İndirme tamamlandı ama video dosyası bulunamadı: {path}")

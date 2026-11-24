@@ -29,7 +29,7 @@ matplotlib==3.10.9               # Taktik ML grafikleri (Adım 8)
 # psycopg2-binary==2.9.10        # PostgreSQL kullanılacaksa
 
 # --- Yardımcı ---
-yt-dlp==2026.11.23               # --input'a maç linki (YouTube vb.) verildiğinde videoyu indirmek için
+yt-dlp==2026.10.26               # --input'a video/maç linki verildiğinde videoyu indirmek için
 tqdm==4.67.1                     # İlerleme çubuğu
 PyYAML==6.0.2                    # config dosyaları için
 

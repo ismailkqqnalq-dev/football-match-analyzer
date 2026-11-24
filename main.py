@@ -20,7 +20,7 @@ Projenin giriş noktası (entry point).
 
 Kullanım:
     python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4
-    python main.py --input "https://www.youtube.com/watch?v=..." --no-video
+    python main.py --input "https://ornek-site.com/mac-ozeti" --no-video
 """
 
 import argparse
@@ -55,7 +55,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Futbol Maç Analiz ve Oyuncu Takip Sistemi")
     parser.add_argument(
         "--input", type=str, default=config.DEFAULT_INPUT_VIDEO,
-        help="İşlenecek giriş videosunun yolu (.mp4) veya maç linki (http/https, ör. YouTube)"
+        help="İşlenecek giriş videosunun yolu (.mp4) veya video/maç linki (http/https: video sitesi, gömülü videolu sayfa, .mp4, .m3u8 ...)"
     )
     parser.add_argument(
         "--output", type=str, default=config.DEFAULT_OUTPUT_VIDEO,
