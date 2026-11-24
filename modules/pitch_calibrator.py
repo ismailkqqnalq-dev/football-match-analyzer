@@ -882,9 +882,10 @@ class HybridPitchCalibrator:
 
         # Profil algılama / izleme istatistikleri
         self._detect_start_frame: Optional[int] = None
-        self._pan_path_px = 0.0
+        self._net_base_px = np.zeros(2, dtype=np.float64)   # önceki çapalardan biriken net kayma
+        self._last_offset_px = np.zeros(2, dtype=np.float64)
+        self._max_net_px = 0.0
         self._max_scale_change = 0.0
-        self._prev_motion: Optional[np.ndarray] = None
         self._reanchored_since_prev = False
 
         # Sabit kamera kilidi
@@ -1268,7 +1269,9 @@ class HybridPitchCalibrator:
         self.profile_events.append(
             {"frame_idx": int(frame_idx), "from": old, "to": new_profile, "reason": reason}
         )
-        self._pan_path_px = 0.0
+        self._net_base_px = np.zeros(2, dtype=np.float64)
+        self._last_offset_px = np.zeros(2, dtype=np.float64)
+        self._max_net_px = 0.0
         self._max_scale_change = 0.0
         print(f"[Kalibrasyon] Görüntü profili: {new_profile} (kare {frame_idx}; {reason})")
 
@@ -1279,29 +1282,36 @@ class HybridPitchCalibrator:
         motion: Optional[np.ndarray],
         scene_cut: bool,
     ) -> None:
+        """
+        Kamera hareketini görüntü merkezinin NET kayması (çapa değişimleri boyunca
+        birikimli) ve ölçek değişimiyle ölçer. Kare kare yol toplamı kullanılmaz:
+        sabit kamerada küçük flow titremeleri yolu sınırsız büyütür.
+        """
         if self.profile_decided and self.profile == "broadcast":
             return
         w = max(1.0, float(frame_shape[1]))
         center = np.array([[0.5 * w, 0.5 * float(frame_shape[0])]], dtype=np.float64)
+        if self._reanchored_since_prev:
+            self._net_base_px = self._net_base_px + self._last_offset_px
+            self._last_offset_px = np.zeros(2, dtype=np.float64)
+        self._reanchored_since_prev = False
         if motion is not None:
-            if self._prev_motion is not None and not self._reanchored_since_prev:
-                p_now = self._project(motion, center)[0]
-                p_prev = self._project(self._prev_motion, center)[0]
-                step = float(np.linalg.norm(p_now - p_prev))
-                if math.isfinite(step):
-                    self._pan_path_px += step
+            offset = self._project(motion, center)[0] - center[0]
+            if bool(np.isfinite(offset).all()):
+                self._last_offset_px = offset
+                net = float(np.linalg.norm(self._net_base_px + offset))
+                self._max_net_px = max(self._max_net_px, net)
             try:
                 scale = math.sqrt(abs(float(np.linalg.det(motion[:2, :2] / motion[2, 2]))))
                 self._max_scale_change = max(self._max_scale_change, abs(scale - 1.0))
             except (ValueError, ZeroDivisionError, np.linalg.LinAlgError):
                 pass
-        self._prev_motion = None if motion is None else motion.copy()
-        self._reanchored_since_prev = False
 
-        pan_ratio = self._pan_path_px / w
+        net_ratio = self._max_net_px / w
         max_pan = float(getattr(config, "PROFILE_FIXED_MAX_PAN_RATIO", 0.05))
         max_scale = float(getattr(config, "PROFILE_FIXED_MAX_SCALE_CHANGE", 0.03))
-        moving = pan_ratio > max_pan or self._max_scale_change > max_scale
+        moving = net_ratio > max_pan or self._max_scale_change > max_scale
+        detail = f"net kayma oranı={net_ratio:.3f}, ölçek değişimi={self._max_scale_change:.3f}"
 
         if not self.profile_decided:
             if self._detect_start_frame is None:
@@ -1310,23 +1320,18 @@ class HybridPitchCalibrator:
             if scene_cut:
                 self._set_profile(frame_idx, "broadcast", "algılama penceresinde sahne kesmesi")
             elif moving:
-                self._set_profile(
-                    frame_idx,
-                    "broadcast",
-                    f"kamera hareketi (pan oranı={pan_ratio:.3f}, ölçek değişimi={self._max_scale_change:.3f})",
-                )
+                self._set_profile(frame_idx, "broadcast", f"kamera hareketi ({detail})")
             elif frame_idx - self._detect_start_frame >= detect_frames:
                 self._set_profile(
-                    frame_idx,
-                    "fixed",
-                    f"{detect_frames} karede kesme yok, kamera sabit "
-                    f"(pan oranı={pan_ratio:.3f}, ölçek değişimi={self._max_scale_change:.3f})",
+                    frame_idx, "fixed", f"{detect_frames} karede kesme yok, kamera sabit ({detail})"
                 )
         elif self.profile == "fixed":
             if scene_cut:
                 self._set_profile(frame_idx, "broadcast", "sabit profilde sahne kesmesi")
             elif moving:
-                self._set_profile(frame_idx, "broadcast", "sabit profilde belirgin kamera hareketi")
+                self._set_profile(
+                    frame_idx, "broadcast", f"sabit profilde belirgin kamera hareketi ({detail})"
+                )
 
     def _lock_fixed(
         self,

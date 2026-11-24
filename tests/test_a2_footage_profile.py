@@ -123,3 +123,27 @@ def test_a2_5_invalid_profile_rejected():
             calibrator=NoisyKeypointCalibrator(), transformer=pt, motion_tracker=FakeFlow(),
             profile="drone",
         )
+
+
+def test_a2_5_fixed_profile_survives_long_flow_jitter():
+    """10 dk boyunca kare başına ±0,5 px flow titremesi sabit profili yayına çevirmemeli."""
+    rng = np.random.default_rng(0)
+    jitter = rng.normal(0.0, 0.5, size=(20000, 2))
+    cal = NoisyKeypointCalibrator(sigma_px=1.0, seed=2)
+    flow = FakeFlow(lambda t: jitter[t])
+    hybrid, _ = _make_hybrid(cal, flow, profile="auto")
+    _run(hybrid, flow, range(0, int(10 * 60 * FPS)))
+    assert hybrid.profile == "fixed", hybrid.profile_events
+
+
+def test_a2_5_fixed_profile_switches_on_real_pan():
+    cal = NoisyKeypointCalibrator(sigma_px=0.0, seed=1)
+    detect_frames = int(config.PROFILE_DETECT_SEC * FPS)
+    start = detect_frames + 50
+    flow = FakeFlow(lambda t: np.array([max(0, t - start) * 2.0, 0.0]))
+    hybrid, _ = _make_hybrid(cal, flow, profile="auto")
+    _run(hybrid, flow, range(0, detect_frames + 1))
+    assert hybrid.profile == "fixed"
+    _run(hybrid, flow, range(detect_frames + 1, start + 100))
+    assert hybrid.profile == "broadcast"
+    assert "net kayma" in hybrid.profile_events[-1]["reason"]
