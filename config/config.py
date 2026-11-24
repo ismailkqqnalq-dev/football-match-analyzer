@@ -480,16 +480,16 @@ PITCH_KEYPOINT_NAMES_32 = (
     "left_six_yard_box_bottom_right",       # 7  (#8)
     "left_penalty_spot",                    # 8  (#9)
     "left_penalty_box_top_right",           # 9  (#10)
-    "left_penalty_box_six_yard_top",        # 10 (#11)
-    "left_penalty_box_six_yard_bottom",     # 11 (#12)
+    "left_penalty_arc_top",                 # 10 (#11) ceza yayı x ceza sahası çizgisi
+    "left_penalty_arc_bottom",              # 11 (#12)
     "left_penalty_box_bottom_right",        # 12 (#13)
     "halfway_top",                          # 13 (#14)
     "center_circle_top",                    # 14 (#15)
     "center_circle_bottom",                 # 15 (#16)
     "halfway_bottom",                       # 16 (#17)
     "right_penalty_box_top_left",           # 17 (#18)
-    "right_penalty_box_six_yard_top",       # 18 (#19)
-    "right_penalty_box_six_yard_bottom",    # 19 (#20)
+    "right_penalty_arc_top",                # 18 (#19) ceza yayı x ceza sahası çizgisi
+    "right_penalty_arc_bottom",             # 19 (#20)
     "right_penalty_box_bottom_left",        # 20 (#21)
     "right_penalty_spot",                   # 21 (#22)
     "right_six_yard_box_top_left",          # 22 (#23)
@@ -504,6 +504,11 @@ PITCH_KEYPOINT_NAMES_32 = (
     "center_circle_right",                  # 31 (#32)
 )
 
+# 10/11/18/19: Roboflow etiketleri ceza yayının ceza sahası çizgisini kestiği noktadadır
+# (y = 34 ± sqrt(9.15² - 5.5²) = 34 ± 7.3125), kale alanı hizasında (24.84/43.16) DEĞİL.
+# Veri setinden ölçüldü (A2-7 nokta sırası kontrolü, ~115 etiket/nokta, ~1.85 m sistematik fark).
+_PENALTY_ARC_HALF_CHORD_M = (CENTER_CIRCLE_RADIUS_M ** 2 - 5.5 ** 2) ** 0.5  # 7.3125
+
 PITCH_KEYPOINTS_32_METERS = (
     (0.0, 0.0),                                         # 0: top_left_corner
     (0.0, 13.84),                                       # 1: left_penalty_box_top_left
@@ -515,16 +520,16 @@ PITCH_KEYPOINTS_32_METERS = (
     (5.5, 43.16),                                       # 7: left_six_yard_box_bottom_right
     (11.0, 34.0),                                       # 8: left_penalty_spot
     (16.5, 13.84),                                      # 9: left_penalty_box_top_right
-    (16.5, 24.84),                                      # 10: left_penalty_box_six_yard_top
-    (16.5, 43.16),                                      # 11: left_penalty_box_six_yard_bottom
+    (16.5, 34.0 - _PENALTY_ARC_HALF_CHORD_M),           # 10: left_penalty_arc_top
+    (16.5, 34.0 + _PENALTY_ARC_HALF_CHORD_M),           # 11: left_penalty_arc_bottom
     (16.5, 54.16),                                      # 12: left_penalty_box_bottom_right
     (52.5, 0.0),                                        # 13: halfway_top
     (52.5, 34.0 - CENTER_CIRCLE_RADIUS_M),              # 14: center_circle_top (52.5, 24.85)
     (52.5, 34.0 + CENTER_CIRCLE_RADIUS_M),              # 15: center_circle_bottom (52.5, 43.15)
     (52.5, 68.0),                                       # 16: halfway_bottom
     (88.5, 13.84),                                      # 17: right_penalty_box_top_left
-    (88.5, 24.84),                                      # 18: right_penalty_box_six_yard_top
-    (88.5, 43.16),                                      # 19: right_penalty_box_six_yard_bottom
+    (88.5, 34.0 - _PENALTY_ARC_HALF_CHORD_M),           # 18: right_penalty_arc_top
+    (88.5, 34.0 + _PENALTY_ARC_HALF_CHORD_M),           # 19: right_penalty_arc_bottom
     (88.5, 54.16),                                      # 20: right_penalty_box_bottom_left
     (94.0, 34.0),                                       # 21: right_penalty_spot
     (99.5, 24.84),                                      # 22: right_six_yard_box_top_left
