@@ -96,7 +96,7 @@ class TeamClassifier:
         self._samples_since_fit: int = 0
 
         # Kaleci mekânsal eşleştirme ve kilitli çoğunluk oylaması durumu
-        self._team_x_ema: Dict[str, float] = {}
+        self._team_x_ema: Dict[str, Dict[str, float]] = {}  # uzay ("pitch"/"pixel") -> takım -> x
         self._gk_vote_history: Dict[int, Deque[str]] = {}
         self._locked_gk_tracks: set = set()
 
@@ -501,73 +501,90 @@ class TeamClassifier:
         self._samples_since_fit = 0
 
     # ----------------------------------------------------------------
-    def _update_team_spatial_ema(self, outfield_dets: List[Dict]):
-        """Her iki takımın saha oyuncuları birlikte görüldüğünde yatay x EMA'sını günceller."""
-        xs_by_team: Dict[str, List[float]] = {}
-        for team_label in ("Team A", "Team B"):
-            xs = [
-                0.5 * (float(d["bbox"][0]) + float(d["bbox"][2]))
-                for d in outfield_dets
-                if d.get("team") == team_label and d.get("bbox") is not None and len(d["bbox"]) >= 4
-            ]
-            if not xs:
-                return
-            xs_by_team[team_label] = xs
+    @staticmethod
+    def _det_x(det: Dict, space: str) -> Optional[float]:
+        """Tespitin yatay konumu: 'pitch' -> saha metresi (pitch_x), 'pixel' -> kutu merkezi."""
+        if space == "pitch":
+            v = det.get("pitch_x")
+            if v is None:
+                return None
+            v = float(v)
+            return v if np.isfinite(v) else None
+        bbox = det.get("bbox")
+        if bbox is None or len(bbox) < 4:
+            return None
+        return 0.5 * (float(bbox[0]) + float(bbox[2]))
 
+    def _team_xs(self, dets: List[Dict], team_label: str, space: str) -> List[float]:
+        xs = (self._det_x(d, space) for d in dets if d.get("team") == team_label)
+        return sorted(x for x in xs if x is not None)
+
+    def _update_team_spatial_ema(self, outfield_dets: List[Dict]):
+        """
+        Her iki takımın saha oyuncuları birlikte görüldüğünde yatay x EMA'sını
+        günceller. Saha metresi ve piksel uzayları ayrı tutulur: dönen kamerada
+        piksel x kayar, saha metresi kaymaz.
+        """
         alpha = float(getattr(config, "TEAM_CLASSIFIER_GK_X_EMA_ALPHA", 0.15))
-        for team_label, xs in xs_by_team.items():
-            cur_mean = float(np.mean(xs))
-            if team_label not in self._team_x_ema:
-                self._team_x_ema[team_label] = cur_mean
-            else:
-                self._team_x_ema[team_label] = (1.0 - alpha) * self._team_x_ema[team_label] + alpha * cur_mean
+        for space in ("pitch", "pixel"):
+            xs_a = self._team_xs(outfield_dets, "Team A", space)
+            xs_b = self._team_xs(outfield_dets, "Team B", space)
+            if not xs_a or not xs_b:
+                continue
+            ema = self._team_x_ema.setdefault(space, {})
+            for team_label, xs in (("Team A", xs_a), ("Team B", xs_b)):
+                cur_mean = float(np.mean(xs))
+                if team_label not in ema:
+                    ema[team_label] = cur_mean
+                else:
+                    ema[team_label] = (1.0 - alpha) * ema[team_label] + alpha * cur_mean
 
     # ----------------------------------------------------------------
     def _resolve_goalkeeper_team(
         self,
-        gk_bbox: List[float],
+        gk_det: Dict,
         outfield_dets: List[Dict],
     ) -> str:
         """
         Model eğitilmiş ve saha oyuncuları yatayda yeterince ayrışmışsa kaleciyi
         en yakın savunma bloğunun takımıyla eşleştirir; aksi halde geçici 'Goalkeeper' döner.
+        Kalibrasyon varsa saha metresi, yoksa piksel konumu kullanılır.
         """
         if not self.is_fitted:
             return "Goalkeeper"
-        if "Team A" not in self._team_x_ema or "Team B" not in self._team_x_ema:
-            return "Goalkeeper"
 
-        ema_a = self._team_x_ema["Team A"]
-        ema_b = self._team_x_ema["Team B"]
+        min_seps = {
+            "pitch": float(getattr(config, "TEAM_CLASSIFIER_GK_MIN_SEPARATION_M", 5.0)),
+            "pixel": float(getattr(config, "TEAM_CLASSIFIER_GK_MIN_SEPARATION_PX", 40.0)),
+        }
+        for space in ("pitch", "pixel"):
+            gk_x = self._det_x(gk_det, space)
+            ema = self._team_x_ema.get(space, {})
+            if gk_x is None or "Team A" not in ema or "Team B" not in ema:
+                continue
 
-        xs_a = sorted(
-            0.5 * (float(d["bbox"][0]) + float(d["bbox"][2]))
-            for d in outfield_dets
-            if d.get("team") == "Team A" and d.get("bbox") is not None and len(d["bbox"]) >= 4
-        )
-        xs_b = sorted(
-            0.5 * (float(d["bbox"][0]) + float(d["bbox"][2]))
-            for d in outfield_dets
-            if d.get("team") == "Team B" and d.get("bbox") is not None and len(d["bbox"]) >= 4
-        )
+            ema_a = ema["Team A"]
+            ema_b = ema["Team B"]
+            xs_a = self._team_xs(outfield_dets, "Team A", space)
+            xs_b = self._team_xs(outfield_dets, "Team B", space)
 
-        # Savunma bloğu merkezi: soldaki takımın en derin %50'si, sağdaki takımın en derin %50'si
-        if ema_a <= ema_b:
-            cur_a = float(np.mean(xs_a[:max(1, (len(xs_a) + 1) // 2)])) if xs_a else ema_a
-            cur_b = float(np.mean(xs_b[len(xs_b) // 2:])) if xs_b else ema_b
-        else:
-            cur_a = float(np.mean(xs_a[len(xs_a) // 2:])) if xs_a else ema_a
-            cur_b = float(np.mean(xs_b[:max(1, (len(xs_b) + 1) // 2)])) if xs_b else ema_b
+            # Savunma bloğu merkezi: soldaki takımın en derin %50'si, sağdaki takımın en derin %50'si
+            if ema_a <= ema_b:
+                cur_a = float(np.mean(xs_a[:max(1, (len(xs_a) + 1) // 2)])) if xs_a else ema_a
+                cur_b = float(np.mean(xs_b[len(xs_b) // 2:])) if xs_b else ema_b
+            else:
+                cur_a = float(np.mean(xs_a[len(xs_a) // 2:])) if xs_a else ema_a
+                cur_b = float(np.mean(xs_b[:max(1, (len(xs_b) + 1) // 2)])) if xs_b else ema_b
 
-        block_a = 0.5 * cur_a + 0.5 * ema_a if xs_a else ema_a
-        block_b = 0.5 * cur_b + 0.5 * ema_b if xs_b else ema_b
+            block_a = 0.5 * cur_a + 0.5 * ema_a if xs_a else ema_a
+            block_b = 0.5 * cur_b + 0.5 * ema_b if xs_b else ema_b
 
-        min_sep_px = float(getattr(config, "TEAM_CLASSIFIER_GK_MIN_SEPARATION_PX", 40.0))
-        if abs(block_a - block_b) < min_sep_px and abs(ema_a - ema_b) < min_sep_px:
-            return "Goalkeeper"
+            min_sep = min_seps[space]
+            if abs(block_a - block_b) < min_sep and abs(ema_a - ema_b) < min_sep:
+                return "Goalkeeper"
+            return "Team A" if abs(gk_x - block_a) <= abs(gk_x - block_b) else "Team B"
 
-        gk_x = 0.5 * (float(gk_bbox[0]) + float(gk_bbox[2]))
-        return "Team A" if abs(gk_x - block_a) <= abs(gk_x - block_b) else "Team B"
+        return "Goalkeeper"
 
     # ----------------------------------------------------------------
     def assign_teams(self, tracked_players: List[Dict], frame: np.ndarray) -> List[Dict]:
@@ -672,7 +689,7 @@ class TeamClassifier:
                 det["team"] = self.team_assignment[tid]
                 continue
 
-            matched = self._resolve_goalkeeper_team(det["bbox"], outfield_dets)
+            matched = self._resolve_goalkeeper_team(det, outfield_dets)
             if tid is None:
                 det["team"] = matched
                 continue
