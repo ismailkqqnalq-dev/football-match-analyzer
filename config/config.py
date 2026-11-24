@@ -93,6 +93,10 @@ DEFAULT_OUTPUT_VIDEO = os.path.join(OUTPUT_VIDEO_DIR, "match_sample_annotated.mp
 YOLO_MODEL_PATH = os.path.join(MODELS_DIR, "football_yolo11s_best.pt")  # M1 futbola özel fine-tune model
 MODEL_DOWNLOAD_URL = ""  # Opsiyonel ağırlık indirme adresi (örn. GitHub Releases)
 
+# Saha anahtar nokta (32 keypoint) YOLO-Pose kalibrasyon modeli (Phase A2)
+PITCH_KEYPOINT_MODEL_PATH = os.path.join(MODELS_DIR, "football_pitch_pose.pt")
+PITCH_KEYPOINT_MODEL_DOWNLOAD_URL = ""  # Opsiyonel ağırlık indirme adresi
+
 # YOLO çıkarım (inference) çözünürlüğü, FP16 ve batch ayarları
 DETECTION_IMG_SIZE = 960
 DETECTION_HALF = True
@@ -431,6 +435,91 @@ HOMOGRAPHY_MIN_ABS_DET = 1e-10
 HOMOGRAPHY_MAX_CONDITION_NUMBER = 1e8
 HOMOGRAPHY_MIN_HOMOGENEOUS_W = 1e-6
 
+# Otomatik saha kalibrasyonu (Phase A2: 32 keypoint YOLO-Pose + hibrit takip)
+AUTO_CALIBRATE_PITCH = True
+PITCH_CALIBRATION_REFRESH_INTERVAL = 15
+PITCH_CALIBRATION_SMOOTH_FRAMES = 5
+PITCH_KEYPOINT_CONF_THRESHOLD = 0.50
+PITCH_KEYPOINT_DET_CONF_THRESHOLD = 0.25
+PITCH_KEYPOINT_IMGSZ = 640
+PITCH_KEYPOINT_HALF = True
+PITCH_CALIBRATION_MIN_KEYPOINTS = 4
+PITCH_CALIBRATION_RANSAC_PX = 8.0
+PITCH_CALIBRATION_MAX_REPROJ_ERR_PX = 12.0
+PITCH_CALIBRATION_MAX_REPROJ_ERR_M = 2.0
+
+# Roboflow football-field-detection 32-keypoint köşe sırası (0..31),
+# 105.0m x 68.0m IFAB standart saha koordinatlarına hizalı.
+PITCH_KEYPOINT_NAMES_32 = (
+    "top_left_corner",                      # 0  (#1)
+    "left_penalty_box_top_left",            # 1  (#2)
+    "left_six_yard_box_top_left",           # 2  (#3)
+    "left_six_yard_box_bottom_left",        # 3  (#4)
+    "left_penalty_box_bottom_left",         # 4  (#5)
+    "bottom_left_corner",                   # 5  (#6)
+    "left_six_yard_box_top_right",          # 6  (#7)
+    "left_six_yard_box_bottom_right",       # 7  (#8)
+    "left_penalty_spot",                    # 8  (#9)
+    "left_penalty_box_top_right",           # 9  (#10)
+    "left_penalty_box_six_yard_top",        # 10 (#11)
+    "left_penalty_box_six_yard_bottom",     # 11 (#12)
+    "left_penalty_box_bottom_right",        # 12 (#13)
+    "halfway_top",                          # 13 (#14)
+    "center_circle_top",                    # 14 (#15)
+    "center_circle_bottom",                 # 15 (#16)
+    "halfway_bottom",                       # 16 (#17)
+    "right_penalty_box_top_left",           # 17 (#18)
+    "right_penalty_box_six_yard_top",       # 18 (#19)
+    "right_penalty_box_six_yard_bottom",    # 19 (#20)
+    "right_penalty_box_bottom_left",        # 20 (#21)
+    "right_penalty_spot",                   # 21 (#22)
+    "right_six_yard_box_top_left",          # 22 (#23)
+    "right_six_yard_box_bottom_left",       # 23 (#24)
+    "top_right_corner",                     # 24 (#25)
+    "right_penalty_box_top_right",          # 25 (#26)
+    "right_six_yard_box_top_right",         # 26 (#27)
+    "right_six_yard_box_bottom_right",      # 27 (#28)
+    "right_penalty_box_bottom_right",       # 28 (#29)
+    "bottom_right_corner",                  # 29 (#30)
+    "center_circle_left",                   # 30 (#31)
+    "center_circle_right",                  # 31 (#32)
+)
+
+PITCH_KEYPOINTS_32_METERS = (
+    (0.0, 0.0),                                         # 0: top_left_corner
+    (0.0, 13.84),                                       # 1: left_penalty_box_top_left
+    (0.0, 24.84),                                       # 2: left_six_yard_box_top_left
+    (0.0, 43.16),                                       # 3: left_six_yard_box_bottom_left
+    (0.0, 54.16),                                       # 4: left_penalty_box_bottom_left
+    (0.0, 68.0),                                        # 5: bottom_left_corner
+    (5.5, 24.84),                                       # 6: left_six_yard_box_top_right
+    (5.5, 43.16),                                       # 7: left_six_yard_box_bottom_right
+    (11.0, 34.0),                                       # 8: left_penalty_spot
+    (16.5, 13.84),                                      # 9: left_penalty_box_top_right
+    (16.5, 24.84),                                      # 10: left_penalty_box_six_yard_top
+    (16.5, 43.16),                                      # 11: left_penalty_box_six_yard_bottom
+    (16.5, 54.16),                                      # 12: left_penalty_box_bottom_right
+    (52.5, 0.0),                                        # 13: halfway_top
+    (52.5, 34.0 - CENTER_CIRCLE_RADIUS_M),              # 14: center_circle_top (52.5, 24.85)
+    (52.5, 34.0 + CENTER_CIRCLE_RADIUS_M),              # 15: center_circle_bottom (52.5, 43.15)
+    (52.5, 68.0),                                       # 16: halfway_bottom
+    (88.5, 13.84),                                      # 17: right_penalty_box_top_left
+    (88.5, 24.84),                                      # 18: right_penalty_box_six_yard_top
+    (88.5, 43.16),                                      # 19: right_penalty_box_six_yard_bottom
+    (88.5, 54.16),                                      # 20: right_penalty_box_bottom_left
+    (94.0, 34.0),                                       # 21: right_penalty_spot
+    (99.5, 24.84),                                      # 22: right_six_yard_box_top_left
+    (99.5, 43.16),                                      # 23: right_six_yard_box_bottom_left
+    (105.0, 0.0),                                       # 24: top_right_corner
+    (105.0, 13.84),                                     # 25: right_penalty_box_top_right
+    (105.0, 24.84),                                     # 26: right_six_yard_box_top_right
+    (105.0, 43.16),                                     # 27: right_six_yard_box_bottom_right
+    (105.0, 54.16),                                     # 28: right_penalty_box_bottom_right
+    (105.0, 68.0),                                      # 29: bottom_right_corner
+    (52.5 - CENTER_CIRCLE_RADIUS_M, 34.0),              # 30: center_circle_left (43.35, 34.0)
+    (52.5 + CENTER_CIRCLE_RADIUS_M, 34.0),              # 31: center_circle_right (61.65, 34.0)
+)
+
 # Kuş bakışı 2D saha görselleştirmesi (minimap) boyutları (piksel).
 # Saha oranını (105:68) koruyacak şekilde otomatik hesaplanır.
 PITCH_MINIMAP_WIDTH_PX = 600
@@ -537,9 +626,11 @@ SECURITY_ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv"}
 # YOLO ağırlık (Pickle / RCE) güvenliği ve bütünlük doğrulaması
 SECURITY_ENFORCE_MODEL_DIR_WHITELIST = True
 SECURITY_MODEL_SHA256 = os.environ.get("FOOTBALL_MODEL_SHA256") or None
+SECURITY_PITCH_MODEL_SHA256 = os.environ.get("FOOTBALL_PITCH_MODEL_SHA256") or None
 SECURITY_ALLOWED_OFFICIAL_YOLO_BASENAMES = {
     "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
     "yolo11n.pt", "yolo11s.pt", "yolo11m.pt", "yolo11l.pt", "yolo11x.pt",
+    "yolo11n-pose.pt", "yolo11s-pose.pt", "yolo11m-pose.pt", "yolo11l-pose.pt", "yolo11x-pose.pt",
 }
 
 # API iş kuyruğu, hız sınırı ve kimlik doğrulama ayarları (gizli anahtarlar YALNIZCA env'den okunur)

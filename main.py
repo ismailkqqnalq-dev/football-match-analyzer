@@ -37,6 +37,7 @@ from modules.tracker import PlayerTracker, BallTracker
 from modules.team_classifier import TeamClassifier
 from modules.perspective_transformer import PerspectiveTransformer
 from modules.camera_motion_tracker import CameraMotionTracker
+from modules.pitch_calibrator import AutoPitchCalibrator, HybridPitchCalibrator
 from modules.data_exporter import DataExporter
 from modules.match_analytics import MatchAnalyzer
 from modules.ml_analyzer import MLAnalyzer
@@ -105,6 +106,10 @@ def parse_args():
         "--no-ml", action="store_true",
         help="Video bitiminde Adım 8 taktik ve scouting ML analizini (xP/xT, rol kümeleme, tempo/anomali) atla"
     )
+    parser.add_argument(
+        "--no-auto-calibrate", action="store_true",
+        help="Otomatik saha anahtar nokta (keypoint) kalibrasyonunu devre dışı bırak"
+    )
     return parser.parse_args()
 
 
@@ -148,17 +153,59 @@ def main():
     # --- Adım 4 için: TeamClassifier ---
     team_classifier = TeamClassifier()
 
-    # --- Adım 5 için: PerspectiveTransformer & CameraMotionTracker ---
-    transformer = PerspectiveTransformer()
-    if not transformer.is_calibrated:
+    # --- Adım 5 / Phase A2 için: PerspectiveTransformer, CameraMotionTracker & Otomatik Kalibrasyon ---
+    manual_points_configured = bool(getattr(config, "SOURCE_CALIBRATION_POINTS", None))
+    auto_cal_requested = (
+        (not manual_points_configured)
+        and (not getattr(args, "no_auto_calibrate", False))
+        and bool(getattr(config, "AUTO_CALIBRATE_PITCH", True))
+    )
+
+    try:
+        transformer = PerspectiveTransformer(quiet=auto_cal_requested)
+    except TypeError:
+        transformer = PerspectiveTransformer()
+
+    motion_tracker = CameraMotionTracker()
+    hybrid_calibrator = None
+
+    if transformer.is_calibrated:
+        if manual_points_configured:
+            print(
+                "[Kalibrasyon] Manuel kalibrasyon (config.SOURCE_CALIBRATION_POINTS) "
+                "öncelikli olarak aktif."
+            )
+    elif auto_cal_requested:
+        if hasattr(transformer, "set_homography") and hasattr(motion_tracker, "reanchor"):
+            auto_calibrator = AutoPitchCalibrator()
+            if auto_calibrator.is_available:
+                hybrid_calibrator = HybridPitchCalibrator(
+                    calibrator=auto_calibrator,
+                    transformer=transformer,
+                    motion_tracker=motion_tracker,
+                )
+                print(
+                    f"[Kalibrasyon] Otomatik saha anahtar nokta kalibrasyonu aktif "
+                    f"(yenileme={hybrid_calibrator.refresh_interval} kare, "
+                    f"yumuşak geçiş={hybrid_calibrator.smooth_frames} kare)."
+                )
+            else:
+                print(
+                    "\n[UYARI] Otomatik kalibrasyon modeli bulunamadı; kalibrasyonsuz "
+                    "(T2) modda devam ediliyor. Saha koordinatları üretilmeyecek ve "
+                    "minimap gösterilmeyecek.\n"
+                )
+        else:
+            print(
+                "\n[UYARI] Kalibrasyon yapılmamış (T2 modu); saha koordinatları üretilmeyecek.\n"
+            )
+    else:
         print(
             "\n[UYARI] Homografi kalibrasyonu yapılmamış. Saha (metre) koordinatları "
             "üretilmeyecek VE taktik minimap görünümü çıktı videosuna eklenmeyecek "
             "(minimap, saha koordinatlarına ihtiyaç duyar). Kalibrasyon için: "
             "python utils/calibrate_homography.py --input <video_yolu>\n"
         )
-
-    motion_tracker = CameraMotionTracker()
 
     with VideoProcessor(args.input, output_video_path) as vp:
         exporter = DataExporter(
@@ -171,8 +218,12 @@ def main():
 
         try:
             def process_frame(frame_idx, frame, raw_detections):
-                # 1) Kamera hareketini (pan/tilt/zoom) ve sahne kesmesini tahmin et -- Adım 5
-                if frame_idx >= config.CALIBRATION_FRAME_INDEX:
+                # 1) Kamera hareketini (pan/tilt/zoom) ve sahne kesmesini tahmin et -- Adım 5 / Phase A2
+                if hybrid_calibrator is not None:
+                    motion_matrix = hybrid_calibrator.process_frame(
+                        frame_idx, frame, raw_detections
+                    )
+                elif frame_idx >= config.CALIBRATION_FRAME_INDEX:
                     motion_matrix = motion_tracker.update(frame, raw_detections)
                 else:
                     motion_matrix = None

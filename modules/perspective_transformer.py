@@ -79,6 +79,7 @@ class PerspectiveTransformer:
         self,
         source_points: Optional[Dict[str, Tuple[float, float]]] = None,
         destination_points_meters: Optional[Dict[str, Tuple[float, float]]] = None,
+        quiet: bool = False,
     ):
         """
         Parametreler
@@ -89,6 +90,8 @@ class PerspectiveTransformer:
         destination_points_meters : Dict[str, Tuple[float, float]], optional
             Landmark ismi -> sahadaki gerçek metre koordinatı. Verilmezse
             config.PITCH_LANDMARKS_METERS kullanılır.
+        quiet : bool, optional
+            True verilirse eksik kalibrasyon noktası başlangıç uyarısı bastırılır.
         """
         self.source_points = (
             source_points if source_points is not None else config.SOURCE_CALIBRATION_POINTS
@@ -98,6 +101,7 @@ class PerspectiveTransformer:
             if destination_points_meters is not None
             else config.PITCH_LANDMARKS_METERS
         )
+        self.quiet = bool(quiet)
 
         self.homography_matrix: Optional[np.ndarray] = None
         self.is_calibrated = False
@@ -193,12 +197,13 @@ class PerspectiveTransformer:
         ]
 
         if len(common_landmarks) < 4:
-            print(
-                f"[PerspectiveTransformer] UYARI: Sadece {len(common_landmarks)} kalibrasyon "
-                f"noktası bulundu (en az 4 gerekli). Homografi hesaplanamadı -- "
-                f"config.py -> SOURCE_CALIBRATION_POINTS'i doldurmalısın "
-                f"(bkz. utils/calibrate_homography.py). Saha koordinatları üretilmeyecek."
-            )
+            if not self.quiet:
+                print(
+                    f"[PerspectiveTransformer] UYARI: Sadece {len(common_landmarks)} kalibrasyon "
+                    f"noktası bulundu (en az 4 gerekli). Homografi hesaplanamadı -- "
+                    f"config.py -> SOURCE_CALIBRATION_POINTS'i doldurmalısın "
+                    f"(bkz. utils/calibrate_homography.py). Saha koordinatları üretilmeyecek."
+                )
             return
 
         # Piksel noktaları (kaynak) ve metre noktaları (hedef) dizilerini hazırla.
@@ -295,6 +300,70 @@ class PerspectiveTransformer:
             f"[PerspectiveTransformer] Homografi başarıyla hesaplandı. "
             f"{len(common_landmarks)} nokta kullanıldı ({inlier_count} tanesi RANSAC inlier)."
         )
+
+    # ----------------------------------------------------------------
+    def set_homography(
+        self,
+        homography_matrix: Optional[np.ndarray],
+        source_points: Optional[Dict[str, Tuple[float, float]]] = None,
+    ) -> bool:
+        """
+        Harici bir kalibratörden gelen 3x3 piksel->metre homografi matrisini
+        doğrulayıp normalize ederek uygular. Geçersiz matriste mevcut durumu korur.
+        """
+        if homography_matrix is None:
+            return False
+
+        try:
+            H = np.asarray(homography_matrix, dtype=np.float64)
+        except (TypeError, ValueError):
+            return False
+
+        if H.ndim != 2 or H.shape != (3, 3) or not bool(np.isfinite(H).all()):
+            return False
+
+        min_abs_det, max_cond, w_eps, row2_min_norm = self._get_homography_thresholds()
+
+        if source_points is not None and len(source_points) > 0:
+            try:
+                pts = np.array(list(source_points.values()), dtype=np.float64)
+            except (TypeError, ValueError):
+                return False
+            if pts.ndim != 2 or pts.shape[1] != 2 or not bool(np.isfinite(pts).all()):
+                return False
+
+            w_cal = H[2, 0] * pts[:, 0] + H[2, 1] * pts[:, 1] + H[2, 2]
+            if not bool(np.isfinite(w_cal).all()):
+                return False
+            if float(np.median(w_cal)) < 0.0:
+                H = -H
+                w_cal = -w_cal
+            row2_norm = float(np.linalg.norm(H[2, :]))
+            if not math.isfinite(row2_norm) or row2_norm <= row2_min_norm:
+                return False
+            if not bool(np.all(w_cal > w_eps * row2_norm)):
+                return False
+
+        validated_H = self._validate_and_normalize_matrix(
+            H,
+            min_abs_det=min_abs_det,
+            max_cond=max_cond,
+            row2_min_norm=row2_min_norm,
+        )
+        if validated_H is None:
+            return False
+
+        self.homography_matrix = validated_H.copy()
+        self.is_calibrated = True
+        if source_points is not None:
+            self.source_points = dict(source_points)
+        return True
+
+    # ----------------------------------------------------------------
+    def clear_calibration(self) -> None:
+        """Aktif homografi kalibrasyonunu temizleyip kalibrasyonsuz (T2) moda döner."""
+        self.homography_matrix = None
+        self.is_calibrated = False
 
     # ----------------------------------------------------------------
     def transform_point(

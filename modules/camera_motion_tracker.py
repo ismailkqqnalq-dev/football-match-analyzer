@@ -907,6 +907,102 @@ class CameraMotionTracker:
         self._last_reanchor_frame = 0
 
     # ----------------------------------------------------------------
+    def reanchor(
+        self,
+        frame: np.ndarray,
+        detections: Optional[List[Dict]] = None,
+        keep_keyframe_bank: bool = True,
+        prev_cumulative: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        """
+        Mevcut kareyi yeni referans çapası (M = I) olarak ayarlar.
+        Periyodik keypoint yenilemesinde (keep_keyframe_bank=True) mevcut
+        anahtar kare bankasındaki M_k matrislerini inv(M_old) @ M_k ile yeni
+        kare koordinat sistemine taşır; sahne kesmesi sonrası yeni açıda
+        (keep_keyframe_bank=False) bankayı sıfırlayıp mevcut kareyi Keyframe 0 yapar.
+        """
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        mask = self._build_background_mask(frame.shape, detections)
+        signals = self._compute_frame_signals(frame)
+
+        gray_flow, sx, sy = self._get_flow_scale_and_gray(gray)
+        if (sx, sy) != (1.0, 1.0):
+            mask_flow = cv2.resize(
+                mask,
+                (gray_flow.shape[1], gray_flow.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        else:
+            mask_flow = mask
+        scale_avg = 0.5 * (sx + sy)
+
+        rebase_m: Optional[np.ndarray] = None
+        if keep_keyframe_bank:
+            cand_m = (
+                prev_cumulative
+                if prev_cumulative is not None
+                else (self.cumulative_matrix if self.is_anchored else None)
+            )
+            if cand_m is not None:
+                try:
+                    m_arr = np.asarray(cand_m, dtype=np.float64)
+                    if (
+                        m_arr.shape == (3, 3)
+                        and bool(np.isfinite(m_arr).all())
+                        and abs(float(np.linalg.det(m_arr))) > 1e-10
+                    ):
+                        inv_prev = np.linalg.inv(m_arr)
+                        if bool(np.isfinite(inv_prev).all()):
+                            rebase_m = inv_prev
+                except np.linalg.LinAlgError:
+                    rebase_m = None
+
+        if keep_keyframe_bank and rebase_m is not None:
+            rebased_bank: List[Dict] = []
+            for kf in self._keyframe_bank:
+                rebased = rebase_m @ kf["M_k"]
+                rebased_valid = self._validate_homography(
+                    rebased, frame.shape, is_step=False
+                )
+                if rebased_valid is None:
+                    continue
+                new_kf = dict(kf)
+                new_kf["M_k"] = rebased_valid
+                new_kf["view_center_ref"] = self._project_center_ref(
+                    rebased_valid, frame.shape
+                )
+                rebased_bank.append(new_kf)
+            self._keyframe_bank = rebased_bank
+        else:
+            self._keyframe_bank.clear()
+            self._last_kf_frame = -1000
+
+        self.cumulative_matrix = np.eye(3, dtype=np.float64)
+        self.is_anchored = True
+        self.recovered_this_frame = False
+        self.tracking_lost = False
+        self.shot_state = "ANCHORED"
+        self.consecutive_lost_frames = 0
+        self._healthy_anchored_frames = 1
+        self._fade_degraded_count = 0
+        self._recovery_streak = 0
+        self._anchor_green_ratio = float(signals["green_ratio"])  # type: ignore[arg-type]
+        self._last_reanchor_frame = self.frame_count
+
+        # NOT: self.scene_cut_detected bilinçli olarak değiştirilmez; aynı karede
+        # sahne kesmesi olmuşsa main.py oyuncu/top izlerini sıfırlayabilmelidir.
+        self.prev_points = self._detect_features(gray_flow, mask_flow, scale_avg)
+        self._store_prev_signals(
+            gray, gray_flow, (sx, sy), signals, reset_baseline=True
+        )
+
+        has_pinned = any(bool(kf.get("pinned")) for kf in self._keyframe_bank)
+        self._maybe_insert_keyframe(
+            gray, mask, frame.shape, pinned=(not has_pinned)
+        )
+        return self.cumulative_matrix.copy()
+
+    # ----------------------------------------------------------------
     def update(
         self,
         frame: np.ndarray,
