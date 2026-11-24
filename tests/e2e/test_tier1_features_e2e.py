@@ -467,7 +467,7 @@ def test_f2_data_exporter_streaming_flush_csv_and_sqlite_wal(tmp_path, isolated_
     assert Path(out_sql).is_file()
 
     df = pd.read_csv(out_csv)
-    assert len(df.columns) == 16
+    assert list(df.columns) == list(DataExporter.COLUMNS)  # A2-3: calib_reset eklendi (17 sütun)
     assert len(df) == 70
     assert query_sqlite_count_readonly(Path(out_sql)) == 70
 
