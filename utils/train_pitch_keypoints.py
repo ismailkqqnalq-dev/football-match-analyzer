@@ -572,6 +572,30 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         default=0.5,
         help="Yatay çevirme artırma olasılığı (flip_idx yoksa şablondan üretilir).",
     )
+    parser.add_argument(
+        "--mosaic",
+        type=float,
+        default=1.0,
+        help=(
+            "Mosaic artırma olasılığı. Sahanın kısmi görüldüğü (TV yakın çekim) karelere "
+            "genelleme sağlar; tamamen kapatmak (0) TV görüntülerinde tespiti çökertir."
+        ),
+    )
+    parser.add_argument(
+        "--close-mosaic",
+        type=int,
+        default=40,
+        help=(
+            "Son N epoch'ta mosaic kapatılır. Nokta hassasiyeti bu evrede oturur; "
+            "Ultralytics varsayılanı (10) saha noktaları için yetersiz kaldı."
+        ),
+    )
+    parser.add_argument(
+        "--scale",
+        type=float,
+        default=0.7,
+        help="Ölçek artırma aralığı (±). Yakınlaştırılmış yayın karelerine genelleme için.",
+    )
     return parser.parse_args(argv)
 
 
@@ -724,6 +748,9 @@ def main(argv: Optional[Sequence[str]] = None):
         save=True,
         plots=True,
         fliplr=flip_policy["fliplr"],
+        mosaic=args.mosaic,
+        close_mosaic=args.close_mosaic,
+        scale=args.scale,
     )
 
     # --------------------------------------------------------------
