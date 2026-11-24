@@ -52,11 +52,12 @@ _ANALYTICS_COLUMNS = (
     "pitch_x",
     "pitch_y",
     "on_pitch",
+    "calib_reset",
 )
 _ANALYTICS_COL_SET = frozenset(_ANALYTICS_COLUMNS)
 _CAT_COLS = ("track_id", "class_name", "team")
 _FLOAT32_COLS = ("pixel_x", "pixel_y", "pitch_x", "pitch_y")
-_BOOL_COLS = ("is_predicted", "on_pitch")
+_BOOL_COLS = ("is_predicted", "on_pitch", "calib_reset")
 
 
 def _get_human_class_names() -> set:
@@ -601,6 +602,13 @@ class MatchAnalyzer:
             fps=self.fps,
             is_calibrated=self.is_calibrated,
             bounds=bounds,
+            reset_frames=(
+                self.df.loc[
+                    _bool_mask(self.df["calib_reset"], na_value=False), "frame_idx"
+                ].to_numpy(dtype=np.int64)
+                if "calib_reset" in self.df.columns
+                else None
+            ),
         )
         self._last_kinematic_info = kin
 

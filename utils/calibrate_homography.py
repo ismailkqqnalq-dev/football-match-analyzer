@@ -502,6 +502,115 @@ def run_interactive_calibration(video_path: str, start_frame_index: int):
     print("=" * 70)
 
 
+# ----------------------------------------------------------------------
+# A2-6: İsabet ölçümü için çok kareli etiketleme modu (--label-mode)
+# ----------------------------------------------------------------------
+LABEL_COLUMNS = ("frame_idx", "landmark_name", "pixel_x", "pixel_y")
+
+
+def resolve_label_frames(total_frames: int, fps: float, frames_arg=None, every_sec=None):
+    """--frames "100,350" ya da --every-sec 15 değerinden etiketlenecek kare listesini üretir."""
+    total_frames = max(1, int(total_frames))
+    if frames_arg:
+        frames = sorted({int(x) for x in str(frames_arg).split(",") if x.strip() != ""})
+    elif every_sec:
+        step = max(1, int(round(float(every_sec) * (fps or 25.0))))
+        frames = list(range(0, total_frames, step))
+    else:
+        raise ValueError("Etiketleme modu için --frames ya da --every-sec gerekli.")
+    bad = [f for f in frames if f < 0 or f >= total_frames]
+    if bad:
+        raise ValueError(f"Video aralığı dışında kareler: {bad} (toplam {total_frames} kare)")
+    return frames
+
+
+def label_landmark_names():
+    from utils.evaluate_homography import label_landmarks_meters
+
+    return sorted(label_landmarks_meters().keys())
+
+
+def parse_landmark_answer(answer: str, names):
+    """Kullanıcı yanıtını (isim ya da listedeki numara) saha noktası adına çevirir; boş/geçersizse None."""
+    answer = (answer or "").strip()
+    if not answer:
+        return None
+    if answer.isdigit():
+        idx = int(answer)
+        return names[idx] if 0 <= idx < len(names) else None
+    return answer if answer in names else None
+
+
+def write_labels_csv(path: str, rows) -> str:
+    import csv
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(LABEL_COLUMNS)
+        for r in rows:
+            w.writerow([int(r[0]), r[1], round(float(r[2]), 1), round(float(r[3]), 1)])
+    return path
+
+
+def run_label_mode(video_path: str, frames, output_path: str):
+    """
+    Seçilen her karede bilinen saha noktalarına SOL TIKLA; 'n' ile sonraki kareye geç,
+    'q' ile bitir. Her karenin sonunda tıklanan noktaların adları terminalden sorulur
+    (isim ya da listedeki numara; boş bırakılan nokta atlanır).
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise IOError(f"Video açılamadı: {video_path}")
+    names = label_landmark_names()
+    print("Geçerli saha noktaları (numara ya da isim yazabilirsin):")
+    for i, n in enumerate(names):
+        print(f"  {i:2d}: {n}")
+
+    rows = []
+    window_name = "Etiketleme - SOL TIK: nokta, n: sonraki kare, q: bitir"
+    cv2.namedWindow(window_name)
+    stop = False
+    for k, f in enumerate(frames, start=1):
+        frame = read_frame_at(cap, f)
+        if frame is None:
+            print(f"[UYARI] Kare {f} okunamadı, atlanıyor.")
+            continue
+        clicked_points.clear()
+
+        def redraw(frame=frame, f=f, k=k):
+            disp = frame.copy()
+            for i, (x, y) in enumerate(clicked_points, start=1):
+                cv2.circle(disp, (x, y), 5, (0, 0, 255), -1)
+                cv2.putText(disp, str(i), (x + 8, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            cv2.rectangle(disp, (0, 0), (disp.shape[1], 30), (0, 0, 0), -1)
+            cv2.putText(disp, f"Kare {f} ({k}/{len(frames)}) | {len(clicked_points)} nokta",
+                        (10, 21), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.imshow(window_name, disp)
+
+        cv2.setMouseCallback(window_name, mouse_callback, param={"redraw": redraw})
+        redraw()
+        while True:
+            key = cv2.waitKey(30) & 0xFF
+            if key in (ord("n"), ord("q")):
+                stop = key == ord("q")
+                break
+        for i, (x, y) in enumerate(list(clicked_points), start=1):
+            name = parse_landmark_answer(input(f"Kare {f} nokta {i} (x={x}, y={y}) -> saha noktası: "), names)
+            if name is None:
+                print("  atlandı")
+                continue
+            rows.append((f, name, x, y))
+        if stop:
+            break
+    cap.release()
+    cv2.destroyAllWindows()
+    write_labels_csv(output_path, rows)
+    print(f"{len(rows)} etiket yazıldı: {output_path}")
+    print("Ölçüm: python utils/evaluate_homography.py --log <export>/homography_log.csv "
+          f"--labels {output_path}")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Homografi kalibrasyon aracı")
     parser.add_argument("--input", type=str, default=config.DEFAULT_INPUT_VIDEO)
@@ -526,13 +635,33 @@ def parse_args():
             "docstring'i). Sahanın tamamı tek bir karede görünmüyorsa kullan."
         ),
     )
+    parser.add_argument(
+        "--label-mode", action="store_true",
+        help="A2-6: isabet ölçümü için birden fazla karede saha noktası etiketle (labels.csv)",
+    )
+    parser.add_argument("--frames", type=str, default=None, help='Etiketlenecek kareler, örn. "100,350,900"')
+    parser.add_argument("--every-sec", type=float, default=None, help="Her N saniyede bir kare etiketle")
+    parser.add_argument(
+        "--labels-out", type=str, default=os.path.join(config.EXPORT_DIR, "labels.csv"),
+        help="Etiket dosyası yolu (varsayılan: data/exports/labels.csv)",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
 
-    if args.save_frame_only:
+    if args.label_mode:
+        cap = cv2.VideoCapture(args.input)
+        if not cap.isOpened():
+            raise IOError(f"Video açılamadı: {args.input}")
+        label_frames = resolve_label_frames(
+            int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), cap.get(cv2.CAP_PROP_FPS) or 25.0,
+            args.frames, args.every_sec,
+        )
+        cap.release()
+        run_label_mode(args.input, label_frames, args.labels_out)
+    elif args.save_frame_only:
         cap = cv2.VideoCapture(args.input)
         if not cap.isOpened():
             raise IOError(f"Video açılamadı: {args.input}")

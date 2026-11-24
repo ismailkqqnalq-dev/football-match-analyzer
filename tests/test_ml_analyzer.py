@@ -477,6 +477,9 @@ def test_main_step8_integration_and_no_ml_flag(tmp_path, monkeypatch):
     class DummyPerspective:
         is_calibrated = False
 
+        def __init__(self, *args, **kwargs):
+            pass
+
     class DummyExporter:
         def __init__(self, fps=25.0, **kwargs):
             self.fps = fps

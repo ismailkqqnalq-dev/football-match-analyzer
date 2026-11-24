@@ -127,6 +127,9 @@ def test_t1_main_cli_short_video_prints_insufficient_not_roc_auc(tmp_path, monke
     class DummyPerspective:
         is_calibrated = True
 
+        def __init__(self, *args, **kwargs):
+            pass
+
     class DummyExporter:
         def __init__(self, fps=25.0, **kwargs):
             self.fps = fps

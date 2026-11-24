@@ -538,3 +538,237 @@ def test_api_upload_size_limit_and_gpu_queue_saturation(tmp_path):
             assert r3.status_code == 429
     finally:
         blocker.set()
+
+
+# ----------------------------------------------------------------------
+# 7. Phase A2 Saha Anahtar Nokta Modeli & Eğitim/İndirme Güvenliği
+# ----------------------------------------------------------------------
+def test_pitch_model_weight_path_hardening_and_sha256_isolation(tmp_path, monkeypatch):
+    from modules import pitch_calibrator as pc_module
+
+    fake_models = tmp_path / "models"
+    fake_models.mkdir()
+    pitch_weight = fake_models / "football_pitch_pose.pt"
+    pitch_weight.write_bytes(b"valid-pitch-pose-weights")
+    pitch_sha = compute_sha256(pitch_weight)
+
+    outside_weight = tmp_path / "evil_pitch.pt"
+    outside_weight.write_bytes(b"malicious-pitch-pickle")
+
+    # Dizin dışı, traversal, geçersiz uzantı, null byte ve UNC yollar reddedilmeli
+    for bad_path in (
+        outside_weight,
+        fake_models / ".." / "evil_pitch.pt",
+        fake_models / "bad_pitch.pkl",
+        fake_models / "bad_pitch.onnx",
+        "football_pitch_pose.pt\x00.txt",
+        r"\\evil-server\share\football_pitch_pose.pt",
+        str(tmp_path / "sub" / "yolo11s-pose.pt"),
+        "../yolo11s-pose.pt",
+    ):
+        with pytest.raises(SecurityViolationError):
+            validate_model_weight_path(
+                bad_path,
+                models_dir=fake_models,
+                sha256_config_attr="SECURITY_PITCH_MODEL_SHA256",
+            )
+
+    # Göreceli alt dizin yolu resmi yalın isim olarak sayılmamalı; models/ içine hapsedilmeli
+    sub_pose = validate_model_weight_path(
+        "sub/yolo11s-pose.pt",
+        models_dir=fake_models,
+        sha256_config_attr="SECURITY_PITCH_MODEL_SHA256",
+    )
+    assert sub_pose == (fake_models / "sub" / "yolo11s-pose.pt").resolve()
+
+    # Sembolik bağ ile dizin dışına kaçış reddedilmeli (OS izin veriyorsa)
+    escape_link = fake_models / "escape_pitch.pt"
+    try:
+        escape_link.symlink_to(outside_weight)
+    except (OSError, NotImplementedError):
+        pass
+    else:
+        with pytest.raises(SecurityViolationError):
+            validate_model_weight_path(
+                escape_link,
+                models_dir=fake_models,
+                sha256_config_attr="SECURITY_PITCH_MODEL_SHA256",
+            )
+
+    # Resmi YOLO-Pose temel ağırlık isimleri izin verilen listede olmalı
+    for official_pose in (
+        "yolo11n-pose.pt",
+        "yolo11s-pose.pt",
+        "yolo11m-pose.pt",
+        "yolo11l-pose.pt",
+        "yolo11x-pose.pt",
+    ):
+        assert (
+            validate_model_weight_path(
+                official_pose,
+                models_dir=fake_models,
+                sha256_config_attr="SECURITY_PITCH_MODEL_SHA256",
+            ).name
+            == official_pose
+        )
+
+    # SHA-256 izolasyonu: dedektör SHA-256'sı saha modelini etkilememeli
+    monkeypatch.setattr(config, "MODELS_DIR", str(fake_models))
+    monkeypatch.setattr(config, "SECURITY_MODEL_SHA256", "f" * 64)
+    monkeypatch.setattr(config, "SECURITY_PITCH_MODEL_SHA256", None)
+    assert (
+        validate_model_weight_path(
+            pitch_weight,
+            sha256_config_attr="SECURITY_PITCH_MODEL_SHA256",
+        )
+        == pitch_weight.resolve()
+    )
+
+    # Yanlış saha SHA-256 değeri reddedilmeli, doğru olan kabul edilmeli
+    monkeypatch.setattr(config, "SECURITY_PITCH_MODEL_SHA256", "0" * 64)
+    with pytest.raises(SecurityViolationError, match="SHA-256"):
+        validate_model_weight_path(
+            pitch_weight,
+            sha256_config_attr="SECURITY_PITCH_MODEL_SHA256",
+        )
+
+    monkeypatch.setattr(config, "SECURITY_PITCH_MODEL_SHA256", pitch_sha)
+    assert (
+        validate_model_weight_path(
+            pitch_weight,
+            sha256_config_attr="SECURITY_PITCH_MODEL_SHA256",
+        )
+        == pitch_weight.resolve()
+    )
+
+    # AutoPitchCalibrator, YOLO() çağrısından ÖNCE güvensiz yolu / SHA uyumsuzluğunu engellemeli
+    yolo_calls = {"count": 0}
+
+    class SpyYOLO:
+        def __init__(self, path):
+            yolo_calls["count"] += 1
+            self.loaded_path = path
+
+    monkeypatch.setattr(pc_module, "YOLO", SpyYOLO)
+
+    with pytest.raises(SecurityViolationError):
+        pc_module.AutoPitchCalibrator(model_path=str(outside_weight), device="cpu")
+    with pytest.raises(SecurityViolationError):
+        pc_module.AutoPitchCalibrator(
+            model_path=str(fake_models / ".." / "evil_pitch.pt"), device="cpu"
+        )
+    monkeypatch.setattr(config, "SECURITY_PITCH_MODEL_SHA256", "0" * 64)
+    with pytest.raises(SecurityViolationError, match="SHA-256"):
+        pc_module.AutoPitchCalibrator(model_path=str(pitch_weight), device="cpu")
+    assert yolo_calls["count"] == 0
+
+    monkeypatch.setattr(config, "SECURITY_PITCH_MODEL_SHA256", pitch_sha)
+    cal = pc_module.AutoPitchCalibrator(model_path=str(pitch_weight), device="cpu")
+    assert cal.is_available is True
+    assert yolo_calls["count"] == 1
+
+
+def test_download_models_url_scheme_and_pitch_sha256_hardening(tmp_path, monkeypatch):
+    import utils.download_models as dm
+
+    net_calls = {"count": 0}
+
+    def _fail_urlopen(*args, **kwargs):
+        net_calls["count"] += 1
+        raise AssertionError("Güvensiz URL veya eksik SHA-256 ile ağ çağrısı yapılmamalıydı!")
+
+    monkeypatch.setattr(dm.urllib.request, "urlopen", _fail_urlopen)
+
+    for target in ("detector", "pitch"):
+        for bad_url in (
+            "file:///etc/passwd",
+            "ftp://example.com/model.pt",
+            "javascript:alert(1)",
+            "https://",
+        ):
+            with pytest.raises(ValueError, match="URL"):
+                dm.download_model(
+                    url=bad_url,
+                    output_path=tmp_path / f"{target}.pt",
+                    expected_sha256="a" * 64,
+                    target=target,
+                )
+    assert net_calls["count"] == 0
+
+    # Hedefler arası SHA-256 sızıntısı olmamalı: detector SHA'sı pitch hedefine yedeklenmemeli
+    monkeypatch.setattr(config, "SECURITY_MODEL_SHA256", "a" * 64)
+    monkeypatch.setattr(config, "SECURITY_PITCH_MODEL_SHA256", None)
+    pitch_out = tmp_path / "pitch_no_sha.pt"
+    with pytest.raises(ValueError, match="SHA-256"):
+        dm.download_model(
+            url="https://example.com/football_pitch_pose.pt",
+            output_path=pitch_out,
+            target="pitch",
+        )
+    assert net_calls["count"] == 0
+    assert not pitch_out.exists()
+    assert not pitch_out.with_suffix(".pt.part").exists()
+
+    # Akış ortasında ağ/IO hatası oluşursa .part dosyası mutlaka temizlenmeli
+    class BrokenResp:
+        def __init__(self):
+            self._calls = 0
+
+        def read(self, n: int = -1):
+            self._calls += 1
+            if self._calls == 1:
+                return b"partial-bytes"
+            raise OSError("bağlantı koptu")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(dm.urllib.request, "urlopen", lambda req, timeout=120.0: BrokenResp())
+    broken_out = tmp_path / "broken_pitch.pt"
+    with pytest.raises(OSError):
+        dm.download_model(
+            url="https://example.com/football_pitch_pose.pt",
+            output_path=broken_out,
+            expected_sha256="b" * 64,
+            target="pitch",
+        )
+    assert not broken_out.exists()
+    assert not broken_out.with_suffix(".pt.part").exists()
+
+
+def test_train_pitch_keypoints_env_only_secret_and_temp_path_hygiene(monkeypatch):
+    import tempfile
+    import utils.train_pitch_keypoints as train_pk
+
+    # --api-key CLI bayrağı güvenlik nedeniyle tamamen reddedilmeli
+    with pytest.raises(SystemExit) as exc_info:
+        train_pk.parse_args(["--api-key", "DUMMY_KEY"])
+    assert exc_info.value.code != 0
+
+    monkeypatch.delenv("ROBOFLOW_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="ROBOFLOW_API_KEY"):
+        train_pk.resolve_api_key()
+
+    monkeypatch.setenv("ROBOFLOW_API_KEY", "  DUMMY_ENV_TOKEN  ")
+    assert train_pk.resolve_api_key() == "DUMMY_ENV_TOKEN"
+
+    masked = train_pk._sanitize_secret(
+        "https://api.roboflow.com/pitch?key=DUMMY_ENV_TOKEN",
+        "DUMMY_ENV_TOKEN",
+    )
+    assert "DUMMY_ENV_TOKEN" not in masked
+    assert "***" in masked
+
+    root, dataset_dir, runs_dir = train_pk.resolve_temp_paths(
+        None, "football-field-detection-f07vi", "1"
+    )
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    repo_root = Path(config.BASE_DIR).resolve()
+    assert root.is_relative_to(temp_root)
+    assert dataset_dir.is_relative_to(root)
+    assert runs_dir.is_relative_to(root)
+    assert not dataset_dir.is_relative_to(repo_root)
+    assert not runs_dir.is_relative_to(repo_root)

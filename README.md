@@ -48,6 +48,30 @@ Bu adımı atlarsanız pipeline yine çalışır, sadece `pitch_x`/`pitch_y` ala
 `None` kalır (piksel koordinatları, `pixel_fallback` modundaki analizler ve
 video çıktısı etkilenmez).
 
+### Kalibrasyon isabetini ölçme (Faz A2)
+Otomatik kalibrasyonun gerçek videoda kaç metre şaştığını ölçmek için iki klipte
+(bir TV yayını, bir sabit/geniş kamera) 20'şer kare etiketleyin:
+
+1. Pipeline'ı çalıştırın; export dizinine kare bazında `homography_log.csv` yazılır
+   (`--no-homography-log` ile kapatılabilir):
+   ```powershell
+   python main.py --input data/input_videos/klip.mp4 --no-video --export-dir data/exports/klip
+   ```
+2. Aynı klipte bilinen saha noktalarına tıklayarak etiketleyin (`n`: sonraki kare,
+   `q`: bitir; nokta adını isim ya da listedeki numarayla girin):
+   ```powershell
+   python utils/calibrate_homography.py --input data/input_videos/klip.mp4 --label-mode --every-sec 15 --labels-out data/exports/klip/labels.csv
+   ```
+   Belirli kareler için `--every-sec` yerine `--frames 100,350,900` kullanılabilir.
+3. Ölçümü çalıştırın; Türkçe özet ekrana, ayrıntılar `homography_eval.json`'a yazılır:
+   ```powershell
+   python utils/evaluate_homography.py --log data/exports/klip/homography_log.csv --labels data/exports/klip/labels.csv
+   ```
+   Özet; ortanca ve %90'lık dilim hatasını, etiketli karelerde geçerli tablo oranını
+   ve kaynağa göre (`keypoint_*`, `flow`, `blend`) kırılımı verir. Etiketlenip tablosu
+   olmayan kare "tablo yok" sayılır. Hedef: TV yayınında ortanca hata < 1 m, sabit
+   kamerada < 0,5 m ve etiketli karelerin en az %90'ında geçerli tablo.
+
 ## Çalıştırma
 ```bash
 python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4
@@ -107,6 +131,43 @@ $env:YOLO_CONFIG_DIR = "$env:TEMP\ultralytics_cfg"
 python utils/train_custom_yolo.py --epochs 60 --imgsz 960 --batch 4
 Remove-Item Env:ROBOFLOW_API_KEY -ErrorAction SilentlyContinue
 ```
+
+## Otomatik Saha Kalibrasyonu ve Saha Anahtar Nokta Modeli (Faz A2)
+`config.SOURCE_CALIBRATION_POINTS` boşsa ve `models/football_pitch_pose.pt` varsa pipeline
+sahayı 32 anahtar noktayla (YOLO-Pose) otomatik kalibre eder; model yoksa kalibrasyonsuz
+(T2) modda devam eder. Önemli davranışlar:
+- **Kademeli kabul**: Model, optical flow tablosuyla düzenli olarak karşılaştırılır.
+  Fark 0,5 m altındaysa tablo değiştirilmez; 1 m'ye kadar yumuşak geçişle kabul edilir;
+  daha büyük fark ancak sonraki 2 yenilemede doğrulanırsa kabul edilir (tek seferlik hatalı
+  tespitler oyuncuları sahada kaydırmaz). 3 m üstü doğrulanmış düzeltmeler sert geçişle
+  uygulanır ve o kare `calib_reset` olarak işaretlenip mesafe/hız hesaplarından dışlanır.
+- **Görüntü profili** (`config.FOOTAGE_PROFILE = "auto" | "fixed" | "broadcast"`): ilk 5 sn'de
+  kamera hareketi ve sahne kesmesine bakılır. Sabit kamerada tek, en tutarlı tablo kilitlenir
+  ve yalnızca 10 sn'de bir sağlık kontrolü yapılır; kesme ya da kamera hareketi görülürse
+  yayın profiline geçilir (tersine geçiş yok). Karar `calibration_summary.json`'a yazılır.
+- **Kayıt**: kare bazında kullanılan tablo `homography_log.csv`'ye yazılır (isabet ölçümü için).
+
+### Saha anahtar nokta modelini eğitme (RTX 4050 6 GB)
+Roboflow API anahtarı yalnızca ortam değişkeniyle verilir, hiçbir dosyaya yazılmaz.
+1. Veri setini indirip **nokta sırasını kontrol edin** (eğitim başlamaz):
+   ```powershell
+   $env:ROBOFLOW_API_KEY = "SENIN_ROBOFLOW_API_KEYIN"
+   $env:YOLO_CONFIG_DIR = "$env:TEMP\ultralytics_cfg"
+   python utils/train_pitch_keypoints.py --check-order-only
+   ```
+   `runs/pitch_order_check/*.png` görsellerinde her nokta, `config.PITCH_KEYPOINT_NAMES_32`'deki
+   adımızla çizilir. Adlar noktaların gerçek yerleriyle (köşe, ceza sahası köşesi, orta yuvarlak
+   vb.) eşleşmiyorsa **eğitime geçmeyin**: sıra kaymış demektir ve tüm kalibrasyon sessizce
+   yanlış olur. Betik ayrıca `kpt_shape == [32, 3]` kontrolü yapar; veri setinde `flip_idx`
+   yoksa yatay çevirme eşlemesini bizim şablondan üretir, veri setindeki eşleme şablonla
+   uyuşmuyorsa çevirmeyi kapatıp uyarır.
+2. Görseller doğruysa eğitimi başlatın (yaklaşık 15-40 dk, veri seti boyutuna bağlı):
+   ```powershell
+   python utils/train_pitch_keypoints.py --epochs 60 --imgsz 640 --batch 4
+   Remove-Item Env:ROBOFLOW_API_KEY -ErrorAction SilentlyContinue
+   ```
+3. Betik en iyi ağırlığı `models/football_pitch_pose.pt` olarak kaydeder, SHA-256 özetini ve
+   `$env:FOOTBALL_PITCH_MODEL_SHA256` / `SECURITY_PITCH_MODEL_SHA256` satırlarını yazdırır.
 
 ## TV Yayını Sahne Kesmesi ve Uzun Çekim Kayma (Drift) Dayanıklılığı (Adım 5)
 - **Çok Sinyalli Kesme ve Kademeli Geçiş (Dissolve) Tespiti**: `CameraMotionTracker`, gri/HSV histogram korelasyonu, kenar yoğunluğu, yeşil çim oranı ve optical flow RANSAC inlier oranını birlikte değerlendirerek sert kesmeleri, yakın çekim tekrarları ve kademeli geçişleri (fade/dissolve) yakalar.

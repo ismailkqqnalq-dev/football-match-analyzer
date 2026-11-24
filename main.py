@@ -23,6 +23,7 @@ Kullanım:
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -37,6 +38,11 @@ from modules.tracker import PlayerTracker, BallTracker
 from modules.team_classifier import TeamClassifier
 from modules.perspective_transformer import PerspectiveTransformer
 from modules.camera_motion_tracker import CameraMotionTracker
+from modules.pitch_calibrator import (
+    AutoPitchCalibrator,
+    HomographyLogWriter,
+    HybridPitchCalibrator,
+)
 from modules.data_exporter import DataExporter
 from modules.match_analytics import MatchAnalyzer
 from modules.ml_analyzer import MLAnalyzer
@@ -105,6 +111,14 @@ def parse_args():
         "--no-ml", action="store_true",
         help="Video bitiminde Adım 8 taktik ve scouting ML analizini (xP/xT, rol kümeleme, tempo/anomali) atla"
     )
+    parser.add_argument(
+        "--no-auto-calibrate", action="store_true",
+        help="Otomatik saha anahtar nokta (keypoint) kalibrasyonunu devre dışı bırak"
+    )
+    parser.add_argument(
+        "--no-homography-log", action="store_true",
+        help="Kare bazında kalibrasyon kaydını (homography_log.csv) yazmayı atla"
+    )
     return parser.parse_args()
 
 
@@ -148,9 +162,45 @@ def main():
     # --- Adım 4 için: TeamClassifier ---
     team_classifier = TeamClassifier()
 
-    # --- Adım 5 için: PerspectiveTransformer & CameraMotionTracker ---
-    transformer = PerspectiveTransformer()
-    if not transformer.is_calibrated:
+    # --- Adım 5 / Phase A2 için: PerspectiveTransformer, CameraMotionTracker & Otomatik Kalibrasyon ---
+    manual_points_configured = bool(getattr(config, "SOURCE_CALIBRATION_POINTS", None))
+    auto_cal_requested = (
+        (not manual_points_configured)
+        and (not getattr(args, "no_auto_calibrate", False))
+        and bool(getattr(config, "AUTO_CALIBRATE_PITCH", True))
+    )
+
+    transformer = PerspectiveTransformer(quiet=auto_cal_requested)
+
+    motion_tracker = CameraMotionTracker()
+    hybrid_calibrator = None
+
+    if transformer.is_calibrated:
+        if manual_points_configured:
+            print(
+                "[Kalibrasyon] Manuel kalibrasyon (config.SOURCE_CALIBRATION_POINTS) "
+                "öncelikli olarak aktif."
+            )
+    elif auto_cal_requested:
+        auto_calibrator = AutoPitchCalibrator()
+        if auto_calibrator.is_available:
+            hybrid_calibrator = HybridPitchCalibrator(
+                calibrator=auto_calibrator,
+                transformer=transformer,
+                motion_tracker=motion_tracker,
+            )
+            print(
+                f"[Kalibrasyon] Otomatik saha anahtar nokta kalibrasyonu aktif "
+                f"(yenileme={hybrid_calibrator.refresh_interval} kare, "
+                f"yumuşak geçiş={hybrid_calibrator.smooth_frames} kare)."
+            )
+        else:
+            print(
+                "\n[UYARI] Otomatik kalibrasyon modeli bulunamadı; kalibrasyonsuz "
+                "(T2) modda devam ediliyor. Saha koordinatları üretilmeyecek ve "
+                "minimap gösterilmeyecek.\n"
+            )
+    else:
         print(
             "\n[UYARI] Homografi kalibrasyonu yapılmamış. Saha (metre) koordinatları "
             "üretilmeyecek VE taktik minimap görünümü çıktı videosuna eklenmeyecek "
@@ -158,9 +208,9 @@ def main():
             "python utils/calibrate_homography.py --input <video_yolu>\n"
         )
 
-    motion_tracker = CameraMotionTracker()
-
     with VideoProcessor(args.input, output_video_path) as vp:
+        if hybrid_calibrator is not None:
+            hybrid_calibrator.set_fps(vp.fps)
         exporter = DataExporter(
             fps=vp.fps,
             output_dir=export_dir,
@@ -168,11 +218,22 @@ def main():
             enable_csv=enable_csv,
             enable_sql=enable_sql,
         )
+        homography_log = (
+            None
+            if args.no_homography_log
+            else HomographyLogWriter(
+                os.path.join(export_dir, config.EXPORT_HOMOGRAPHY_LOG_FILENAME)
+            )
+        )
 
         try:
             def process_frame(frame_idx, frame, raw_detections):
-                # 1) Kamera hareketini (pan/tilt/zoom) ve sahne kesmesini tahmin et -- Adım 5
-                if frame_idx >= config.CALIBRATION_FRAME_INDEX:
+                # 1) Kamera hareketini (pan/tilt/zoom) ve sahne kesmesini tahmin et -- Adım 5 / Phase A2
+                if hybrid_calibrator is not None:
+                    motion_matrix = hybrid_calibrator.process_frame(
+                        frame_idx, frame, raw_detections
+                    )
+                elif frame_idx >= config.CALIBRATION_FRAME_INDEX:
                     motion_matrix = motion_tracker.update(frame, raw_detections)
                 else:
                     motion_matrix = None
@@ -206,6 +267,29 @@ def main():
                 else:
                     for det in all_tracked:
                         det["pitch_x"], det["pitch_y"], det["on_pitch"] = None, None, None
+
+                # A2-2: bu karede kullanılan efektif tabloyu ve kalibrasyon kararını kaydet
+                if homography_log is not None:
+                    effective_h = (
+                        HybridPitchCalibrator._normalize_matrix(
+                            transformer.homography_matrix @ motion_matrix
+                        )
+                        if motion_matrix is not None and transformer.is_calibrated
+                        else None
+                    )
+                    if hybrid_calibrator is not None:
+                        log_info = hybrid_calibrator.frame_info
+                    else:
+                        log_info = {"source": "manual" if effective_h is not None else "none"}
+                    homography_log.write(frame_idx, log_info, effective_h)
+
+                # A2-3: kalibrasyon sıçrama karesi -> mesafe/hız hesabında segment bölünür
+                calib_reset = bool(
+                    hybrid_calibrator is not None
+                    and hybrid_calibrator.frame_info.get("calib_reset")
+                )
+                for det in all_tracked:
+                    det["calib_reset"] = calib_reset
 
                 # 7) Bu karenin tüm verisini dışa aktarım için biriktir / akıt -- Adım 6
                 exporter.append_frame_data(frame_idx, all_tracked)
@@ -257,6 +341,21 @@ def main():
             csv_out_path = exporter.export_to_csv() if enable_csv else None
             sql_out_path = exporter.export_to_sql() if enable_sql else None
             exporter.export_distance_summary()
+
+            if homography_log is not None:
+                homography_log.close()
+                print(f"[Kalibrasyon] Kare bazında kalibrasyon kaydı: {homography_log.path}")
+            if hybrid_calibrator is not None:
+                cal_summary = hybrid_calibrator.summary()
+                cal_summary_path = os.path.join(
+                    export_dir, config.EXPORT_CALIBRATION_SUMMARY_FILENAME
+                )
+                with open(cal_summary_path, "w", encoding="utf-8") as fh:
+                    json.dump(cal_summary, fh, ensure_ascii=False, indent=2)
+                print(
+                    f"[Kalibrasyon] Görüntü profili: {cal_summary['profile']} "
+                    f"({cal_summary['profile_reason']}) | özet: {cal_summary_path}"
+                )
 
             # Adım 7 ve Adım 8 için veri kaynağını seç (SQLite -> CSV -> bellek)
             def _load_match_analyzer() -> MatchAnalyzer:
@@ -346,6 +445,8 @@ def main():
                 else:
                     print("Tempo & Anomali -> Saha kalibrasyonu gerekli.")
         finally:
+            if homography_log is not None:
+                homography_log.close()
             if hasattr(exporter, "close"):
                 exporter.close()
 

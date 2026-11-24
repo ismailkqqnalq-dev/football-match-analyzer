@@ -274,6 +274,7 @@ def validate_model_weight_path(
     enforce_whitelist: Optional[bool] = None,
     expected_sha256: Optional[str] = None,
     models_dir: Optional[Union[str, os.PathLike]] = None,
+    sha256_config_attr: str = "SECURITY_MODEL_SHA256",
 ) -> Path:
     """
     PyTorch `.pt` (pickle) deserialization / RCE riskine karşı model yolunu doğrular:
@@ -282,7 +283,7 @@ def validate_model_weight_path(
         yalın dosya adı olarak verilirse kabul edilir.
       - Yerel `.pt` ağırlıkları yalnızca `config.MODELS_DIR` (veya `models_dir`)
         içinden ve sembolik bağla dışarı taşmayacak biçimde yüklenebilir.
-      - `expected_sha256` (veya `config.SECURITY_MODEL_SHA256`) tanımlıysa dosyanın
+      - `expected_sha256` (veya `config.<sha256_config_attr>`) tanımlıysa dosyanın
         SHA-256 özeti sabit zamanlı karşılaştırmayla doğrulanır.
     """
     raw = os.fspath(model_path)
@@ -330,7 +331,7 @@ def validate_model_weight_path(
     sha_target = (
         expected_sha256
         if expected_sha256 is not None
-        else getattr(config, "SECURITY_MODEL_SHA256", None)
+        else (getattr(config, sha256_config_attr, None) if sha256_config_attr else None)
     )
     if sha_target and resolved_model.is_file():
         actual_sha = compute_sha256(resolved_model)
