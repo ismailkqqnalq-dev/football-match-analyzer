@@ -3844,11 +3844,15 @@ class MLAnalyzer:
                     row_ot_start = np.maximum.accumulate(np.where(is_ot_start, idx_o, 0))
                     last_valid_o = np.maximum.accumulate(np.where(o_tm_codes >= 0, idx_o, -1))
                     has_ot = last_valid_o >= row_ot_start
-                    o_resolved_team = np.where(
-                        has_ot,
-                        o_remap[o_tm_codes[np.maximum(0, last_valid_o)]],
-                        u_team_to_code["Unknown"],
-                    )
+                    if o_remap.size == 0:
+                        # Hiç takım etiketi yok: np.where iki dalı da hesapladığı için boş diziye indekslenemez
+                        o_resolved_team = np.full(n_o, u_team_to_code["Unknown"], dtype=np.int64)
+                    else:
+                        o_resolved_team = np.where(
+                            has_ot,
+                            o_remap[o_tm_codes[np.maximum(0, last_valid_o)]],
+                            u_team_to_code["Unknown"],
+                        )
                 else:
                     o_resolved_team = np.full(len(obs_idx), u_team_to_code["Unknown"], dtype=np.int64)
 
