@@ -448,6 +448,25 @@ PITCH_CALIBRATION_RANSAC_PX = 8.0
 PITCH_CALIBRATION_MAX_REPROJ_ERR_PX = 12.0
 PITCH_CALIBRATION_MAX_REPROJ_ERR_M = 2.0
 
+# A2-3: Model–optical flow uyuşmazlığına göre kademeli kabul (metre, 3x3 referans ızgarasının ortancası)
+PITCH_CAL_DEADBAND_M = 0.5          # bu farkın altında tablo değiştirilmez (gürültü titremesini önler)
+PITCH_CAL_SOFT_M = 1.0              # bu farka kadar yumuşak geçişle hemen kabul
+PITCH_CAL_HARD_M = 3.0              # bunun üstü doğrulandıktan sonra sert geçiş + calib_reset
+PITCH_CAL_CONFIRM_REFRESHES = 2     # SOFT üstü farkta kabul için gereken ek tutarlı yenileme sayısı
+PITCH_CAL_BLEND_MAX_STEP_M = 0.05   # yumuşak geçişte referans noktaların kare başına en fazla kayması
+
+# A2-5: Görüntü profili ("auto" | "fixed" | "broadcast")
+FOOTAGE_PROFILE = "auto"
+PROFILE_DETECT_SEC = 5.0                    # otomatik algılama penceresi
+PROFILE_FIXED_MAX_PAN_RATIO = 0.05          # pencerede görüntü merkezinin toplam yolu / kare genişliği
+PROFILE_FIXED_MAX_SCALE_CHANGE = 0.03       # pencerede en büyük ölçek (zoom) değişimi
+PITCH_CAL_FIXED_CANDIDATES = 10             # sabit kamerada kilit için toplanan en fazla aday tablo
+PITCH_CAL_FIXED_HEALTH_SEC = 10.0           # sabit kamerada sağlık kontrolü aralığı
+
+# A2-2: Kare bazında homografi kaydı
+EXPORT_HOMOGRAPHY_LOG_FILENAME = "homography_log.csv"
+EXPORT_CALIBRATION_SUMMARY_FILENAME = "calibration_summary.json"
+
 # Roboflow football-field-detection 32-keypoint köşe sırası (0..31),
 # 105.0m x 68.0m IFAB standart saha koordinatlarına hizalı.
 PITCH_KEYPOINT_NAMES_32 = (

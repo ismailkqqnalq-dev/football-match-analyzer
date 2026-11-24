@@ -97,6 +97,7 @@ STANDARD_TRACKING_COLUMNS = (
     "pitch_x",
     "pitch_y",
     "on_pitch",
+    "calib_reset",
 )
 _STANDARD_TRACKING_COL_SET = frozenset(STANDARD_TRACKING_COLUMNS)
 _ML_CAT_COLS = ("track_id", "class_name", "team")
@@ -111,7 +112,7 @@ _ML_FLOAT32_COLS = (
     "pitch_x",
     "pitch_y",
 )
-_ML_BOOL_COLS = ("is_predicted", "on_pitch")
+_ML_BOOL_COLS = ("is_predicted", "on_pitch", "calib_reset")
 
 
 def _get_human_class_names() -> set:
@@ -1274,6 +1275,13 @@ class MLAnalyzer:
         same_track = tid_codes[1:] == tid_codes[:-1]
         df_i = fids[1:] - fids[:-1]
         step_ok = same_track & (df_i > 0) & (df_i <= max_gap)
+        if "calib_reset" in self.df.columns:
+            # A2-3: kalibrasyon sıfırlama karesine giren adımlar hız/tempo hesabına girmez
+            reset_frames = self.df.loc[
+                _bool_mask(self.df["calib_reset"], na_value=False), "frame_idx"
+            ].to_numpy(dtype=np.int64)
+            if reset_frames.size:
+                step_ok &= ~np.isin(fids[1:], reset_frames)
         dt_step = np.where(step_ok, df_i / self.fps, 1.0)
         dx_step = xs[1:] - xs[:-1]
         dy_step = ys[1:] - ys[:-1]

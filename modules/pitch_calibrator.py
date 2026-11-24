@@ -18,9 +18,9 @@ Bu modül iki ana bileşen sunar:
          - İlk taktik karede (giriş/yakın çekim geçildikten sonra) kilitler.
          - Sahne kesmesi / tekrar sonrası dönüşte (ORB çakışması olmasa bile,
            ör. karşı yarı sahaya kesmede) anahtar noktalarla yeniden kilitler.
-         - Periyodik aralıklarla (varsayılan 15 kare) kamera takipçi çapasını
-           ve anahtar kare bankasını taşıyarak (reanchor) kaymayı yumuşak
-           geçişle (smooth blend) sıfırlar.
+         - Periyodik aralıklarla (varsayılan 15 kare) modeli flow ile karşılaştırır;
+           farkın büyüklüğüne göre kademeli karar verir (A2-3) ve kabul edilen
+           düzeltmeyi referans noktaları üzerinden yumuşak geçişle uygular.
 """
 
 from dataclasses import dataclass
@@ -808,9 +808,27 @@ class AutoPitchCalibrator:
         return self.estimate_homography_from_keypoints(pixel_pts, meter_pts, frame.shape)
 
 
+
+
+_VALID_PROFILES = ("auto", "fixed", "broadcast")
+
+
 class HybridPitchCalibrator:
     """
     AutoPitchCalibrator + PerspectiveTransformer + CameraMotionTracker hibrit yöneticisi.
+
+    Kare başına efektif tablo: E = transformer.homography_matrix @ motion_matrix
+    (motion_matrix: mevcut kare pikseli -> çapa karesi pikseli).
+
+    A2-3 kademeli kabul kuralı (model tablosu ile flow tablosu arasındaki fark,
+    görüntüdeki 3x3 referans ızgarasının saha üzerindeki ortanca mesafesi):
+      - fark <= PITCH_CAL_DEADBAND_M  -> tablo değiştirilmez (gürültü titremesi önlenir)
+      - fark <= PITCH_CAL_SOFT_M      -> hemen kabul, referans noktaları üzerinden yumuşak geçiş
+      - fark >  PITCH_CAL_SOFT_M      -> model sonraki PITCH_CAL_CONFIRM_REFRESHES yenilemede
+                                         aynı yeri tutarlı gösterirse kabul; göstermezse aykırı
+      - doğrulanan fark > PITCH_CAL_HARD_M -> sert geçiş, kare `calib_reset` olarak işaretlenir
+
+    A2-5 görüntü profili: "fixed" (sabit/geniş kamera) ya da "broadcast" (TV yayını).
     """
 
     def __init__(
@@ -820,6 +838,8 @@ class HybridPitchCalibrator:
         motion_tracker: CameraMotionTracker,
         refresh_interval: Optional[int] = None,
         smooth_frames: Optional[int] = None,
+        fps: Optional[float] = None,
+        profile: Optional[str] = None,
     ):
         self.calibrator = calibrator
         self.transformer = transformer
@@ -840,22 +860,85 @@ class HybridPitchCalibrator:
                 else getattr(config, "PITCH_CALIBRATION_SMOOTH_FRAMES", 5)
             ),
         )
-        self.last_calibration_frame: Optional[int] = None
-        self.was_non_tactical: bool = False
-        self._blend_start_h: Optional[np.ndarray] = None
-        self._blend_target_h: Optional[np.ndarray] = None
-        self._blend_step: int = 0
-        self._blend_total: int = 0
-        self.calibration_count: int = 0
-        self.last_calibration_reason: str = ""
+        self.fps = float(fps) if fps and fps > 0 else 25.0
 
-    # ----------------------------------------------------------------
-    def _cancel_blend(self) -> None:
-        self._blend_start_h = None
-        self._blend_target_h = None
+        self.deadband_m = float(getattr(config, "PITCH_CAL_DEADBAND_M", 0.5))
+        self.soft_m = float(getattr(config, "PITCH_CAL_SOFT_M", 1.0))
+        self.hard_m = float(getattr(config, "PITCH_CAL_HARD_M", 3.0))
+        self.confirm_refreshes = max(0, int(getattr(config, "PITCH_CAL_CONFIRM_REFRESHES", 2)))
+        self.blend_max_step_m = max(1e-3, float(getattr(config, "PITCH_CAL_BLEND_MAX_STEP_M", 0.05)))
+
+        requested = str(profile if profile is not None else getattr(config, "FOOTAGE_PROFILE", "auto")).lower()
+        if requested not in _VALID_PROFILES:
+            raise ValueError(
+                f"Geçersiz görüntü profili: {requested!r} (geçerli: {', '.join(_VALID_PROFILES)})"
+            )
+        self.requested_profile = requested
+        self.profile = "fixed" if requested == "fixed" else "broadcast"
+        self.profile_decided = requested != "auto"
+        self.profile_reason = "config" if self.profile_decided else "algılanıyor"
+        self.profile_events: List[Dict[str, Any]] = []
+
+        # Profil algılama / izleme istatistikleri
+        self._detect_start_frame: Optional[int] = None
+        self._pan_path_px = 0.0
+        self._max_scale_change = 0.0
+        self._prev_motion: Optional[np.ndarray] = None
+        self._reanchored_since_prev = False
+
+        # Sabit kamera kilidi
+        self.fixed_candidates_target = max(1, int(getattr(config, "PITCH_CAL_FIXED_CANDIDATES", 10)))
+        self._fixed_candidates: List[np.ndarray] = []  # çapa koordinatında tablolar
+        self._fixed_locked = False
+        self._last_health_frame: Optional[int] = None
+
+        # Doğrulama bekleyen model tablosu (çapa koordinatında)
+        self._pending_anchor_h: Optional[np.ndarray] = None
+        self._pending_count = 0
+
+        # Yumuşak geçiş durumu (referans dörtgenin saha koordinatları arasında)
+        self._blend_quad_img: Optional[np.ndarray] = None
+        self._blend_p0: Optional[np.ndarray] = None
+        self._blend_p1: Optional[np.ndarray] = None
         self._blend_step = 0
         self._blend_total = 0
 
+        self.last_calibration_frame: Optional[int] = None
+        self.was_non_tactical = False
+        self.calibration_count = 0
+        self.last_calibration_reason = ""
+
+        self.stats: Dict[str, int] = {
+            "model_calls": 0,
+            "model_success": 0,
+            "agree_no_change": 0,
+            "soft_blend": 0,
+            "pending": 0,
+            "rejected_outlier": 0,
+            "confirmed_blend": 0,
+            "confirmed_hard_reset": 0,
+            "immediate_lock": 0,
+        }
+        self.frame_info: Dict[str, Any] = self._new_frame_info()
+
+    # ----------------------------------------------------------------
+    def set_fps(self, fps: Optional[float]) -> None:
+        if fps and fps > 0:
+            self.fps = float(fps)
+
+    def _new_frame_info(self) -> Dict[str, Any]:
+        return {
+            "source": "none",
+            "num_keypoints": None,
+            "num_inliers": None,
+            "reproj_error_m": None,
+            "disagreement_m": None,
+            "calib_reset": False,
+            "profile": self.profile,
+        }
+
+    # ----------------------------------------------------------------
+    # Matris yardımcıları
     # ----------------------------------------------------------------
     @staticmethod
     def _normalize_matrix(matrix: Optional[np.ndarray]) -> Optional[np.ndarray]:
@@ -869,25 +952,170 @@ class HybridPitchCalibrator:
             row2_min_norm=row2_min_norm,
         )
 
-    # ----------------------------------------------------------------
     @staticmethod
-    def _center_displacement_m(
-        h_a: np.ndarray, h_b: np.ndarray, frame_shape: Tuple[int, ...]
-    ) -> Optional[float]:
-        h, w = int(frame_shape[0]), int(frame_shape[1])
-        cx, cy = 0.5 * float(w), 0.5 * float(h)
+    def _canonical_sign(h: np.ndarray, frame_shape: Tuple[int, ...]) -> np.ndarray:
+        """Görüntü merkezinde w' > 0 olacak şekilde matris işaretini sabitler."""
+        cx, cy = 0.5 * float(frame_shape[1]), 0.5 * float(frame_shape[0])
+        w = float(h[2, 0] * cx + h[2, 1] * cy + h[2, 2])
+        return -h if w < 0.0 else h
+
+    @staticmethod
+    def _project(h: np.ndarray, pts: np.ndarray) -> np.ndarray:
+        """Pikselleri sahaya izdüşürür; w' <= eps olan noktalar NaN döner."""
         _, _, w_eps, _ = PerspectiveTransformer._get_homography_thresholds()
-        wa = float(h_a[2, 0] * cx + h_a[2, 1] * cy + h_a[2, 2])
-        wb = float(h_b[2, 0] * cx + h_b[2, 1] * cy + h_b[2, 2])
-        if not (math.isfinite(wa) and math.isfinite(wb)) or wa <= w_eps or wb <= w_eps:
+        homog = np.hstack([pts, np.ones((pts.shape[0], 1))]) @ h.T
+        w = homog[:, 2]
+        out = np.full((pts.shape[0], 2), np.nan, dtype=np.float64)
+        ok = np.isfinite(w) & (w > w_eps)
+        out[ok] = homog[ok, :2] / w[ok, None]
+        return out
+
+    @staticmethod
+    def reference_grid(frame_shape: Tuple[int, ...]) -> np.ndarray:
+        """Görüntüde kenarlardan içeride 3x3 referans noktası."""
+        h, w = float(frame_shape[0]), float(frame_shape[1])
+        fr = (0.2, 0.5, 0.8)
+        return np.array([[w * fx, h * fy] for fy in fr for fx in fr], dtype=np.float64)
+
+    @staticmethod
+    def reference_quad(frame_shape: Tuple[int, ...]) -> np.ndarray:
+        h, w = float(frame_shape[0]), float(frame_shape[1])
+        return np.array(
+            [[0.2 * w, 0.3 * h], [0.8 * w, 0.3 * h], [0.8 * w, 0.8 * h], [0.2 * w, 0.8 * h]],
+            dtype=np.float64,
+        )
+
+    @classmethod
+    def disagreement_m(
+        cls, h_a: np.ndarray, h_b: np.ndarray, frame_shape: Tuple[int, ...]
+    ) -> Optional[float]:
+        """
+        İki piksel->metre tablosunun saha üzerinde ne kadar ayrıştığı:
+        3x3 referans ızgarasının iki tabloyla izdüşümleri arasındaki ortanca mesafe.
+        Saha (±10 m) içine düşen noktalar tercih edilir (tribün/gökyüzü dışlanır).
+        """
+        a = cls._canonical_sign(np.asarray(h_a, dtype=np.float64), frame_shape)
+        b = cls._canonical_sign(np.asarray(h_b, dtype=np.float64), frame_shape)
+        grid = cls.reference_grid(frame_shape)
+        pa = cls._project(a, grid)
+        pb = cls._project(b, grid)
+        valid = np.isfinite(pa).all(axis=1) & np.isfinite(pb).all(axis=1)
+        if not valid.any():
             return None
-        pt = np.array([[[cx, cy]]], dtype=np.float64)
-        pa = cv2.perspectiveTransform(pt, h_a)[0, 0]
-        pb = cv2.perspectiveTransform(pt, h_b)[0, 0]
-        dist = float(math.hypot(float(pa[0] - pb[0]), float(pa[1] - pb[1])))
-        return dist if math.isfinite(dist) else None
+        length = float(getattr(config, "PITCH_LENGTH_M", 105.0))
+        width = float(getattr(config, "PITCH_WIDTH_M", 68.0))
+        on_pitch = (
+            valid
+            & (pb[:, 0] >= -10.0) & (pb[:, 0] <= length + 10.0)
+            & (pb[:, 1] >= -10.0) & (pb[:, 1] <= width + 10.0)
+        )
+        use = on_pitch if int(on_pitch.sum()) >= 3 else valid
+        dist = np.linalg.norm(pa[use] - pb[use], axis=1)
+        val = float(np.median(dist))
+        return val if math.isfinite(val) else None
+
+    def _effective_flow(self, motion: np.ndarray) -> Optional[np.ndarray]:
+        if self.transformer.homography_matrix is None:
+            return None
+        return self._normalize_matrix(self.transformer.homography_matrix @ motion)
+
+    @staticmethod
+    def _safe_inv(m: np.ndarray) -> Optional[np.ndarray]:
+        try:
+            inv = np.linalg.inv(np.asarray(m, dtype=np.float64))
+        except np.linalg.LinAlgError:
+            return None
+        return inv if bool(np.isfinite(inv).all()) else None
 
     # ----------------------------------------------------------------
+    # Çapa değişimi (reanchor) ve aday tabloların taşınması
+    # ----------------------------------------------------------------
+    def _reanchor(
+        self,
+        frame: np.ndarray,
+        raw_detections: Optional[List[Dict]],
+        motion: Optional[np.ndarray],
+        keep_bank: bool,
+    ) -> np.ndarray:
+        if keep_bank and motion is not None:
+            # Eski çapa koordinatındaki tablolar -> yeni çapa (mevcut kare) koordinatı: T @ M
+            self._fixed_candidates = [c @ motion for c in self._fixed_candidates]
+            if self._pending_anchor_h is not None:
+                self._pending_anchor_h = self._pending_anchor_h @ motion
+            reanchored = self.motion_tracker.reanchor(
+                frame, raw_detections, keep_keyframe_bank=True, prev_cumulative=motion
+            )
+        else:
+            self._fixed_candidates = []
+            self._clear_pending()
+            reanchored = self.motion_tracker.reanchor(
+                frame, raw_detections, keep_keyframe_bank=False
+            )
+        self._reanchored_since_prev = True
+        return reanchored
+
+    def _clear_pending(self, rejected: bool = False) -> None:
+        if rejected and self._pending_count > 0:
+            self.stats["rejected_outlier"] += 1
+        self._pending_anchor_h = None
+        self._pending_count = 0
+
+    # ----------------------------------------------------------------
+    # Yumuşak geçiş (matris ortalaması YOK: referans dörtgenin saha koordinatları ara değerlenir)
+    # ----------------------------------------------------------------
+    def _cancel_blend(self) -> None:
+        self._blend_quad_img = None
+        self._blend_p0 = None
+        self._blend_p1 = None
+        self._blend_step = 0
+        self._blend_total = 0
+
+    def _blend_active(self) -> bool:
+        return self._blend_total > 0 and self._blend_p0 is not None
+
+    def blend_matrix(self, alpha: float) -> Optional[np.ndarray]:
+        if self._blend_quad_img is None or self._blend_p0 is None or self._blend_p1 is None:
+            return None
+        a = min(1.0, max(0.0, float(alpha)))
+        p = (1.0 - a) * self._blend_p0 + a * self._blend_p1
+        h = cv2.getPerspectiveTransform(
+            self._blend_quad_img.astype(np.float32), p.astype(np.float32)
+        )
+        return self._normalize_matrix(np.asarray(h, dtype=np.float64))
+
+    def _advance_active_blend(self) -> bool:
+        """Aktif geçişi bir adım ilerletir; bu karede geçiş tablosu kullanıldıysa True."""
+        if not self._blend_active():
+            return False
+        self._blend_step += 1
+        alpha = min(1.0, float(self._blend_step) / float(self._blend_total))
+        h_blend = self.blend_matrix(alpha)
+        if h_blend is None or not self.transformer.set_homography(h_blend):
+            target = self.blend_matrix(1.0)
+            if target is not None:
+                self.transformer.set_homography(target)
+            self._cancel_blend()
+            self.frame_info["source"] = "keypoint_refresh"
+            return True
+        finished = self._blend_step >= self._blend_total
+        self.frame_info["source"] = "keypoint_refresh" if finished else "blend"
+        if finished:
+            self._cancel_blend()
+        return True
+
+    # ----------------------------------------------------------------
+    # Kabul yolları
+    # ----------------------------------------------------------------
+    def _calibrate(self, frame: np.ndarray) -> Any:
+        self.stats["model_calls"] += 1
+        res = self.calibrator.calibrate_frame(frame)
+        self.frame_info["num_keypoints"] = getattr(res, "num_keypoints", None)
+        self.frame_info["num_inliers"] = getattr(res, "num_inliers", None)
+        self.frame_info["reproj_error_m"] = getattr(res, "reproj_error_m", None)
+        if getattr(res, "success", False) and getattr(res, "homography_matrix", None) is not None:
+            self.stats["model_success"] += 1
+        return res
+
     def _apply_immediate_lock(
         self,
         frame_idx: int,
@@ -899,92 +1127,290 @@ class HybridPitchCalibrator:
         self._cancel_blend()
         if not self.transformer.set_homography(h_kp):
             return None
-        reanchored = self.motion_tracker.reanchor(
-            frame, raw_detections, keep_keyframe_bank=False
-        )
+        reanchored = self._reanchor(frame, raw_detections, None, keep_bank=False)
         self.last_calibration_frame = frame_idx
         self.was_non_tactical = False
         self.calibration_count += 1
         self.last_calibration_reason = reason
+        self.stats["immediate_lock"] += 1
+        self.frame_info["source"] = "keypoint_lock"
+        self.frame_info["calib_reset"] = True
         return reanchored
 
-    # ----------------------------------------------------------------
-    def _start_periodic_smooth_refresh(
+    def _accept_hard(
+        self,
+        frame: np.ndarray,
+        raw_detections: Optional[List[Dict]],
+        motion: np.ndarray,
+        h_kp: np.ndarray,
+        reason: str,
+    ) -> np.ndarray:
+        self._cancel_blend()
+        if not self.transformer.set_homography(h_kp):
+            self.frame_info["source"] = "flow"
+            return motion
+        reanchored = self._reanchor(frame, raw_detections, motion, keep_bank=True)
+        self.calibration_count += 1
+        self.last_calibration_reason = reason
+        self.frame_info["source"] = "keypoint_refresh"
+        self.frame_info["calib_reset"] = True
+        return reanchored
+
+    def _accept_blend(
+        self,
+        frame: np.ndarray,
+        raw_detections: Optional[List[Dict]],
+        motion: np.ndarray,
+        e_flow: np.ndarray,
+        h_kp: np.ndarray,
+        disagreement: float,
+        reason: str,
+    ) -> np.ndarray:
+        quad = self.reference_quad(frame.shape)
+        p0 = self._project(self._canonical_sign(e_flow, frame.shape), quad)
+        p1 = self._project(self._canonical_sign(h_kp, frame.shape), quad)
+        if not (bool(np.isfinite(p0).all()) and bool(np.isfinite(p1).all())):
+            return self._accept_hard(frame, raw_detections, motion, h_kp, reason)
+
+        reanchored = self._reanchor(frame, raw_detections, motion, keep_bank=True)
+        # Çapa artık mevcut kare (M = I): referans dörtgen bu karenin pikselleridir.
+        self._blend_quad_img = quad
+        self._blend_p0 = p0
+        self._blend_p1 = p1
+        self._blend_step = 0
+        self._blend_total = max(
+            self.smooth_frames, int(math.ceil(float(disagreement) / self.blend_max_step_m))
+        )
+        self.calibration_count += 1
+        self.last_calibration_reason = reason
+        self._advance_active_blend()
+        return reanchored
+
+    def _gated_refresh(
         self,
         frame_idx: int,
         frame: np.ndarray,
         raw_detections: Optional[List[Dict]],
-        motion_matrix: np.ndarray,
+        motion: np.ndarray,
         h_kp_raw: np.ndarray,
     ) -> np.ndarray:
+        """A2-3 kademeli karar kuralı."""
+        self.last_calibration_frame = frame_idx
+        self.frame_info["source"] = "flow"
         h_kp = self._normalize_matrix(h_kp_raw)
+        e_flow = self._effective_flow(motion)
         if h_kp is None:
-            return motion_matrix
+            return motion
+        if e_flow is None:
+            return self._accept_hard(frame, raw_detections, motion, h_kp, "periodic_refresh")
+        h_kp = self._canonical_sign(h_kp, frame.shape)
+        e_flow = self._canonical_sign(e_flow, frame.shape)
 
-        h_flow_eff = None
-        if self.transformer.homography_matrix is not None:
-            h_flow_eff = self._normalize_matrix(
-                self.transformer.homography_matrix @ motion_matrix
+        d = self.disagreement_m(e_flow, h_kp, frame.shape)
+        self.frame_info["disagreement_m"] = None if d is None else round(d, 4)
+
+        if d is not None and d <= self.deadband_m:
+            self._clear_pending(rejected=True)
+            self.stats["agree_no_change"] += 1
+            self.frame_info["source"] = "keypoint_refresh"
+            return motion
+
+        if d is not None and d <= self.soft_m:
+            self._clear_pending(rejected=True)
+            self.stats["soft_blend"] += 1
+            return self._accept_blend(
+                frame, raw_detections, motion, e_flow, h_kp, d, "periodic_refresh"
             )
 
-        reanchored = self.motion_tracker.reanchor(
-            frame,
-            raw_detections,
-            keep_keyframe_bank=True,
-            prev_cumulative=motion_matrix,
-        )
+        # SOFT üstü: doğrulama bekle
+        inv_m = self._safe_inv(motion)
+        if inv_m is None:
+            return motion
+        if self._pending_anchor_h is not None:
+            pend_now = self._normalize_matrix(self._pending_anchor_h @ motion)
+            d_cons = (
+                self.disagreement_m(pend_now, h_kp, frame.shape)
+                if pend_now is not None
+                else None
+            )
+            if d_cons is not None and d_cons <= self.soft_m:
+                self._pending_count += 1
+            else:
+                if self._pending_count >= 1:
+                    self.stats["rejected_outlier"] += 1
+                self._pending_count = 1
+        else:
+            self._pending_count = 1
+        self._pending_anchor_h = h_kp @ inv_m
 
-        self.last_calibration_frame = frame_idx
-        self.calibration_count += 1
-        self.last_calibration_reason = "periodic_refresh"
+        if self._pending_count >= 1 + self.confirm_refreshes:
+            self._clear_pending()
+            if d is not None and d <= self.hard_m:
+                self.stats["confirmed_blend"] += 1
+                return self._accept_blend(
+                    frame, raw_detections, motion, e_flow, h_kp, d, "confirmed_refresh"
+                )
+            self.stats["confirmed_hard_reset"] += 1
+            return self._accept_hard(frame, raw_detections, motion, h_kp, "confirmed_reset")
 
-        # Yumuşak geçiş uygulanabilir mi? (sign-align + sonlu merkez sapması <= 25 m)
-        use_blend = False
-        if h_flow_eff is not None and self.smooth_frames > 1:
-            if float(np.sum(h_flow_eff * h_kp)) < 0.0:
-                h_flow_eff = -h_flow_eff
-            disp_m = self._center_displacement_m(h_flow_eff, h_kp, frame.shape)
-            if disp_m is not None and disp_m <= 25.0:
-                mid_h = self._normalize_matrix(0.5 * h_flow_eff + 0.5 * h_kp)
-                use_blend = mid_h is not None
-
-        if not use_blend or h_flow_eff is None:
-            self._cancel_blend()
-            self.transformer.set_homography(h_kp)
-            return reanchored
-
-        self._blend_start_h = h_flow_eff.copy()
-        self._blend_target_h = h_kp.copy()
-        self._blend_total = self.smooth_frames
-        self._blend_step = 1
-
-        alpha = 1.0 / float(self._blend_total)
-        h_blend = (1.0 - alpha) * self._blend_start_h + alpha * self._blend_target_h
-        if not self.transformer.set_homography(h_blend):
-            self.transformer.set_homography(h_kp)
-            self._cancel_blend()
-        elif self._blend_step >= self._blend_total:
-            self._cancel_blend()
-
-        return reanchored
+        self.stats["pending"] += 1
+        return motion
 
     # ----------------------------------------------------------------
-    def _advance_active_blend(self) -> None:
-        if (
-            self._blend_total <= 0
-            or self._blend_start_h is None
-            or self._blend_target_h is None
-        ):
+    # A2-5: Görüntü profili
+    # ----------------------------------------------------------------
+    def _set_profile(self, frame_idx: int, new_profile: str, reason: str) -> None:
+        old = self.profile
+        self.profile = new_profile
+        self.profile_decided = True
+        self.profile_reason = reason
+        self.profile_events.append(
+            {"frame_idx": int(frame_idx), "from": old, "to": new_profile, "reason": reason}
+        )
+        self._pan_path_px = 0.0
+        self._max_scale_change = 0.0
+        print(f"[Kalibrasyon] Görüntü profili: {new_profile} (kare {frame_idx}; {reason})")
+
+    def _update_profile(
+        self,
+        frame_idx: int,
+        frame_shape: Tuple[int, ...],
+        motion: Optional[np.ndarray],
+        scene_cut: bool,
+    ) -> None:
+        if self.profile_decided and self.profile == "broadcast":
             return
-        self._blend_step += 1
-        alpha = min(1.0, float(self._blend_step) / float(self._blend_total))
-        h_blend = (1.0 - alpha) * self._blend_start_h + alpha * self._blend_target_h
-        if not self.transformer.set_homography(h_blend):
-            self.transformer.set_homography(self._blend_target_h)
-            self._cancel_blend()
-            return
-        if self._blend_step >= self._blend_total:
-            self._cancel_blend()
+        w = max(1.0, float(frame_shape[1]))
+        center = np.array([[0.5 * w, 0.5 * float(frame_shape[0])]], dtype=np.float64)
+        if motion is not None:
+            if self._prev_motion is not None and not self._reanchored_since_prev:
+                p_now = self._project(motion, center)[0]
+                p_prev = self._project(self._prev_motion, center)[0]
+                step = float(np.linalg.norm(p_now - p_prev))
+                if math.isfinite(step):
+                    self._pan_path_px += step
+            try:
+                scale = math.sqrt(abs(float(np.linalg.det(motion[:2, :2] / motion[2, 2]))))
+                self._max_scale_change = max(self._max_scale_change, abs(scale - 1.0))
+            except (ValueError, ZeroDivisionError, np.linalg.LinAlgError):
+                pass
+        self._prev_motion = None if motion is None else motion.copy()
+        self._reanchored_since_prev = False
+
+        pan_ratio = self._pan_path_px / w
+        max_pan = float(getattr(config, "PROFILE_FIXED_MAX_PAN_RATIO", 0.05))
+        max_scale = float(getattr(config, "PROFILE_FIXED_MAX_SCALE_CHANGE", 0.03))
+        moving = pan_ratio > max_pan or self._max_scale_change > max_scale
+
+        if not self.profile_decided:
+            if self._detect_start_frame is None:
+                self._detect_start_frame = frame_idx
+            detect_frames = int(round(float(getattr(config, "PROFILE_DETECT_SEC", 5.0)) * self.fps))
+            if scene_cut:
+                self._set_profile(frame_idx, "broadcast", "algılama penceresinde sahne kesmesi")
+            elif moving:
+                self._set_profile(
+                    frame_idx,
+                    "broadcast",
+                    f"kamera hareketi (pan oranı={pan_ratio:.3f}, ölçek değişimi={self._max_scale_change:.3f})",
+                )
+            elif frame_idx - self._detect_start_frame >= detect_frames:
+                self._set_profile(
+                    frame_idx,
+                    "fixed",
+                    f"{detect_frames} karede kesme yok, kamera sabit "
+                    f"(pan oranı={pan_ratio:.3f}, ölçek değişimi={self._max_scale_change:.3f})",
+                )
+        elif self.profile == "fixed":
+            if scene_cut:
+                self._set_profile(frame_idx, "broadcast", "sabit profilde sahne kesmesi")
+            elif moving:
+                self._set_profile(frame_idx, "broadcast", "sabit profilde belirgin kamera hareketi")
+
+    def _lock_fixed(
+        self,
+        frame: np.ndarray,
+        raw_detections: Optional[List[Dict]],
+        motion: np.ndarray,
+    ) -> np.ndarray:
+        """Aday tablolar arasından en tutarlısını (ortanca farkı en düşük) kilitler."""
+        cands = [self._normalize_matrix(c @ motion) for c in self._fixed_candidates]
+        cands = [self._canonical_sign(c, frame.shape) for c in cands if c is not None]
+        self._fixed_candidates = []
+        self._fixed_locked = True
+        if not cands:
+            return motion
+        best = cands[0]
+        if len(cands) > 1:
+            best_score = math.inf
+            for i, ci in enumerate(cands):
+                ds = [
+                    self.disagreement_m(ci, cj, frame.shape)
+                    for j, cj in enumerate(cands)
+                    if j != i
+                ]
+                ds = [x for x in ds if x is not None]
+                score = float(np.median(ds)) if ds else math.inf
+                if score < best_score:
+                    best_score = score
+                    best = ci
+        e_flow = self._effective_flow(motion)
+        if e_flow is None:
+            return self._accept_hard(frame, raw_detections, motion, best, "fixed_lock")
+        e_flow = self._canonical_sign(e_flow, frame.shape)
+        d = self.disagreement_m(e_flow, best, frame.shape)
+        self.frame_info["disagreement_m"] = None if d is None else round(d, 4)
+        self.last_calibration_reason = "fixed_lock"
+        if d is not None and d <= self.deadband_m:
+            self.frame_info["source"] = "keypoint_refresh"
+            return motion
+        if d is not None and d <= self.soft_m:
+            return self._accept_blend(frame, raw_detections, motion, e_flow, best, d, "fixed_lock")
+        return self._accept_hard(frame, raw_detections, motion, best, "fixed_lock")
+
+    def _process_fixed(
+        self,
+        frame_idx: int,
+        frame: np.ndarray,
+        raw_detections: Optional[List[Dict]],
+        motion: np.ndarray,
+    ) -> np.ndarray:
+        if not self._fixed_locked:
+            if len(self._fixed_candidates) >= self.fixed_candidates_target:
+                return self._lock_fixed(frame, raw_detections, motion)
+            due = (
+                self.last_calibration_frame is None
+                or (frame_idx - self.last_calibration_frame) >= self.refresh_interval
+            )
+            if due and not self._blend_active():
+                self.last_calibration_frame = frame_idx
+                res = self._calibrate(frame)
+                if getattr(res, "success", False) and res.homography_matrix is not None:
+                    inv_m = self._safe_inv(motion)
+                    h = self._normalize_matrix(res.homography_matrix)
+                    if inv_m is not None and h is not None:
+                        self._fixed_candidates.append(h @ inv_m)
+                    if len(self._fixed_candidates) >= self.fixed_candidates_target:
+                        return self._lock_fixed(frame, raw_detections, motion)
+            if not self._advance_active_blend():
+                self.frame_info["source"] = "flow"
+            return motion
+
+        health_frames = max(
+            1, int(round(float(getattr(config, "PITCH_CAL_FIXED_HEALTH_SEC", 10.0)) * self.fps))
+        )
+        if self._last_health_frame is None:
+            self._last_health_frame = frame_idx
+        if (frame_idx - self._last_health_frame) >= health_frames and not self._blend_active():
+            self._last_health_frame = frame_idx
+            res = self._calibrate(frame)
+            if getattr(res, "success", False) and res.homography_matrix is not None:
+                return self._gated_refresh(
+                    frame_idx, frame, raw_detections, motion, res.homography_matrix
+                )
+        if not self._advance_active_blend():
+            self.frame_info["source"] = "flow"
+        return motion
 
     # ----------------------------------------------------------------
     def process_frame(
@@ -992,6 +1418,19 @@ class HybridPitchCalibrator:
         frame_idx: int,
         frame: np.ndarray,
         raw_detections: Optional[List[Dict]] = None,
+    ) -> Optional[np.ndarray]:
+        self.frame_info = self._new_frame_info()
+        result = self._process_frame_inner(frame_idx, frame, raw_detections)
+        self.frame_info["profile"] = self.profile
+        if result is None:
+            self.frame_info["source"] = "none"
+        return result
+
+    def _process_frame_inner(
+        self,
+        frame_idx: int,
+        frame: np.ndarray,
+        raw_detections: Optional[List[Dict]],
     ) -> Optional[np.ndarray]:
         cal_start = int(getattr(config, "CALIBRATION_FRAME_INDEX", 0))
         if frame_idx < cal_start:
@@ -1001,12 +1440,14 @@ class HybridPitchCalibrator:
         scene_cut = bool(getattr(self.motion_tracker, "scene_cut_detected", False))
         recovered = bool(getattr(self.motion_tracker, "recovered_this_frame", False))
 
+        self._update_profile(frame_idx, frame.shape, motion_matrix, scene_cut)
+
         if scene_cut:
             self._cancel_blend()
+            self._clear_pending()
             self.was_non_tactical = True
 
         # Durum 1: İlk taktik kare kilidi veya kesme/tekrar sonrası geri dönüş
-        # (ORB eşleşmesi olmasa bile -- örn. karşı yarı sahaya kesme -- keypoint ile yakala)
         needs_immediate_lock = (
             (not self.transformer.is_calibrated)
             or (motion_matrix is None)
@@ -1014,7 +1455,7 @@ class HybridPitchCalibrator:
             or self.was_non_tactical
         )
         if needs_immediate_lock:
-            cal_res = self.calibrator.calibrate_frame(frame)
+            cal_res = self._calibrate(frame)
             if (
                 getattr(cal_res, "success", False)
                 and getattr(cal_res, "homography_matrix", None) is not None
@@ -1025,43 +1466,66 @@ class HybridPitchCalibrator:
                     else "post_cut_recovery"
                 )
                 locked_m = self._apply_immediate_lock(
-                    frame_idx,
-                    frame,
-                    raw_detections,
-                    cal_res.homography_matrix,
-                    reason=reason,
+                    frame_idx, frame, raw_detections, cal_res.homography_matrix, reason=reason
                 )
                 if locked_m is not None:
+                    if self.profile == "fixed" and not self._fixed_locked:
+                        h0 = self._normalize_matrix(cal_res.homography_matrix)
+                        if h0 is not None:
+                            self._fixed_candidates.append(h0)
                     return locked_m
 
-            # Keypoint kalibrasyonu bu karede başarısız oldu:
-            # - Çapa yoksa (motion_matrix is None) veya hiç kalibrasyon yapılmadıysa None dön (NON_TACTICAL / T2).
-            # - ORB eski ana kameraya başarıyla döndüyse ve önceden geçerli kalibrasyon varsa
-            #   ORB matrisini döndür, ancak was_non_tactical=True bırakarak sonraki karede keypoint yenilemeyi dene.
+            # Keypoint kalibrasyonu bu karede başarısız: önceki geçerli kalibrasyon ve
+            # flow varsa onunla devam et; was_non_tactical bir sonraki karede yeniden denemeyi sağlar.
             if motion_matrix is None or not self.transformer.is_calibrated:
                 return None
+            self.frame_info["source"] = "flow"
             return motion_matrix
 
-        # Durum 2: Periyodik keypoint yenileme (drift sıfırlama + yumuşak geçiş)
+        if self.profile == "fixed":
+            return self._process_fixed(frame_idx, frame, raw_detections, motion_matrix)
+
+        # Durum 2 (broadcast): periyodik keypoint yenileme + kademeli karar
         periodic_due = (
             self.last_calibration_frame is not None
             and (frame_idx - self.last_calibration_frame) >= self.refresh_interval
+            and not self._blend_active()
         )
         if periodic_due:
-            cal_res = self.calibrator.calibrate_frame(frame)
+            cal_res = self._calibrate(frame)
             if (
                 getattr(cal_res, "success", False)
                 and getattr(cal_res, "homography_matrix", None) is not None
             ):
-                return self._start_periodic_smooth_refresh(
-                    frame_idx,
-                    frame,
-                    raw_detections,
-                    motion_matrix,
-                    cal_res.homography_matrix,
+                if not self.profile_decided:
+                    inv_m = self._safe_inv(motion_matrix)
+                    h = self._normalize_matrix(cal_res.homography_matrix)
+                    if inv_m is not None and h is not None:
+                        self._fixed_candidates.append(h @ inv_m)
+                        self._fixed_candidates = self._fixed_candidates[-self.fixed_candidates_target:]
+                return self._gated_refresh(
+                    frame_idx, frame, raw_detections, motion_matrix, cal_res.homography_matrix
                 )
             # Başarısız olursa last_calibration_frame güncellenmez -> sonraki karede yeniden dener.
 
         # Durum 3: Ara karelerde devam eden yumuşak geçişi ilerlet
-        self._advance_active_blend()
+        if not self._advance_active_blend():
+            self.frame_info["source"] = "flow"
         return motion_matrix
+
+    # ----------------------------------------------------------------
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "requested_profile": self.requested_profile,
+            "profile": self.profile,
+            "profile_reason": self.profile_reason,
+            "profile_events": list(self.profile_events),
+            "thresholds_m": {
+                "deadband": self.deadband_m,
+                "soft": self.soft_m,
+                "hard": self.hard_m,
+                "confirm_refreshes": self.confirm_refreshes,
+            },
+            "calibration_count": self.calibration_count,
+            "stats": dict(self.stats),
+        }

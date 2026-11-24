@@ -134,6 +134,7 @@ def compute_ball_kinematic_filter(
     fps: float,
     is_calibrated: bool,
     bounds: Optional[Tuple[float, float, float, float]] = None,
+    reset_frames: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """
     Top yörüngesi üzerinde vektörel O(N) kinematik denetim uygular:
@@ -144,6 +145,8 @@ def compute_ball_kinematic_filter(
         kontrol dışı bırakılır.
       - Donmuş Kalman tahmininden (is_predicted=True -> False) ani sıçrama
         sınırları pas geçişi engelleyici süreksizlik olarak işaretlenir.
+      - A2-3: Kalibrasyon sıfırlama karesine (calib_reset) giren adımlar hız
+        denetiminde kullanılmaz ve süreksizlik olarak işaretlenir.
     """
     fps_safe = float(fps) if fps and fps > 0 else 25.0
     scale = 1.0 if is_calibrated else compute_pixel_scale_px_per_m(bounds)
@@ -195,6 +198,12 @@ def compute_ball_kinematic_filter(
 
         max_vel_gap_frames = max(3, int(round(0.25 * fps_safe)))
         valid_step = (df_step >= 1) & (df_step <= max_vel_gap_frames)
+        reset_step = (
+            np.isin(ball_fids[1:], np.asarray(reset_frames, dtype=np.int64))
+            if reset_frames is not None and len(reset_frames) > 0
+            else np.zeros(n - 1, dtype=bool)
+        )
+        valid_step &= ~reset_step
 
         # Donmuş Kalman tahmininden (is_predicted=1 -> 0) imkânsız hızlı sıçrama süreksizlikleri
         min_snap_dist = float(getattr(config, "PASS_MIN_BALL_MOVE_M", 2.0)) * scale
@@ -205,10 +214,12 @@ def compute_ball_kinematic_filter(
             & (pred_arr[1:] == 0)
             & (speed_step > max_pass_speed)
             & (dist_step > min_snap_dist)
+            & ~reset_step
         )
-        if pred_snap_mask.any():
-            disc_starts = ball_fids[:-1][pred_snap_mask]
-            disc_ends = ball_fids[1:][pred_snap_mask]
+        disc_mask = pred_snap_mask | reset_step
+        if disc_mask.any():
+            disc_starts = ball_fids[:-1][disc_mask]
+            disc_ends = ball_fids[1:][disc_mask]
 
         if n >= 3:
             both_valid = valid_step[:-1] & valid_step[1:]

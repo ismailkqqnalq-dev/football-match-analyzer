@@ -121,6 +121,7 @@ class DataExporter:
         "pitch_x",
         "pitch_y",
         "on_pitch",
+        "calib_reset",
     )
 
     SUMMARY_COLUMNS: Tuple[str, ...] = (
@@ -295,6 +296,7 @@ class DataExporter:
             _to_py_float(rec.get("pitch_x")),
             _to_py_float(rec.get("pitch_y")),
             _to_sqlite_bool_int(rec.get("on_pitch")),
+            _to_sqlite_bool_int(rec.get("calib_reset")),
         )
 
     @classmethod
@@ -316,6 +318,7 @@ class DataExporter:
             _to_csv_cell(rec.get("pitch_x")),
             _to_csv_cell(rec.get("pitch_y")),
             _to_csv_cell(rec.get("on_pitch"), is_bool=True),
+            _to_csv_cell(rec.get("calib_reset"), is_bool=True),
         ]
 
     @staticmethod
@@ -338,7 +341,8 @@ class DataExporter:
             "pixel_y REAL, "
             "pitch_x REAL, "
             "pitch_y REAL, "
-            "on_pitch INTEGER"
+            "on_pitch INTEGER, "
+            "calib_reset INTEGER"
             ")"
         )
 
@@ -435,6 +439,7 @@ class DataExporter:
                 "pitch_x": det.get("pitch_x"),
                 "pitch_y": det.get("pitch_y"),
                 "on_pitch": det.get("on_pitch"),
+                "calib_reset": bool(det.get("calib_reset", False)),
             })
 
         if self.flush_interval > 0:
@@ -934,7 +939,7 @@ class DataExporter:
             conn = sqlite3.connect(self._active_sql_path)
             try:
                 df_disk = pd.read_sql_query(f'SELECT * FROM "{table_name}"', conn)
-                for col in ("is_predicted", "on_pitch"):
+                for col in ("is_predicted", "on_pitch", "calib_reset"):
                     if col in df_disk.columns:
                         df_disk[col] = df_disk[col].map(
                             lambda v: None if _is_null(v) else bool(int(v))
@@ -985,7 +990,7 @@ class DataExporter:
                         conn,
                         chunksize=self._SQL_BATCH_SIZE,
                     ):
-                        for col in ("is_predicted", "on_pitch"):
+                        for col in ("is_predicted", "on_pitch", "calib_reset"):
                             if col in chunk_df.columns:
                                 chunk_df[col] = chunk_df[col].map(
                                     lambda v: "" if _is_null(v) else bool(int(v))
@@ -1104,6 +1109,7 @@ class DataExporter:
         min_sprint_frames: int,
         max_frame_gap: int,
         max_realistic_speed_kmh: float,
+        reset_frames: Optional[np.ndarray] = None,
     ) -> Optional[Dict]:
         f_arr = np.asarray(frame_idxs, dtype=np.int64)
         if f_arr.size == 0:
@@ -1149,7 +1155,12 @@ class DataExporter:
         n_frames = int(f_arr.size)
         if n_frames >= 2:
             frame_diffs = np.diff(f_arr)
-            split_indices = np.flatnonzero(frame_diffs > max_frame_gap) + 1
+            split_mask = frame_diffs > max_frame_gap
+            if reset_frames is not None and len(reset_frames) > 0:
+                # A2-3: kalibrasyon sıfırlama karesine giren adım (önceki kare -> sıfırlama
+                # karesi) sahte sıçrama içerir; segment orada bölünür.
+                split_mask |= np.isin(f_arr[1:], reset_frames)
+            split_indices = np.flatnonzero(split_mask) + 1
             seg_starts = np.concatenate(([0], split_indices))
             seg_ends = np.concatenate((split_indices, [n_frames]))
 
@@ -1303,6 +1314,17 @@ class DataExporter:
         summary_rows: List[Dict] = []
         conn = sqlite3.connect(sql_path)
         try:
+            col_names = {r[1] for r in conn.execute(f'PRAGMA table_info("{table_name}")')}
+            reset_frames = (
+                np.asarray(
+                    [r[0] for r in conn.execute(
+                        f'SELECT DISTINCT frame_idx FROM "{table_name}" WHERE calib_reset = 1'
+                    )],
+                    dtype=np.int64,
+                )
+                if "calib_reset" in col_names
+                else None
+            )
             cur = conn.execute(query, tuple(sorted_classes))
             current_tid: Optional[str] = None
             f_buf: List[int] = []
@@ -1326,6 +1348,7 @@ class DataExporter:
                     min_sprint_frames=min_sprint_frames,
                     max_frame_gap=config.DISTANCE_CALC_MAX_FRAME_GAP,
                     max_realistic_speed_kmh=config.MAX_REALISTIC_PLAYER_SPEED_KMH,
+                    reset_frames=reset_frames,
                 )
                 if row is not None:
                     summary_rows.append(row)
@@ -1373,6 +1396,10 @@ class DataExporter:
             "pitch_y",
             "on_pitch",
         ]
+        header_cols = set(pd.read_csv(csv_path, nrows=0).columns)
+        if "calib_reset" in header_cols:
+            usecols = usecols + ["calib_reset"]
+        reset_set: Set[int] = set()
         per_track: Dict[str, Dict[str, List]] = {}
         for chunk in pd.read_csv(
             csv_path,
@@ -1388,6 +1415,10 @@ class DataExporter:
             )
             if config.DISTANCE_CALC_EXCLUDE_PREDICTED:
                 mask &= chunk["is_predicted"] != True  # noqa: E712
+            if "calib_reset" in chunk.columns:
+                reset_set.update(
+                    int(f) for f in chunk.loc[chunk["calib_reset"] == True, "frame_idx"]  # noqa: E712
+                )
 
             filtered = chunk.loc[
                 mask, ["track_id", "frame_idx", "class_name", "team", "pitch_x", "pitch_y"]
@@ -1407,6 +1438,7 @@ class DataExporter:
                 bucket["px"].append(float(px))
                 bucket["py"].append(float(py))
 
+        reset_frames = np.asarray(sorted(reset_set), dtype=np.int64)
         summary_rows: List[Dict] = []
         for tid_str, bucket in per_track.items():
             row = self._summarize_track_rows(
@@ -1421,6 +1453,7 @@ class DataExporter:
                 min_sprint_frames=min_sprint_frames,
                 max_frame_gap=config.DISTANCE_CALC_MAX_FRAME_GAP,
                 max_realistic_speed_kmh=config.MAX_REALISTIC_PLAYER_SPEED_KMH,
+                reset_frames=reset_frames,
             )
             if row is not None:
                 summary_rows.append(row)
@@ -1483,6 +1516,11 @@ class DataExporter:
                 print("[DataExporter] Özet çıkarılacak veri yok (records boş).")
                 return None
 
+            reset_frames = (
+                df.loc[df["calib_reset"] == True, "frame_idx"].unique().astype(np.int64)  # noqa: E712
+                if "calib_reset" in df.columns
+                else None
+            )
             players_df = df[df["class_name"].isin(human_classes)].copy()
             players_df = players_df.dropna(subset=["pitch_x", "pitch_y"])
             if config.DISTANCE_CALC_EXCLUDE_PREDICTED:
@@ -1506,6 +1544,7 @@ class DataExporter:
                     min_sprint_frames=min_sprint_frames,
                     max_frame_gap=config.DISTANCE_CALC_MAX_FRAME_GAP,
                     max_realistic_speed_kmh=config.MAX_REALISTIC_PLAYER_SPEED_KMH,
+                    reset_frames=reset_frames,
                 )
                 if row is not None:
                     summary_rows.append(row)

@@ -200,6 +200,8 @@ def main():
         )
 
     with VideoProcessor(args.input, output_video_path) as vp:
+        if hybrid_calibrator is not None:
+            hybrid_calibrator.set_fps(vp.fps)
         exporter = DataExporter(
             fps=vp.fps,
             output_dir=export_dir,
@@ -249,6 +251,14 @@ def main():
                 else:
                     for det in all_tracked:
                         det["pitch_x"], det["pitch_y"], det["on_pitch"] = None, None, None
+
+                # A2-3: kalibrasyon sıçrama karesi -> mesafe/hız hesabında segment bölünür
+                calib_reset = bool(
+                    hybrid_calibrator is not None
+                    and hybrid_calibrator.frame_info.get("calib_reset")
+                )
+                for det in all_tracked:
+                    det["calib_reset"] = calib_reset
 
                 # 7) Bu karenin tüm verisini dışa aktarım için biriktir / akıt -- Adım 6
                 exporter.append_frame_data(frame_idx, all_tracked)
