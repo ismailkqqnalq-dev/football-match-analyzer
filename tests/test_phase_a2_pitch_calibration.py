@@ -631,52 +631,75 @@ def test_r2_hybrid_calibrator_lifecycle_cut_opposite_half_and_smooth_blend():
         m_step = hybrid.process_frame(idx, f_left)
         assert m_step is not None
 
-    # Kare 7: Periyodik yenileme (5 kare sonra) -> işaret ters (-H_flow_eff) olsa bile
-    # işaret hizalı yumuşak geçiş (smooth blend) uygulanmalı
+    # Kare 7: Periyodik yenileme (5 kare sonra). A2-3: model flow ile uyuşuyorsa
+    # (fark <= PITCH_CAL_DEADBAND_M) tablo DEĞİŞMEZ ve çapa taşınmaz. İşaret ters
+    # (-H) olsa bile fark işaret hizalı ölçülmeli.
+    # (f_left_2 içeriği 4 px sola kayar -> model tablosu pan_x=-4)
+    H_left_agree = np.linalg.inv(_make_synthetic_homography_m_to_px(frame_size, pan_x=-4.0))
+    H_left_off = np.linalg.inv(_make_synthetic_homography_m_to_px(frame_size, pan_x=-8.0))
     pt.homography_matrix = -pt.homography_matrix  # ters işaret testi
+    h_before = pt.homography_matrix.copy()
     cal.current_idx = 7
-    scripted_results[7] = CalibrationResult(success=True, homography_matrix=H_left_shifted)
+    scripted_results[7] = CalibrationResult(success=True, homography_matrix=H_left_agree)
     m7 = hybrid.process_frame(7, f_left_2)
-    assert np.allclose(m7, np.eye(3))
-    assert hybrid.last_calibration_reason == "periodic_refresh"
-    assert hybrid._blend_total == 4
-    assert hybrid._blend_step == 1
+    assert m7 is not None
+    assert hybrid.frame_info["source"] == "keypoint_refresh"
+    assert hybrid.frame_info["disagreement_m"] <= config.PITCH_CAL_DEADBAND_M
+    assert hybrid._blend_total == 0
+    assert np.allclose(pt.homography_matrix, h_before)
+    assert hybrid.last_calibration_frame == 7
 
-    # Kare 8-10: Yumuşak geçiş tamamlanmalı
-    for idx in (8, 9, 10):
+    # Kare 12: ~4 px (DEADBAND < fark <= SOFT) -> hemen kabul, referans noktaları
+    # üzerinden yumuşak geçiş; süre farkın PITCH_CAL_BLEND_MAX_STEP_M'ye bölümü kadar
+    for idx in range(8, 12):
         cal.current_idx = idx
         hybrid.process_frame(idx, f_left_2)
-    assert hybrid._blend_total == 0  # geçiş tamamlandı
-
-    # Kare 11: Tekrar (replay) kesmesi -> None
-    cal.current_idx = 11
-    assert hybrid.process_frame(11, f_replay) is None
-    assert mt.scene_cut_detected is True
-
-    # Kare 12: Karşı yarı sahaya dönüş (sıfır ORB çakışması) -> keypoint ile anında toparlanma
     cal.current_idx = 12
-    scripted_results[12] = CalibrationResult(success=True, homography_matrix=H_right_px_to_m)
-    m12 = hybrid.process_frame(12, f_right)
-    assert m12 is not None
-    assert hybrid.last_calibration_reason == "post_cut_recovery"
-    assert pt.is_calibrated is True
+    scripted_results[12] = CalibrationResult(success=True, homography_matrix=H_left_off)
+    m12 = hybrid.process_frame(12, f_left_2)
+    d12 = hybrid.frame_info["disagreement_m"]
+    assert config.PITCH_CAL_DEADBAND_M < d12 <= config.PITCH_CAL_SOFT_M
+    assert np.allclose(m12, np.eye(3))
+    assert hybrid.last_calibration_reason == "periodic_refresh"
+    assert hybrid.frame_info["source"] == "blend"
+    expected_total = max(4, int(np.ceil(d12 / config.PITCH_CAL_BLEND_MAX_STEP_M)))
+    assert hybrid._blend_total == expected_total
+    assert hybrid._blend_step == 1
 
-    # Kare 17: Periyodik yenileme başarısız olursa last_calibration_frame korunup Kare 18'de yeniden denenmeli
-    cal.current_idx = 17
-    assert hybrid.process_frame(17, f_right) is not None
-    assert hybrid.last_calibration_frame == 12  # güncellenmedi
+    # Kare 13-14: geçiş sürüyor
+    for idx in (13, 14):
+        cal.current_idx = idx
+        hybrid.process_frame(idx, f_left_2)
+        assert hybrid.frame_info["source"] == "blend"
+    assert hybrid._blend_total == expected_total
 
-    cal.current_idx = 18
-    scripted_results[18] = CalibrationResult(success=True, homography_matrix=H_right_px_to_m)
-    hybrid.process_frame(18, f_right)
-    assert hybrid.last_calibration_frame == 18
-    assert hybrid._blend_total == 4
-
-    # Kare 19: Yumuşak geçiş ortasında sahne kesmesi gelirse aktif geçiş iptal edilmeli
-    cal.current_idx = 19
-    assert hybrid.process_frame(19, f_replay) is None
+    # Kare 15: Tekrar (replay) kesmesi -> None, aktif geçiş iptal
+    cal.current_idx = 15
+    assert hybrid.process_frame(15, f_replay) is None
+    assert mt.scene_cut_detected is True
     assert hybrid._blend_total == 0
     assert hybrid.was_non_tactical is True
+
+    # Kare 16: Karşı yarı sahaya dönüş (sıfır ORB çakışması) -> keypoint ile anında toparlanma
+    cal.current_idx = 16
+    scripted_results[16] = CalibrationResult(success=True, homography_matrix=H_right_px_to_m)
+    m16 = hybrid.process_frame(16, f_right)
+    assert m16 is not None
+    assert hybrid.last_calibration_reason == "post_cut_recovery"
+    assert hybrid.frame_info["source"] == "keypoint_lock"
+    assert hybrid.frame_info["calib_reset"] is True
+    assert pt.is_calibrated is True
+
+    # Kare 21: Periyodik yenileme başarısız olursa last_calibration_frame korunup Kare 22'de yeniden denenmeli
+    cal.current_idx = 21
+    assert hybrid.process_frame(21, f_right) is not None
+    assert hybrid.last_calibration_frame == 16  # güncellenmedi
+
+    cal.current_idx = 22
+    scripted_results[22] = CalibrationResult(success=True, homography_matrix=H_right_px_to_m)
+    hybrid.process_frame(22, f_right)
+    assert hybrid.last_calibration_frame == 22
+    assert hybrid.frame_info["source"] == "keypoint_refresh"  # aynı yer -> değişiklik yok
 
 
 def test_r2_main_cli_priority_and_no_auto_calibrate_flag(tmp_path, monkeypatch):
