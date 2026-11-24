@@ -48,6 +48,30 @@ Bu adımı atlarsanız pipeline yine çalışır, sadece `pitch_x`/`pitch_y` ala
 `None` kalır (piksel koordinatları, `pixel_fallback` modundaki analizler ve
 video çıktısı etkilenmez).
 
+### Kalibrasyon isabetini ölçme (Faz A2)
+Otomatik kalibrasyonun gerçek videoda kaç metre şaştığını ölçmek için iki klipte
+(bir TV yayını, bir sabit/geniş kamera) 20'şer kare etiketleyin:
+
+1. Pipeline'ı çalıştırın; export dizinine kare bazında `homography_log.csv` yazılır
+   (`--no-homography-log` ile kapatılabilir):
+   ```powershell
+   python main.py --input data/input_videos/klip.mp4 --no-video --export-dir data/exports/klip
+   ```
+2. Aynı klipte bilinen saha noktalarına tıklayarak etiketleyin (`n`: sonraki kare,
+   `q`: bitir; nokta adını isim ya da listedeki numarayla girin):
+   ```powershell
+   python utils/calibrate_homography.py --input data/input_videos/klip.mp4 --label-mode --every-sec 15 --labels-out data/exports/klip/labels.csv
+   ```
+   Belirli kareler için `--every-sec` yerine `--frames 100,350,900` kullanılabilir.
+3. Ölçümü çalıştırın; Türkçe özet ekrana, ayrıntılar `homography_eval.json`'a yazılır:
+   ```powershell
+   python utils/evaluate_homography.py --log data/exports/klip/homography_log.csv --labels data/exports/klip/labels.csv
+   ```
+   Özet; ortanca ve %90'lık dilim hatasını, etiketli karelerde geçerli tablo oranını
+   ve kaynağa göre (`keypoint_*`, `flow`, `blend`) kırılımı verir. Etiketlenip tablosu
+   olmayan kare "tablo yok" sayılır. Hedef: TV yayınında ortanca hata < 1 m, sabit
+   kamerada < 0,5 m ve etiketli karelerin en az %90'ında geçerli tablo.
+
 ## Çalıştırma
 ```bash
 python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4
