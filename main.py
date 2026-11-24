@@ -161,10 +161,7 @@ def main():
         and bool(getattr(config, "AUTO_CALIBRATE_PITCH", True))
     )
 
-    try:
-        transformer = PerspectiveTransformer(quiet=auto_cal_requested)
-    except TypeError:
-        transformer = PerspectiveTransformer()
+    transformer = PerspectiveTransformer(quiet=auto_cal_requested)
 
     motion_tracker = CameraMotionTracker()
     hybrid_calibrator = None
@@ -176,28 +173,23 @@ def main():
                 "öncelikli olarak aktif."
             )
     elif auto_cal_requested:
-        if hasattr(transformer, "set_homography") and hasattr(motion_tracker, "reanchor"):
-            auto_calibrator = AutoPitchCalibrator()
-            if auto_calibrator.is_available:
-                hybrid_calibrator = HybridPitchCalibrator(
-                    calibrator=auto_calibrator,
-                    transformer=transformer,
-                    motion_tracker=motion_tracker,
-                )
-                print(
-                    f"[Kalibrasyon] Otomatik saha anahtar nokta kalibrasyonu aktif "
-                    f"(yenileme={hybrid_calibrator.refresh_interval} kare, "
-                    f"yumuşak geçiş={hybrid_calibrator.smooth_frames} kare)."
-                )
-            else:
-                print(
-                    "\n[UYARI] Otomatik kalibrasyon modeli bulunamadı; kalibrasyonsuz "
-                    "(T2) modda devam ediliyor. Saha koordinatları üretilmeyecek ve "
-                    "minimap gösterilmeyecek.\n"
-                )
+        auto_calibrator = AutoPitchCalibrator()
+        if auto_calibrator.is_available:
+            hybrid_calibrator = HybridPitchCalibrator(
+                calibrator=auto_calibrator,
+                transformer=transformer,
+                motion_tracker=motion_tracker,
+            )
+            print(
+                f"[Kalibrasyon] Otomatik saha anahtar nokta kalibrasyonu aktif "
+                f"(yenileme={hybrid_calibrator.refresh_interval} kare, "
+                f"yumuşak geçiş={hybrid_calibrator.smooth_frames} kare)."
+            )
         else:
             print(
-                "\n[UYARI] Kalibrasyon yapılmamış (T2 modu); saha koordinatları üretilmeyecek.\n"
+                "\n[UYARI] Otomatik kalibrasyon modeli bulunamadı; kalibrasyonsuz "
+                "(T2) modda devam ediliyor. Saha koordinatları üretilmeyecek ve "
+                "minimap gösterilmeyecek.\n"
             )
     else:
         print(
