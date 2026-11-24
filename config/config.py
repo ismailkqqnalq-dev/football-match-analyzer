@@ -449,6 +449,16 @@ PITCH_CALIBRATION_RANSAC_PX = 8.0
 PITCH_CALIBRATION_MAX_REPROJ_ERR_PX = 12.0
 PITCH_CALIBRATION_MAX_REPROJ_ERR_M = 2.0
 
+# A2: Saha çizgisine oturtma — model tablosunu beyaz çizgilere hizalayan ince ayar (modules/pitch_line_refiner.py)
+PITCH_LINE_REFINE_ENABLED = True
+PITCH_LINE_REFINE_LOOSE_RANSAC_PX = 25.0     # ek başlangıç adayı: gevşek RANSAC (model noktaları 20-50 px sapabiliyor)
+PITCH_LINE_REFINE_WORK_HEIGHT = 540          # oturtma bu yükseklikteki küçültülmüş karede yapılır (hız)
+PITCH_LINE_REFINE_SAMPLE_STEP_M = 1.0        # saha çiziminden örnek aralığı (metre)
+PITCH_LINE_REFINE_TOPHAT_THRESHOLD = 18      # çizgi maskesi parlaklık eşiği (top-hat)
+PITCH_LINE_REFINE_INLIER_PX = 3.0            # çizgiye "oturdu" sayılma mesafesi (1080p pikseli)
+PITCH_LINE_REFINE_MIN_INLIER_RATIO = 0.50    # kabul için çizgiye oturan örnek oranı alt sınırı (yanlış tablolar <= 0,47 ölçüldü)
+PITCH_LINE_REFINE_MAX_SHIFT_FRAC = 0.10      # örneklerin ortanca yer değiştirmesi <= kare köşegeni x bu oran
+
 # A2-3: Model–optical flow uyuşmazlığına göre kademeli kabul (metre, 3x3 referans ızgarasının ortancası)
 PITCH_CAL_DEADBAND_M = 0.5          # bu farkın altında tablo değiştirilmez (gürültü titremesini önler)
 PITCH_CAL_SOFT_M = 1.0              # bu farka kadar yumuşak geçişle hemen kabul
