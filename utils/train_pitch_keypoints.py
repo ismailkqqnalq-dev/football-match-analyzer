@@ -306,6 +306,162 @@ def _compute_file_sha256(file_path: Path) -> str:
     return digest.hexdigest()
 
 
+# ----------------------------------------------------------------------
+# A2-7: Nokta sırası görsel kontrolü ve yatay çevirme (flip) politikası
+# ----------------------------------------------------------------------
+ORDER_CHECK_DIR: Path = Path(getattr(config, "BASE_DIR", os.getcwd())) / "runs" / "pitch_order_check"
+
+
+def template_flip_idx(
+    template: Optional[Sequence[Tuple[float, float]]] = None,
+    pitch_length: Optional[float] = None,
+    tol: float = 1e-3,
+) -> Optional[list]:
+    """
+    Bizim 32 nokta şablonumuzdan yatay çevirme eşlemesini üretir: i. noktanın aynası
+    (L - x, y) olan j. nokta. Aynası bulunamayan nokta varsa None döner.
+    """
+    pts = np.asarray(
+        template if template is not None else getattr(config, "PITCH_KEYPOINTS_32_METERS", ()),
+        dtype=np.float64,
+    )
+    length = float(pitch_length if pitch_length is not None else getattr(config, "PITCH_LENGTH_M", 105.0))
+    out = []
+    for x, y in pts:
+        d = np.hypot(pts[:, 0] - (length - x), pts[:, 1] - y)
+        j = int(np.argmin(d))
+        if float(d[j]) > tol:
+            return None
+        out.append(j)
+    return out if sorted(out) == list(range(len(pts))) else None
+
+
+def resolve_flip_policy(
+    pose_meta: Dict[str, Any],
+    data_yaml_path: Union[str, Path],
+    fliplr: float = 0.5,
+) -> Dict[str, Any]:
+    """
+    YOLO-Pose yatay çevirme artırması nokta sırasını bozmasın diye karar verir:
+      - veri setinde flip_idx var ve şablonla aynı     -> "dataset_ok"
+      - veri setinde flip_idx var ama şablondan farklı -> "dataset_mismatch" (fliplr=0 + uyarı:
+        nokta sırası config'teki adlarla uyuşmuyor olabilir)
+      - flip_idx yok, fliplr > 0, şablondan üretilebiliyor -> "generated" (data.yaml'a yazılır)
+      - flip_idx yok, üretilemiyor -> "disabled" (fliplr=0)
+      - fliplr <= 0 -> "not_needed"
+    """
+    tmpl = template_flip_idx()
+    ds_flip = pose_meta.get("flip_idx")
+    if ds_flip is not None:
+        if tmpl is not None and list(ds_flip) != list(tmpl):
+            return {
+                "action": "dataset_mismatch",
+                "fliplr": 0.0,
+                "flip_idx": list(ds_flip),
+                "message": (
+                    "UYARI: Veri setindeki flip_idx bizim 32 nokta şablonumuzdan türetilen eşlemeyle "
+                    "uyuşmuyor; nokta sırası config.PITCH_KEYPOINT_NAMES_32 ile farklı olabilir. "
+                    "Yatay çevirme kapatıldı (fliplr=0). Eğitimden önce pitch_order_check "
+                    "görsellerini mutlaka kontrol edin."
+                ),
+            }
+        return {"action": "dataset_ok", "fliplr": float(fliplr), "flip_idx": list(ds_flip),
+                "message": "Veri setindeki flip_idx şablonla uyumlu."}
+    if fliplr <= 0:
+        return {"action": "not_needed", "fliplr": 0.0, "flip_idx": None,
+                "message": "Yatay çevirme kapalı; flip_idx gerekmiyor."}
+    if tmpl is None:
+        return {"action": "disabled", "fliplr": 0.0, "flip_idx": None,
+                "message": "UYARI: flip_idx yok ve şablondan üretilemedi; yatay çevirme kapatıldı (fliplr=0)."}
+    yaml_path = Path(data_yaml_path)
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    data["flip_idx"] = list(tmpl)
+    with open(yaml_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+    return {"action": "generated", "fliplr": float(fliplr), "flip_idx": list(tmpl),
+            "message": "flip_idx veri setinde yoktu; bizim şablondan üretilip data.yaml'a yazıldı."}
+
+
+def read_pose_label(
+    label_path: Union[str, Path], img_w: int, img_h: int, num_kpts: int
+) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """YOLO-Pose etiket dosyasındaki ilk örneğin noktalarını piksel olarak okur (xy, görünürlük)."""
+    with open(label_path, "r", encoding="utf-8") as f:
+        for line in f:
+            vals = line.split()
+            if len(vals) < 5 + 2 * num_kpts:
+                continue
+            arr = np.asarray([float(v) for v in vals[5:]], dtype=np.float64)
+            dims = 3 if arr.size >= 3 * num_kpts else 2
+            arr = arr[: dims * num_kpts].reshape(num_kpts, dims)
+            xy = arr[:, :2] * np.array([img_w, img_h], dtype=np.float64)
+            vis = arr[:, 2] > 0 if dims == 3 else np.ones(num_kpts, dtype=bool)
+            vis &= (arr[:, 0] > 0) | (arr[:, 1] > 0)
+            return xy, vis
+    return None
+
+
+def draw_keypoint_order(image: np.ndarray, xy: np.ndarray, vis: np.ndarray, names: Sequence[str]) -> np.ndarray:
+    """Görünür noktaları indeks ve BİZİM config adımızla çizer."""
+    import cv2
+
+    out = image.copy()
+    for i, ((x, y), v) in enumerate(zip(xy, vis)):
+        if not v:
+            continue
+        p = (int(round(x)), int(round(y)))
+        cv2.circle(out, p, 6, (0, 0, 255), -1)
+        label = f"{i}:{names[i] if i < len(names) else '?'}"
+        cv2.putText(out, label, (p[0] + 7, p[1] - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 3)
+        cv2.putText(out, label, (p[0] + 7, p[1] - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+    return out
+
+
+def write_order_check_images(
+    dataset_dir: Union[str, Path],
+    out_dir: Union[str, Path] = ORDER_CHECK_DIR,
+    names: Optional[Sequence[str]] = None,
+    num_kpts: int = DEFAULT_NUM_KEYPOINTS,
+    count: int = 3,
+) -> list:
+    """Veri setinden en çok görünür noktası olan `count` görüntüyü adlarımızla çizip PNG yazar."""
+    import cv2
+
+    names = list(names if names is not None else getattr(config, "PITCH_KEYPOINT_NAMES_32", ()))
+    dataset_dir = Path(dataset_dir)
+    out_dir = Path(out_dir)
+    scored = []
+    for label_path in sorted(dataset_dir.glob("**/labels/*.txt")):
+        img_path = None
+        for ext in (".jpg", ".jpeg", ".png", ".bmp"):
+            cand = label_path.parent.parent / "images" / (label_path.stem + ext)
+            if cand.is_file():
+                img_path = cand
+                break
+        if img_path is None:
+            continue
+        img = cv2.imread(str(img_path))
+        if img is None:
+            continue
+        parsed = read_pose_label(label_path, img.shape[1], img.shape[0], num_kpts)
+        if parsed is None:
+            continue
+        scored.append((int(parsed[1].sum()), str(label_path), img_path, parsed))
+        if len(scored) >= 50:
+            break
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    if scored:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for k, (_n, _lp, img_path, (xy, vis)) in enumerate(scored[:count], start=1):
+        img = cv2.imread(str(img_path))
+        out_path = out_dir / f"order_check_{k}_{img_path.stem[:40]}.png"
+        cv2.imwrite(str(out_path), draw_keypoint_order(img, xy, vis, names))
+        written.append(out_path)
+    return written
+
+
 def parse_args(argv: Optional[Sequence[str]] = None):
     parser = argparse.ArgumentParser(
         description=(
@@ -402,6 +558,20 @@ def parse_args(argv: Optional[Sequence[str]] = None):
         action="store_true",
         help="Eğitim bitince geçici veri seti ve run klasörlerini siler.",
     )
+    parser.add_argument(
+        "--check-order-only",
+        action="store_true",
+        help=(
+            "Veri setini indirip doğrular, nokta sırası kontrol görsellerini "
+            "runs/pitch_order_check/ altına yazar ve eğitime BAŞLAMADAN çıkar."
+        ),
+    )
+    parser.add_argument(
+        "--fliplr",
+        type=float,
+        default=0.5,
+        help="Yatay çevirme artırma olasılığı (flip_idx yoksa şablondan üretilir).",
+    )
     return parser.parse_args(argv)
 
 
@@ -497,6 +667,31 @@ def main(argv: Optional[Sequence[str]] = None):
     print(f"      kpt_shape: {pose_meta['kpt_shape']}")
     if pose_meta["flip_idx"] is not None:
         print(f"      flip_idx : {len(pose_meta['flip_idx'])} elemanlı geçerli permütasyon")
+    if pose_meta["kpt_shape"] != [DEFAULT_NUM_KEYPOINTS, 3]:
+        print(
+            f"[HATA] Beklenen kpt_shape [{DEFAULT_NUM_KEYPOINTS}, 3], bulunan {pose_meta['kpt_shape']}."
+        )
+        sys.exit(1)
+
+    flip_policy = resolve_flip_policy(pose_meta, data_yaml_path, fliplr=args.fliplr)
+    print(
+        f"      flip     : {flip_policy['action']} (fliplr={flip_policy['fliplr']}) - "
+        f"{flip_policy['message']}"
+    )
+
+    order_pngs = write_order_check_images(dataset_location, ORDER_CHECK_DIR)
+    if order_pngs:
+        print("      Nokta sırası kontrol görselleri (adlar config.PITCH_KEYPOINT_NAMES_32'den):")
+        for pth in order_pngs:
+            print(f"        {pth}")
+    else:
+        print("[UYARI] Nokta sırası kontrol görseli üretilemedi (etiketli görüntü bulunamadı).")
+    if args.check_order_only:
+        print(
+            "\n[DURDURULDU] --check-order-only: görsellerdeki adların noktaların gerçek yerleriyle "
+            "eşleştiğini kontrol edin; doğruysa aynı komutu bu bayrak olmadan çalıştırıp eğitimi başlatın."
+        )
+        return
 
     # --------------------------------------------------------------
     # 3) RTX 4050 GÜVENLİ YOLO-POSE EĞİTİMİNİ BAŞLAT
@@ -528,6 +723,7 @@ def main(argv: Optional[Sequence[str]] = None):
         patience=args.patience,
         save=True,
         plots=True,
+        fliplr=flip_policy["fliplr"],
     )
 
     # --------------------------------------------------------------
@@ -556,6 +752,8 @@ def main(argv: Optional[Sequence[str]] = None):
     print("=" * 70)
     print(f"PITCH_KEYPOINT_MODEL_PATH -> {destination_path}")
     print(f'$env:FOOTBALL_PITCH_MODEL_SHA256 = "{weights_sha256}"')
+    print("Ortam değişkeni yerine config/config.py'de sabitlemek için:")
+    print(f'SECURITY_PITCH_MODEL_SHA256 = "{weights_sha256}"')
     print("=" * 70)
 
     save_dir = best_weights_path.parent.parent
