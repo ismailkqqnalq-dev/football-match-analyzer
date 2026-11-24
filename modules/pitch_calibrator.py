@@ -23,6 +23,7 @@ Bu modül iki ana bileşen sunar:
            düzeltmeyi referans noktaları üzerinden yumuşak geçişle uygular.
 """
 
+import csv
 from dataclasses import dataclass
 import math
 import os
@@ -1529,3 +1530,70 @@ class HybridPitchCalibrator:
             "calibration_count": self.calibration_count,
             "stats": dict(self.stats),
         }
+
+
+class HomographyLogWriter:
+    """
+    A2-2: Kare bazında kullanılan piksel->metre tablosunu (efektif: H @ M) ve
+    kalibrasyon kararını `homography_log.csv` dosyasına akış halinde yazar.
+    """
+
+    COLUMNS: Tuple[str, ...] = (
+        ("frame_idx", "source")
+        + tuple(f"h{r}{c}" for r in range(3) for c in range(3))
+        + ("num_keypoints", "num_inliers", "reproj_error_m", "disagreement_m", "profile")
+    )
+
+    def __init__(self, path: Union[str, os.PathLike], flush_every: int = 500):
+        self.path = os.fspath(path)
+        parent = os.path.dirname(os.path.abspath(self.path))
+        os.makedirs(parent, exist_ok=True)
+        self._fh = open(self.path, "w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._fh)
+        self._writer.writerow(self.COLUMNS)
+        self._flush_every = max(1, int(flush_every))
+        self._pending = 0
+        self.rows_written = 0
+
+    @staticmethod
+    def _cell(v: Any) -> Any:
+        if v is None:
+            return ""
+        if isinstance(v, float):
+            return "" if not math.isfinite(v) else float(f"{v:.12g}")
+        return v
+
+    def write(self, frame_idx: int, info: Dict[str, Any], matrix: Optional[np.ndarray]) -> None:
+        if matrix is not None:
+            h_vals = [float(x) for x in np.asarray(matrix, dtype=np.float64).ravel()]
+        else:
+            h_vals = [None] * 9
+        row = (
+            [int(frame_idx), info.get("source", "none")]
+            + [self._cell(v) for v in h_vals]
+            + [
+                self._cell(info.get("num_keypoints")),
+                self._cell(info.get("num_inliers")),
+                self._cell(info.get("reproj_error_m")),
+                self._cell(info.get("disagreement_m")),
+                info.get("profile") or "",
+            ]
+        )
+        self._writer.writerow(row)
+        self.rows_written += 1
+        self._pending += 1
+        if self._pending >= self._flush_every:
+            self._fh.flush()
+            self._pending = 0
+
+    def close(self) -> None:
+        if self._fh is not None and not self._fh.closed:
+            self._fh.flush()
+            self._fh.close()
+
+    def __enter__(self) -> "HomographyLogWriter":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False

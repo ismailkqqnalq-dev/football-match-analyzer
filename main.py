@@ -23,6 +23,7 @@ Kullanım:
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -37,7 +38,11 @@ from modules.tracker import PlayerTracker, BallTracker
 from modules.team_classifier import TeamClassifier
 from modules.perspective_transformer import PerspectiveTransformer
 from modules.camera_motion_tracker import CameraMotionTracker
-from modules.pitch_calibrator import AutoPitchCalibrator, HybridPitchCalibrator
+from modules.pitch_calibrator import (
+    AutoPitchCalibrator,
+    HomographyLogWriter,
+    HybridPitchCalibrator,
+)
 from modules.data_exporter import DataExporter
 from modules.match_analytics import MatchAnalyzer
 from modules.ml_analyzer import MLAnalyzer
@@ -109,6 +114,10 @@ def parse_args():
     parser.add_argument(
         "--no-auto-calibrate", action="store_true",
         help="Otomatik saha anahtar nokta (keypoint) kalibrasyonunu devre dışı bırak"
+    )
+    parser.add_argument(
+        "--no-homography-log", action="store_true",
+        help="Kare bazında kalibrasyon kaydını (homography_log.csv) yazmayı atla"
     )
     return parser.parse_args()
 
@@ -209,6 +218,13 @@ def main():
             enable_csv=enable_csv,
             enable_sql=enable_sql,
         )
+        homography_log = (
+            None
+            if args.no_homography_log
+            else HomographyLogWriter(
+                os.path.join(export_dir, config.EXPORT_HOMOGRAPHY_LOG_FILENAME)
+            )
+        )
 
         try:
             def process_frame(frame_idx, frame, raw_detections):
@@ -251,6 +267,21 @@ def main():
                 else:
                     for det in all_tracked:
                         det["pitch_x"], det["pitch_y"], det["on_pitch"] = None, None, None
+
+                # A2-2: bu karede kullanılan efektif tabloyu ve kalibrasyon kararını kaydet
+                if homography_log is not None:
+                    effective_h = (
+                        HybridPitchCalibrator._normalize_matrix(
+                            transformer.homography_matrix @ motion_matrix
+                        )
+                        if motion_matrix is not None and transformer.is_calibrated
+                        else None
+                    )
+                    if hybrid_calibrator is not None:
+                        log_info = hybrid_calibrator.frame_info
+                    else:
+                        log_info = {"source": "manual" if effective_h is not None else "none"}
+                    homography_log.write(frame_idx, log_info, effective_h)
 
                 # A2-3: kalibrasyon sıçrama karesi -> mesafe/hız hesabında segment bölünür
                 calib_reset = bool(
@@ -310,6 +341,21 @@ def main():
             csv_out_path = exporter.export_to_csv() if enable_csv else None
             sql_out_path = exporter.export_to_sql() if enable_sql else None
             exporter.export_distance_summary()
+
+            if homography_log is not None:
+                homography_log.close()
+                print(f"[Kalibrasyon] Kare bazında kalibrasyon kaydı: {homography_log.path}")
+            if hybrid_calibrator is not None:
+                cal_summary = hybrid_calibrator.summary()
+                cal_summary_path = os.path.join(
+                    export_dir, config.EXPORT_CALIBRATION_SUMMARY_FILENAME
+                )
+                with open(cal_summary_path, "w", encoding="utf-8") as fh:
+                    json.dump(cal_summary, fh, ensure_ascii=False, indent=2)
+                print(
+                    f"[Kalibrasyon] Görüntü profili: {cal_summary['profile']} "
+                    f"({cal_summary['profile_reason']}) | özet: {cal_summary_path}"
+                )
 
             # Adım 7 ve Adım 8 için veri kaynağını seç (SQLite -> CSV -> bellek)
             def _load_match_analyzer() -> MatchAnalyzer:
@@ -399,6 +445,8 @@ def main():
                 else:
                     print("Tempo & Anomali -> Saha kalibrasyonu gerekli.")
         finally:
+            if homography_log is not None:
+                homography_log.close()
             if hasattr(exporter, "close"):
                 exporter.close()
 
