@@ -251,15 +251,13 @@ def main():
                 # 3) Topu sönümlenen hızlı tekil takipçiyle izle -- Adım 3
                 tracked_ball = ball_tracker.update(raw_detections, frame_shape=frame.shape)
 
-                # 4) Forma rengine göre Takım A / Takım B / Hakem / Kaleci ata -- Adım 4
-                tracked_players = team_classifier.assign_teams(tracked_players, frame)
-
-                # 5) Oyuncu + top listelerini birleştir
+                # 4) Oyuncu + top listelerini birleştir
                 all_tracked = tracked_players.copy()
                 if tracked_ball is not None:
                     all_tracked.append(tracked_ball)
 
-                # 6) Piksel koordinatlarını saha (metre) koordinatlarına çevir -- Adım 5
+                # 5) Piksel koordinatlarını saha (metre) koordinatlarına çevir -- Adım 5
+                #    (takım atamasından ÖNCE: kaleci eşleştirmesi saha metresini kullanır)
                 if motion_matrix is not None:
                     all_tracked = transformer.add_pitch_coordinates(
                         all_tracked, camera_motion_matrix=motion_matrix
@@ -267,6 +265,9 @@ def main():
                 else:
                     for det in all_tracked:
                         det["pitch_x"], det["pitch_y"], det["on_pitch"] = None, None, None
+
+                # 6) Forma rengine göre Takım A / Takım B / Hakem / Kaleci ata -- Adım 4
+                team_classifier.assign_teams(tracked_players, frame)
 
                 # A2-2: bu karede kullanılan efektif tabloyu ve kalibrasyon kararını kaydet
                 if homography_log is not None:

@@ -31,6 +31,12 @@ from pandas.api.types import union_categoricals
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import config
+from modules.analytics_common import (
+    _get_human_class_names,
+    _bool_mask,
+    _compact_bool_series,
+    _encode_clean_strings,
+)
 from modules.pitch_orientation import (
     compute_ball_kinematic_filter,
     compute_pixel_scale_px_per_m,
@@ -60,28 +66,6 @@ _FLOAT32_COLS = ("pixel_x", "pixel_y", "pitch_x", "pitch_y")
 _BOOL_COLS = ("is_predicted", "on_pitch", "calib_reset")
 
 
-def _get_human_class_names() -> set:
-    """M1 4-sınıf (goalkeeper/player/referee) ve eski COCO ('person') uyumlu insan sınıf kümesi."""
-    return set(getattr(config, "HUMAN_CLASS_NAMES", ())) | {"person"}
-
-
-def _clean_str(val: Any) -> Optional[str]:
-    """NaN / None / boş değerleri güvenli biçimde None'a normalize eder."""
-    if val is None:
-        return None
-    if isinstance(val, (float, np.floating)) and (math.isnan(float(val)) or math.isinf(float(val))):
-        return None
-    try:
-        if pd.isna(val):
-            return None
-    except (TypeError, ValueError):
-        pass
-    s = str(val).strip()
-    if not s or s.lower() in {"nan", "none", "null"}:
-        return None
-    return s
-
-
 def _to_python_scalar(obj: Any) -> Any:
     """NumPy / Pandas tiplerini JSON serileştirilebilir standart Python tiplerine çevirir."""
     if obj is None:
@@ -107,89 +91,6 @@ def _to_python_scalar(obj: Any) -> Any:
     except (TypeError, ValueError):
         pass
     return obj
-
-
-def _bool_mask(series: pd.Series, na_value: bool) -> np.ndarray:
-    """Nullable boolean, float32, int, object ve category serilerini Kleene hatasız bool NumPy maskesine çevirir."""
-    n = len(series)
-    if n == 0:
-        return np.empty(0, dtype=bool)
-    dtype = series.dtype
-    if pd.api.types.is_bool_dtype(dtype):
-        return series.fillna(na_value).to_numpy(dtype=bool)
-    if pd.api.types.is_numeric_dtype(dtype):
-        arr = series.to_numpy(dtype=np.float32, copy=False)
-        out = arr != 0
-        nan_m = np.isnan(arr)
-        if nan_m.any():
-            out = out.copy()
-            out[nan_m] = na_value
-        return out
-    codes, uniques = pd.factorize(series, sort=False, use_na_sentinel=True)
-    u_bool = np.empty(len(uniques), dtype=bool)
-    for i, u in enumerate(uniques):
-        if u is None or (isinstance(u, float) and math.isnan(u)):
-            u_bool[i] = na_value
-        elif isinstance(u, (bool, np.bool_)):
-            u_bool[i] = bool(u)
-        elif isinstance(u, (int, float, np.integer, np.floating)):
-            u_bool[i] = float(u) != 0.0
-        else:
-            s = str(u).strip().lower()
-            if s in ("true", "1", "1.0", "yes"):
-                u_bool[i] = True
-            elif s in ("false", "0", "0.0", "no"):
-                u_bool[i] = False
-            else:
-                u_bool[i] = na_value
-    out = np.full(n, na_value, dtype=bool)
-    valid = codes >= 0
-    if valid.any():
-        out[valid] = u_bool[codes[valid]]
-    return out
-
-
-def _compact_bool_series(series: pd.Series) -> pd.Series:
-    """Boolean sütunu bellek dostu bool (non-null) veya float32 (1.0/0.0/NaN) tipine sıkıştırır."""
-    dtype = series.dtype
-    if dtype == np.dtype(bool):
-        return series
-    if pd.api.types.is_bool_dtype(dtype):
-        if not series.isna().any():
-            return series.to_numpy(dtype=bool)
-        arr = np.full(len(series), np.nan, dtype=np.float32)
-        notna = series.notna().to_numpy(dtype=bool)
-        arr[notna] = series.loc[notna].to_numpy(dtype=np.float32)
-        return pd.Series(arr, index=series.index, dtype=np.float32)
-    if pd.api.types.is_numeric_dtype(dtype):
-        if not series.isna().any():
-            arr_num = series.to_numpy(dtype=np.float64, copy=False)
-            if np.all((arr_num == 0) | (arr_num == 1)):
-                return pd.Series(arr_num != 0, index=series.index, dtype=bool)
-        return pd.to_numeric(series, errors="coerce").astype(np.float32)
-
-    codes, uniques = pd.factorize(series, sort=False, use_na_sentinel=True)
-    u_vals = np.full(len(uniques), np.nan, dtype=np.float32)
-    for i, u in enumerate(uniques):
-        if u is None or (isinstance(u, float) and math.isnan(u)):
-            continue
-        if isinstance(u, (bool, np.bool_)):
-            u_vals[i] = 1.0 if bool(u) else 0.0
-        elif isinstance(u, (int, float, np.integer, np.floating)):
-            u_vals[i] = 1.0 if float(u) != 0.0 else 0.0
-        else:
-            s = str(u).strip().lower()
-            if s in ("true", "1", "1.0", "yes"):
-                u_vals[i] = 1.0
-            elif s in ("false", "0", "0.0", "no"):
-                u_vals[i] = 0.0
-    out = np.full(len(series), np.nan, dtype=np.float32)
-    valid = codes >= 0
-    if valid.any():
-        out[valid] = u_vals[codes[valid]]
-    if not np.isnan(out).any():
-        return pd.Series(out != 0.0, index=series.index, dtype=bool)
-    return pd.Series(out, index=series.index, dtype=np.float32)
 
 
 def _compact_analytics_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -224,36 +125,20 @@ def _compact_analytics_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _encode_clean_strings(series: pd.Series) -> Tuple[np.ndarray, List[str]]:
-    """Serideki benzersiz değerleri _clean_str ile bir kez temizleyip int32 kodlara çevirir (-1 = None)."""
-    n = len(series)
-    if n == 0:
-        return np.empty(0, dtype=np.int32), []
-    if isinstance(series.dtype, pd.CategoricalDtype):
-        raw_codes = series.cat.codes.to_numpy(dtype=np.int32)
-        uniques = series.cat.categories
-    else:
-        raw_codes, uniques = pd.factorize(series, sort=False, use_na_sentinel=True)
-        raw_codes = raw_codes.astype(np.int32, copy=False)
-
-    cleaned_list: List[str] = []
-    str_to_code: Dict[str, int] = {}
-    remap = np.full(len(uniques), -1, dtype=np.int32)
-    for i, u in enumerate(uniques):
-        cs = _clean_str(u)
-        if cs is not None:
-            c = str_to_code.get(cs)
-            if c is None:
-                c = len(cleaned_list)
-                cleaned_list.append(cs)
-                str_to_code[cs] = c
-            remap[i] = c
-
-    out = np.full(n, -1, dtype=np.int32)
-    valid = raw_codes >= 0
-    if valid.any():
-        out[valid] = remap[raw_codes[valid]]
-    return out, cleaned_list
+def _majority_code(keys: np.ndarray, values: np.ndarray, n_keys: int, n_values: int) -> np.ndarray:
+    """
+    Her anahtar (ör. track kodu) için en sık görülen değer kodunu (ör. takım) döndürür;
+    hiç değeri olmayan anahtarlar -1 olur. Takım ayırıcı ilk karelerde yanılıp sonradan
+    oylamayla düzelttiği için ilk etiket yerine çoğunluk kullanılır.
+    """
+    out = np.full(n_keys, -1, dtype=np.int32)
+    if len(keys) == 0 or n_keys == 0 or n_values == 0:
+        return out
+    counts = np.zeros((n_keys, n_values), dtype=np.int64)
+    np.add.at(counts, (keys, values), 1)
+    has = counts.sum(axis=1) > 0
+    out[has] = counts[has].argmax(axis=1).astype(np.int32)
+    return out
 
 
 class MatchAnalyzer:
@@ -649,8 +534,7 @@ class MatchAnalyzer:
             if valid_tt.any():
                 vt_tids = p_tid_codes[valid_tt]
                 vt_teams = p_team_codes[valid_tt]
-                _, first_occ = np.unique(vt_tids, return_index=True)
-                tid_to_team_code[vt_tids[first_occ]] = vt_teams[first_occ]
+                tid_to_team_code = _majority_code(vt_tids, vt_teams, len(tid_list), len(team_list))
 
             p_fids = self.df["frame_idx"].iloc[p_idx].to_numpy(dtype=np.int64)
             p_xs = self.df[x_col].iloc[p_idx].to_numpy(dtype=np.float64)
@@ -755,18 +639,17 @@ class MatchAnalyzer:
             ctrl_teams = smoothed_team_codes[controlled_mask]
             tid_counts = np.bincount(ctrl_tids, minlength=len(tid_list))
 
-            first_team_per_tid = np.full(len(tid_list), -1, dtype=np.int32)
+            majority_team_per_tid = np.full(len(tid_list), -1, dtype=np.int32)
             has_ctrl_team = ctrl_teams >= 0
             if has_ctrl_team.any():
                 ct_valid_tids = ctrl_tids[has_ctrl_team]
                 ct_valid_teams = ctrl_teams[has_ctrl_team]
-                _, first_idx = np.unique(ct_valid_tids, return_index=True)
-                first_team_per_tid[ct_valid_tids[first_idx]] = ct_valid_teams[first_idx]
+                majority_team_per_tid = _majority_code(ct_valid_tids, ct_valid_teams, len(tid_list), len(team_list))
 
             active_tids = np.flatnonzero(tid_counts > 0)
             for tc in active_tids:
                 f_cnt = int(tid_counts[tc])
-                tmc = int(first_team_per_tid[tc])
+                tmc = int(majority_team_per_tid[tc])
                 player_control.append({
                     "track_id": tid_list[tc],
                     "team": team_list[tmc] if tmc >= 0 else None,

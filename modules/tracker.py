@@ -722,6 +722,32 @@ class BallTracker:
         return [x1, y1, x2, y2]
 
     # ----------------------------------------------------------------
+    def _candidate_score_fn(self):
+        """
+        Top adaylarını puanlayan fonksiyonu döndürür. İz yakın zamanda gerçek bir
+        tespit gördüyse puan = güven * exp(-mesafe / erişim); erişim, topun aradaki
+        karelerde gidebileceği en uzak mesafedir. Aksi halde puan = güven.
+        """
+        gap = self._frames_since_real + 1
+        if (
+            self._last_real_center is None
+            or gap > self.max_missing_frames
+            or self.max_velocity_px <= 0
+        ):
+            return lambda d: float(d["confidence"])
+
+        exp_x = self._last_real_center[0] + self.velocity[0] * gap
+        exp_y = self._last_real_center[1] + self.velocity[1] * gap
+        reach = self.max_velocity_px * gap
+
+        def score(d: Dict) -> float:
+            x1, y1, x2, y2 = map(float, d["bbox"])
+            dist = float(np.hypot(0.5 * (x1 + x2) - exp_x, 0.5 * (y1 + y2) - exp_y))
+            return float(d["confidence"]) * float(np.exp(-dist / reach))
+
+        return score
+
+    # ----------------------------------------------------------------
     def update(
         self,
         detections: List[Dict],
@@ -744,9 +770,10 @@ class BallTracker:
         ball_detections = [d for d in detections if d["class_name"] == config.BALL_CLASS_NAME]
 
         if ball_detections:
-            # Birden fazla "top" tespiti varsa (yanlış pozitif olabilir),
-            # en yüksek güven skoruna sahip olanı gerçek top kabul ediyoruz.
-            best_detection = dict(max(ball_detections, key=lambda d: d["confidence"]))
+            # Birden fazla "top" tespiti varsa (yanlış pozitif olabilir), güveni
+            # izin beklenen konumuna yakınlıkla tartıyoruz: uzaktaki bir krampon
+            # ya da penaltı noktası, biraz daha yüksek güvenle bile topu çalamaz.
+            best_detection = dict(max(ball_detections, key=self._candidate_score_fn()))
             x1, y1, x2, y2 = map(float, best_detection["bbox"])
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
