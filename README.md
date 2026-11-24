@@ -77,6 +77,16 @@ Otomatik kalibrasyonun gerçek videoda kaç metre şaştığını ölçmek için
 python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4
 ```
 
+### Video yerine maç linki vermek
+`--input` parametresine dosya yolu yerine `http(s)` linki (ör. YouTube) verilebilir:
+```bash
+python main.py --input "https://www.youtube.com/watch?v=..." --no-video --max-frames 200
+```
+- Video `yt-dlp` ile en fazla 1080p (tercihen mp4/h264, sessiz) olarak geçici klasöre (`%TEMP%\fma_url_cache`) bir kez indirilir; aynı link tekrar verilirse önbellekteki dosya kullanılır. Yer açmak için bu klasör silinebilir.
+- `--max-frames` verilse bile videonun tamamı indirilir (90 dk 1080p birkaç GB olabilir).
+- YouTube sık değiştiği için indirme hata verirse önce `pip install -U yt-dlp` deneyin.
+- Yasal not: YouTube vb. platformların kullanım şartları video indirmeyi kısıtlayabilir. Bu özellik kişisel analiz içindir ve kullanım sorumluluğu kullanıcıya aittir; proje ticari bir ürüne dönüşürse ayrıca değerlendirilmelidir.
+
 ### 90 Dakikalık Maç ve Üretim CLI Seçenekleri
 - `--no-video`: Çıktı videosu oluşturmayı ve kare çizimini atlar; 90 dakikalık (~135.000 kare / ~2,7 milyon satır) maç analizlerinde disk ve işlem süresini önemli ölçüde azaltır.
 - `--no-minimap`: Çıktı videosu üzerine kuş bakışı 2D taktik minimap bindirmeyi kapatır.
