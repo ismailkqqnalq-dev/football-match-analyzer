@@ -1377,7 +1377,12 @@ class HybridPitchCalibrator:
         motion: np.ndarray,
     ) -> np.ndarray:
         if not self._fixed_locked:
-            if len(self._fixed_candidates) >= self.fixed_candidates_target:
+            # "auto" profilde algılama penceresi boyunca toplanan adaylar yeterliyse hemen kilitle
+            enough = len(self._fixed_candidates) >= self.fixed_candidates_target or (
+                self.requested_profile == "auto"
+                and len(self._fixed_candidates) >= min(3, self.fixed_candidates_target)
+            )
+            if enough:
                 return self._lock_fixed(frame, raw_detections, motion)
             due = (
                 self.last_calibration_frame is None
