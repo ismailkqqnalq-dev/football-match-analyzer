@@ -8,6 +8,7 @@ Girdi:
   --summary     main.py'nin yazdığı match_analytics_summary.json (passes.events, fps)
   --timeline    possession_timeline.csv (timestamp_sec, smoothed_team) [isteğe bağlı]
   --gt-events   Etiket CSV'si: time_sec, event_type (completed_pass | turnover), team
+                (utils/label_events.html ile tarayıcıda üretilir)
   --gt-possession  Etiket CSV'si: start_sec, end_sec, team (team boş = kimsede değil) [isteğe bağlı]
 
 Eşleştirme: aynı türdeki bir sistem olayı ile bir etiket, zaman farkı

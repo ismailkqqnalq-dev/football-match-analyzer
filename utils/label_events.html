@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Olay Etiketleme</title>
+<!--
+Faz V: Videoyu izlerken pas, top kaybı ve top sahipliğini tuşla işaretleme aracı.
+Tarayıcıda çift tıklayıp aç, videoyu seç, işaretle, "CSV indir" ile iki dosyayı al:
+  gt_events.csv      (time_sec, event_type, team)
+  gt_possession.csv  (start_sec, end_sec, team)
+utils/validate_events.py bu dosyaları doğrudan okur. Hiçbir şey internete gönderilmez.
+-->
+<style>
+  :root { --bg:#f6f6f4; --fg:#1d1d1b; --muted:#6b6b66; --line:#d9d9d4; --a:#2a6fdb; --b:#d9472b; --hl:#f2c94c; --card:#fff; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#161615; --fg:#ecece8; --muted:#9a9a93; --line:#33332f; --card:#1f1f1d; } }
+  :root[data-theme="dark"] { --bg:#161615; --fg:#ecece8; --muted:#9a9a93; --line:#33332f; --card:#1f1f1d; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
+  main { max-width:1280px; margin:0 auto; padding:16px; display:grid; gap:12px; grid-template-columns: 1fr 300px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  video { width:100%; background:#000; border-radius:6px; display:block; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:8px; }
+  .status { font-variant-numeric: tabular-nums; font-size:16px; font-weight:600; }
+  .pill { padding:2px 10px; border-radius:99px; border:1px solid var(--line); }
+  .pill.A { background:var(--a); color:#fff; border-color:var(--a); }
+  .pill.B { background:var(--b); color:#fff; border-color:var(--b); }
+  .flash { color:var(--hl); font-weight:700; min-width:140px; }
+  aside { background:var(--card); border:1px solid var(--line); border-radius:6px; padding:12px; }
+  kbd { border:1px solid var(--line); border-bottom-width:2px; border-radius:4px; padding:0 5px; font-size:12px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  td { padding:2px 4px; border-bottom:1px solid var(--line); font-variant-numeric: tabular-nums; }
+  #list { max-height:300px; overflow:auto; }
+  button, input { font:inherit; }
+  button { padding:4px 10px; border-radius:4px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  input[type=number] { width:80px; }
+  h2 { font-size:14px; margin:12px 0 6px; }
+  ul { margin:0; padding-left:18px; }
+</style>
+</head>
+<body>
+<main>
+  <section>
+    <div class="bar">
+      <input type="file" id="file" accept="video/*">
+      <label>Başlangıç sn <input type="number" id="start" value="0" min="0"></label>
+      <label>Bitiş sn <input type="number" id="end" value="300" min="1"></label>
+      <label>fps <input type="number" id="fps" value="50" min="1"></label>
+    </div>
+    <video id="v" style="margin-top:8px"></video>
+    <div class="bar">
+      <span class="status" id="time">0.00 s</span>
+      <span class="pill" id="team">top: -</span>
+      <span id="rate">x1</span>
+      <span class="flash" id="flash"></span>
+    </div>
+  </section>
+  <aside>
+    <strong>Tuşlar</strong>
+    <ul>
+      <li><kbd>Boşluk</kbd> oynat / duraklat</li>
+      <li><kbd>1</kbd> / <kbd>2</kbd> top Takım A / B'de</li>
+      <li><kbd>0</kbd> top kimsede değil (taç, aut, havada, oyun durdu)</li>
+      <li><kbd>P</kbd> tamamlanan pas (topun ayaktan çıktığı an)</li>
+      <li><kbd>T</kbd> top kaybı (kaybeden takımın topu ayağından çıkardığı an)</li>
+      <li><kbd>U</kbd> son işareti geri al</li>
+      <li><kbd>A</kbd> / <kbd>D</kbd> bir kare geri / ileri</li>
+      <li><kbd>J</kbd> / <kbd>L</kbd> 5 sn geri / ileri</li>
+      <li><kbd>[</kbd> / <kbd>]</kbd> yavaşlat / hızlandır</li>
+    </ul>
+    <p style="color:var(--muted)">Pas ve kaybın takımı, o anki sahiplik işaretinden alınır. Takım A/B harfleri sistemle aynı olmak zorunda değil.</p>
+    <div class="bar"><button id="dl">CSV indir</button><span id="count" style="color:var(--muted)"></span></div>
+    <h2>İşaretler</h2>
+    <div id="list"><table><tbody id="rows"></tbody></table></div>
+  </aside>
+</main>
+<script>
+const v = document.getElementById('v');
+const $ = id => document.getElementById(id);
+const KEY = 'label_events_marks';
+let marks = [];
+try { marks = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch (e) { marks = []; }
+const persist = () => { try { localStorage.setItem(KEY, JSON.stringify(marks)); } catch (e) {} };
+
+const startSec = () => +$('start').value || 0;
+const endSec = () => +$('end').value || v.duration || 0;
+const fps = () => +$('fps').value || 25;
+
+function teamAt(t) {
+  let team = null;
+  for (const m of [...marks].sort((a, b) => a.t - b.t)) {
+    if (m.t > t) break;
+    if (m.kind === 'possession') team = m.team;
+  }
+  return team;
+}
+const events = () => marks.filter(m => m.kind !== 'possession').sort((a, b) => a.t - b.t);
+function segments() {
+  const pos = marks.filter(m => m.kind === 'possession').sort((a, b) => a.t - b.t);
+  const out = [];
+  pos.forEach((m, i) => {
+    const e = i + 1 < pos.length ? pos[i + 1].t : endSec();
+    if (e > m.t) out.push([m.t, e, m.team]);
+  });
+  return out;
+}
+
+let flashTimer;
+function flash(msg) { $('flash').textContent = msg; clearTimeout(flashTimer); flashTimer = setTimeout(() => $('flash').textContent = '', 900); }
+const LABEL = { completed_pass: 'PAS', turnover: 'KAYIP', possession: 'sahip' };
+function render() {
+  const t = v.currentTime || 0;
+  $('time').textContent = t.toFixed(2) + ' s';
+  const tm = teamAt(t);
+  $('team').textContent = 'top: ' + (tm ? tm.replace('Team ', 'Takım ') : '-');
+  $('team').className = 'pill' + (tm === 'Team A' ? ' A' : tm === 'Team B' ? ' B' : '');
+  $('rate').textContent = 'x' + v.playbackRate;
+  $('count').textContent = events().length + ' olay';
+}
+function renderList() {
+  $('rows').innerHTML = [...marks].sort((a, b) => b.t - a.t).slice(0, 200).map(m =>
+    `<tr><td>${m.t.toFixed(2)}</td><td>${LABEL[m.kind]}</td><td>${m.team ? m.team.replace('Team ', '') : '-'}</td></tr>`).join('');
+  render();
+}
+v.addEventListener('timeupdate', () => { render(); if (v.currentTime >= endSec()) v.pause(); });
+v.addEventListener('loadedmetadata', () => { v.currentTime = startSec(); render(); });
+$('file').addEventListener('change', e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  if (marks.length && confirm('Önceki işaretler silinsin mi? (İptal: kalsın)')) { marks = []; persist(); }
+  v.src = URL.createObjectURL(f);
+  renderList();
+});
+
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT') return;
+  const k = e.key.toLowerCase();
+  const t = Math.round(v.currentTime * 1000) / 1000;
+  const step = s => { v.pause(); v.currentTime = Math.max(startSec(), Math.min(endSec(), v.currentTime + s)); };
+  if (k === ' ') { v.paused ? v.play() : v.pause(); }
+  else if (k === '1' || k === '2' || k === '0') {
+    const team = k === '1' ? 'Team A' : k === '2' ? 'Team B' : null;
+    marks.push({ t, kind: 'possession', team }); flash(team ? team.replace('Team ', 'Takım ') : 'kimsede değil');
+  }
+  else if (k === 'p' || k === 't') {
+    const kind = k === 'p' ? 'completed_pass' : 'turnover';
+    marks.push({ t, kind, team: teamAt(t) }); flash(LABEL[kind]);
+  }
+  else if (k === 'u') { const m = marks.pop(); if (m) flash('geri alındı: ' + LABEL[m.kind]); }
+  else if (k === 'a') step(-1 / fps());
+  else if (k === 'd') step(1 / fps());
+  else if (k === 'j') step(-5);
+  else if (k === 'l') step(5);
+  else if (k === '[') v.playbackRate = Math.max(0.125, v.playbackRate / 2);
+  else if (k === ']') v.playbackRate = Math.min(4, v.playbackRate * 2);
+  else return;
+  e.preventDefault();
+  persist();
+  renderList();
+});
+
+function download(name, rows) {
+  const blob = new Blob([rows.map(r => r.join(',')).join('\n') + '\n'], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name; a.click();
+}
+$('dl').addEventListener('click', () => {
+  download('gt_events.csv', [['time_sec', 'event_type', 'team'], ...events().map(m => [m.t, m.kind, m.team || ''])]);
+  setTimeout(() => download('gt_possession.csv', [['start_sec', 'end_sec', 'team'],
+    ...segments().map(([s, e, tm]) => [s, e, tm || ''])]), 300);
+});
+renderList();
+</script>
+</body>
+</html>
