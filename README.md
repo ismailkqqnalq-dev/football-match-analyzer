@@ -72,6 +72,26 @@ Otomatik kalibrasyonun gerçek videoda kaç metre şaştığını ölçmek için
    olmayan kare "tablo yok" sayılır. Hedef: TV yayınında ortanca hata < 1 m, sabit
    kamerada < 0,5 m ve etiketli karelerin en az %90'ında geçerli tablo.
 
+### Pas ve top sahipliği doğrulaması (Faz V)
+Sistemin bulduğu pasların ve top kayıplarının gerçeğe ne kadar uyduğunu ölçmek için
+5-10 dakikalık bir klibi elle etiketleyip karşılaştırın:
+
+1. Pipeline'ı analizle birlikte çalıştırın; export dizinine `match_analytics_summary.json`
+   (pas/kayıp olayları) ve `possession_timeline.csv` (kare bazında sahiplik) yazılır.
+2. `utils/label_events.html` dosyasını tarayıcıda açın, aynı videoyu seçin ve izlerken
+   işaretleyin: `1`/`2` top Takım A/B'de, `0` top kimsede değil, `P` tamamlanan pas
+   (topun ayaktan çıktığı an), `T` top kaybı, `U` geri al, `[`/`]` yavaşlat/hızlandır.
+   Bitince "CSV indir" ile `gt_events.csv` ve `gt_possession.csv` alınır. Video ve
+   işaretler bilgisayardan çıkmaz.
+3. Karşılaştırın:
+   ```powershell
+   python utils/validate_events.py --summary data/exports/klip/match_analytics_summary.json --timeline data/exports/klip/possession_timeline.csv --gt-events gt_events.csv --gt-possession gt_possession.csv --start-sec 0 --end-sec 300
+   ```
+   Bir olay, aynı türdeki etiketle 1 sn içindeyse doğru sayılır (`--tolerance` ile
+   değişir). Çıktı; pas ve kayıp için kesinlik (sistemin dediklerinin kaçı doğru),
+   duyarlılık (gerçek olayların kaçı yakalandı) ve F1, ayrıca saniye bazında sahiplik
+   uyumunu verir. Etiketlerdeki Takım A/B sistemle ters düştüyse otomatik çevrilir.
+
 ## Çalıştırma
 ```bash
 python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4
