@@ -383,3 +383,20 @@ def test_blend_step_is_limited_per_second_independent_of_fps():
         assert h.blend_step_m <= config.PITCH_CAL_BLEND_MAX_STEP_M
     # Saniyelik sınır, duran oyuncu kabul ölçütünün (1 km/sa) altında
     assert config.PITCH_CAL_BLEND_MAX_SPEED_MPS * 3.6 < 1.0
+
+
+def test_calibration_exception_does_not_stop_the_run():
+    """Model/oturtma bir karede hata fırlatırsa akış durmamalı; önceki tablo korunmalı."""
+    cal = NoisyKeypointCalibrator(sigma_px=0.0, seed=3)
+    orig = cal.calibrate_frame
+
+    def flaky(frame):
+        if cal.calls == 1:  # ilk çağrı başarılı, sonrakiler hata fırlatır
+            raise np.linalg.LinAlgError("Singular matrix")
+        return orig(frame)
+
+    cal.calibrate_frame = flaky
+    hybrid, pt = _make_hybrid(cal, FakeFlow(), refresh=5)
+    positions, infos = _run(hybrid, pt, 30)
+    assert hybrid.stats["model_errors"] >= 1
+    assert np.isfinite(positions).all()

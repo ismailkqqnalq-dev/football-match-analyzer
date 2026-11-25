@@ -1216,7 +1216,15 @@ class HybridPitchCalibrator:
     # ----------------------------------------------------------------
     def _calibrate(self, frame: np.ndarray) -> Any:
         self.stats["model_calls"] += 1
-        res = self.calibrator.calibrate_frame(frame)
+        try:
+            res = self.calibrator.calibrate_frame(frame)
+        except Exception as exc:  # noqa: BLE001
+            # Tek karedeki beklenmedik bir hata (ör. numpy sürümüne bağlı tekil matris) uzun bir maç
+            # analizini durdurmamalı: kare kalibrasyonsuz sayılır, önceki tablo korunur.
+            self.stats["model_errors"] = self.stats.get("model_errors", 0) + 1
+            if self.stats["model_errors"] <= 3:
+                print(f"[Kalibrasyon] UYARI: kalibrasyon hatası, kare atlandı: {type(exc).__name__}: {exc}")
+            res = CalibrationResult(success=False, reason="calibration_error")
         self.frame_info["num_keypoints"] = getattr(res, "num_keypoints", None)
         self.frame_info["num_inliers"] = getattr(res, "num_inliers", None)
         self.frame_info["reproj_error_m"] = getattr(res, "reproj_error_m", None)
