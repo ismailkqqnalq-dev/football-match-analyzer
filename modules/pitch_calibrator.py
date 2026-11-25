@@ -956,6 +956,7 @@ class HybridPitchCalibrator:
         self.hard_m = float(getattr(config, "PITCH_CAL_HARD_M", 3.0))
         self.confirm_refreshes = max(0, int(getattr(config, "PITCH_CAL_CONFIRM_REFRESHES", 2)))
         self.blend_max_step_m = max(1e-3, float(getattr(config, "PITCH_CAL_BLEND_MAX_STEP_M", 0.05)))
+        self.blend_max_speed_mps = float(getattr(config, "PITCH_CAL_BLEND_MAX_SPEED_MPS", 0.25))
 
         requested = str(profile if profile is not None else getattr(config, "FOOTAGE_PROFILE", "auto")).lower()
         if requested not in _VALID_PROFILES:
@@ -1015,6 +1016,14 @@ class HybridPitchCalibrator:
     def set_fps(self, fps: Optional[float]) -> None:
         if fps and fps > 0:
             self.fps = float(fps)
+
+    @property
+    def blend_step_m(self) -> float:
+        """Yumuşak geçişte kare başına en fazla kayma: saniyelik sınırın fps'e bölümü, kare sınırıyla kırpılmış."""
+        step = self.blend_max_step_m
+        if self.blend_max_speed_mps > 0:
+            step = min(step, self.blend_max_speed_mps / self.fps)
+        return max(1e-4, step)
 
     def _new_frame_info(self) -> Dict[str, Any]:
         return {
@@ -1269,7 +1278,7 @@ class HybridPitchCalibrator:
         self._blend_p1 = p1
         self._blend_step = 0
         self._blend_total = max(
-            self.smooth_frames, int(math.ceil(float(disagreement) / self.blend_max_step_m))
+            self.smooth_frames, int(math.ceil(float(disagreement) / self.blend_step_m))
         )
         self.calibration_count += 1
         self.last_calibration_reason = reason

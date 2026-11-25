@@ -244,7 +244,7 @@ def test_a2_3_soft_blend_uses_reference_points_and_valid_matrices():
     d = hybrid.frame_info["disagreement_m"]
     assert config.PITCH_CAL_DEADBAND_M < d <= config.PITCH_CAL_SOFT_M
     assert hybrid.frame_info["source"] == "blend"
-    assert hybrid._blend_total == max(5, math.ceil(d / config.PITCH_CAL_BLEND_MAX_STEP_M))
+    assert hybrid._blend_total == max(5, math.ceil(d / hybrid.blend_step_m))
 
     quad = hybrid._blend_quad_img
     p0, p1 = hybrid._blend_p0.copy(), hybrid._blend_p1.copy()
@@ -258,7 +258,7 @@ def test_a2_3_soft_blend_uses_reference_points_and_valid_matrices():
         proj = HybridPitchCalibrator._project(h, quad)
         assert np.allclose(proj, (1 - a) * p0 + a * p1, atol=1e-3)
 
-    # Kare başına kayma PITCH_CAL_BLEND_MAX_STEP_M'yi aşmamalı
+    # Kare başına kayma blend_step_m (saniyelik sınır / fps) değerini aşmamalı
     prev = None
     max_step = 0.0
     for f in range(16, 16 + hybrid._blend_total + 2):
@@ -267,7 +267,7 @@ def test_a2_3_soft_blend_uses_reference_points_and_valid_matrices():
         if prev is not None:
             max_step = max(max_step, float(np.linalg.norm(p - prev)))
         prev = p
-    assert max_step <= config.PITCH_CAL_BLEND_MAX_STEP_M * 1.5
+    assert max_step <= hybrid.blend_step_m * 1.5
     assert hybrid._blend_total == 0
 
 
@@ -370,3 +370,16 @@ def test_a2_3_ball_kinematic_filter_marks_reset_as_discontinuity():
     assert list(kin["discontinuity_starts"]) == [4]
     assert list(kin["discontinuity_ends"]) == [5]
     assert bool(kin["valid_ctrl_mask"][4]) and bool(kin["valid_ctrl_mask"][5])
+
+
+def test_blend_step_is_limited_per_second_independent_of_fps():
+    """Yumuşak geçişin kayma hızı saniye cinsinden sınırlı olmalı (duran oyuncuya sahte hız vermesin)."""
+    h = HybridPitchCalibrator.__new__(HybridPitchCalibrator)
+    h.blend_max_step_m = config.PITCH_CAL_BLEND_MAX_STEP_M
+    h.blend_max_speed_mps = config.PITCH_CAL_BLEND_MAX_SPEED_MPS
+    for fps in (25.0, 50.0, 60.0):
+        h.fps = fps
+        assert h.blend_step_m * fps <= config.PITCH_CAL_BLEND_MAX_SPEED_MPS + 1e-9
+        assert h.blend_step_m <= config.PITCH_CAL_BLEND_MAX_STEP_M
+    # Saniyelik sınır, duran oyuncu kabul ölçütünün (1 km/sa) altında
+    assert config.PITCH_CAL_BLEND_MAX_SPEED_MPS * 3.6 < 1.0
