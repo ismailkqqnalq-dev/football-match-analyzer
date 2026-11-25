@@ -138,6 +138,11 @@ def evaluate_possession(timeline: pd.DataFrame, gt_pos: pd.DataFrame) -> Dict[st
     }
 
 
+def swap_teams(teams: pd.Series) -> pd.Series:
+    """Team A <-> Team B yer değiştirir; diğer değerlere dokunmaz."""
+    return teams.map(lambda t: {"Team A": "Team B", "Team B": "Team A"}.get(t, t))
+
+
 def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
     ap = argparse.ArgumentParser(description="Faz V olay ve sahiplik doğrulaması")
     ap.add_argument("--summary", required=True)
@@ -154,10 +159,27 @@ def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
         summary = json.load(f)
     system = load_system_events(summary)
     gt = pd.read_csv(args.gt_events)
+    gt_pos = pd.read_csv(args.gt_possession) if args.gt_possession else None
+    timeline = pd.read_csv(args.timeline) if args.timeline else None
     tr = (args.start_sec, args.end_sec) if args.start_sec is not None and args.end_sec is not None else None
-    res: Dict[str, Any] = {"events": evaluate_events(system, gt, args.tolerance, tr)}
-    if args.timeline and args.gt_possession:
-        res["possession"] = evaluate_possession(pd.read_csv(args.timeline), pd.read_csv(args.gt_possession))
+
+    # Etiketçinin "Takım A"sı sistemin "Team A"sı olmayabilir: iki eşlemeyi de dene, uyanı seç.
+    def run(swap: bool) -> Dict[str, Any]:
+        g = gt.assign(team=swap_teams(gt.team)) if swap and "team" in gt else gt
+        r: Dict[str, Any] = {"events": evaluate_events(system, g, args.tolerance, tr)}
+        if timeline is not None and gt_pos is not None:
+            p = gt_pos.assign(team=swap_teams(gt_pos.team)) if swap else gt_pos
+            r["possession"] = evaluate_possession(timeline, p)
+        return r
+
+    def score(r: Dict[str, Any]) -> float:
+        if "possession" in r and r["possession"]["agreement"] is not None:
+            return r["possession"]["agreement"]
+        return r["events"]["overall"]["team_correct"]
+
+    direct, swapped = run(False), run(True)
+    res = swapped if score(swapped) > score(direct) else direct
+    res["team_mapping"] = "swapped" if res is swapped else "direct"
 
     print(json.dumps(res, indent=2, ensure_ascii=False))
     if args.json_out:

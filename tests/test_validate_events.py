@@ -93,6 +93,22 @@ def test_evaluate_possession_agreement_and_coverage():
     assert res["agreement"] == 0.5
 
 
+def test_main_swaps_team_names_when_labeller_used_opposite_letters(tmp_path):
+    summary = tmp_path / "s.json"
+    summary.write_text(json.dumps(_summary([_ev("completed_pass", 100, "Team A")])), encoding="utf-8")
+    gt = tmp_path / "gt.csv"
+    pd.DataFrame({"time_sec": [2.0], "event_type": ["completed_pass"], "team": ["Team B"]}).to_csv(gt, index=False)
+    timeline = tmp_path / "tl.csv"
+    pd.DataFrame({"timestamp_sec": [0.5, 1.5], "smoothed_team": ["Team A", "Team A"]}).to_csv(timeline, index=False)
+    gt_pos = tmp_path / "pos.csv"
+    pd.DataFrame({"start_sec": [0.0], "end_sec": [2.0], "team": ["Team B"]}).to_csv(gt_pos, index=False)
+    res = main(["--summary", str(summary), "--gt-events", str(gt), "--timeline", str(timeline),
+                "--gt-possession", str(gt_pos)])
+    assert res["team_mapping"] == "swapped"
+    assert res["possession"]["agreement"] == 1.0
+    assert res["events"]["overall"]["team_correct"] == 1
+
+
 def test_main_writes_json(tmp_path):
     summary = tmp_path / "s.json"
     summary.write_text(json.dumps(_summary([_ev("completed_pass", 100)])), encoding="utf-8")
