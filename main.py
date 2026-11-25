@@ -20,6 +20,7 @@ Projenin giriş noktası (entry point).
 
 Kullanım:
     python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4
+    python main.py --input "https://ornek-site.com/mac-ozeti" --no-video
 """
 
 import argparse
@@ -46,6 +47,7 @@ from modules.pitch_calibrator import (
 from modules.data_exporter import DataExporter
 from modules.match_analytics import MatchAnalyzer
 from modules.ml_analyzer import MLAnalyzer
+from modules.url_input import VideoUrlError, resolve_input
 
 
 def parse_args():
@@ -53,7 +55,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Futbol Maç Analiz ve Oyuncu Takip Sistemi")
     parser.add_argument(
         "--input", type=str, default=config.DEFAULT_INPUT_VIDEO,
-        help="İşlenecek giriş videosunun yolu (.mp4)"
+        help="İşlenecek giriş videosunun yolu (.mp4) veya video/maç linki (http/https: video sitesi, gömülü videolu sayfa, .mp4, .m3u8 ...)"
     )
     parser.add_argument(
         "--output", type=str, default=config.DEFAULT_OUTPUT_VIDEO,
@@ -124,6 +126,12 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    try:
+        args.input = resolve_input(args.input)
+    except VideoUrlError as exc:
+        print(f"[HATA] {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if not args.input or not os.path.isfile(args.input):
         print(f"[HATA] Giriş video dosyası bulunamadı: {args.input}", file=sys.stderr)

@@ -77,6 +77,24 @@ Otomatik kalibrasyonun gerçek videoda kaç metre şaştığını ölçmek için
 python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4
 ```
 
+### Video yerine video/maç linki vermek
+`--input` parametresine dosya yolu yerine bir `http(s)` video/maç linki verilebilir:
+```bash
+python main.py --input "https://ornek-site.com/mac-ozeti" --no-video --max-frames 200
+```
+Desteklenen link türleri:
+- Video paylaşım siteleri: `https://www.youtube.com/watch?v=...`
+- İçinde gömülü video olan sayfalar (haber, kulüp, maç siteleri): `https://ornek-kulup.com/haberler/mac-ozeti`
+- Doğrudan video dosyaları: `https://cdn.ornek.com/mac.mp4` (`.webm`, `.mkv` de olur)
+- HLS / DASH akışları: `https://yayin.ornek.com/mac/index.m3u8`, `.../manifest.mpd`
+
+Sayfada birden çok video varsa ilki alınır. Sayfada indirilebilir video yoksa veya video korumalıysa (DRM, ör. ücretli yayın platformları) anlaşılır bir hata mesajı verilir.
+
+- Video `yt-dlp` ile en fazla 1080p (tercihen mp4/h264, sessiz) olarak geçici klasöre (`%TEMP%\fma_url_cache`) bir kez indirilir; aynı link tekrar verilirse önbellekteki dosya kullanılır. Yer açmak için bu klasör silinebilir.
+- `--max-frames` verilse bile videonun tamamı indirilir (90 dk 1080p birkaç GB olabilir).
+- Video siteleri sık değiştiği için indirme hata verirse önce `pip install -U yt-dlp` deneyin.
+- Yasal not: video sitelerinin ve platformların kullanım şartları video indirmeyi kısıtlayabilir. Bu özellik kişisel analiz içindir ve kullanım sorumluluğu kullanıcıya aittir; proje ticari bir ürüne dönüşürse ayrıca değerlendirilmelidir.
+
 ### 90 Dakikalık Maç ve Üretim CLI Seçenekleri
 - `--no-video`: Çıktı videosu oluşturmayı ve kare çizimini atlar; 90 dakikalık (~135.000 kare / ~2,7 milyon satır) maç analizlerinde disk ve işlem süresini önemli ölçüde azaltır.
 - `--no-minimap`: Çıktı videosu üzerine kuş bakışı 2D taktik minimap bindirmeyi kapatır.
