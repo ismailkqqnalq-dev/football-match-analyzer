@@ -8,6 +8,8 @@ kesmesi ve tekrar dönüşü telafili saha (metre) koordinatları → görsel ç
 90 dakikalık maç ölçeğinde akışlı (streaming) CSV/SQLite veri dışa aktarımı +
 taktik analiz ve makine öğrenmesi raporları.
 
+Ölçülen isabet, hedefler ve bilinen sınırlar için: [PROJE_DURUMU.md](PROJE_DURUMU.md).
+
 ## Kurulum
 ```bash
 pip install -r requirements.txt
