@@ -39,6 +39,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import config
 from modules.camera_motion_tracker import CameraMotionTracker
 from modules.perspective_transformer import PerspectiveTransformer
+from modules.pitch_line_refiner import PitchLineRefiner
 from modules.security import validate_model_weight_path
 
 _REAL_YOLO_MODULE = YOLO.__module__
@@ -55,6 +56,7 @@ class CalibrationResult:
     reproj_error_px: Optional[float] = None
     reproj_error_m: Optional[float] = None
     reason: str = ""
+    line_inlier_ratio: Optional[float] = None  # çizgiye oturtma uygulandıysa: çizgiye oturan örnek oranı
 
 
 class AutoPitchCalibrator:
@@ -76,6 +78,7 @@ class AutoPitchCalibrator:
         max_reproj_err_m: Optional[float] = None,
         keypoint_template_meters: Optional[Sequence[Tuple[float, float]]] = None,
         model: Optional[Any] = None,
+        line_refine: Optional[bool] = None,
     ):
         self.model_path = (
             os.fspath(model_path)
@@ -129,6 +132,9 @@ class AutoPitchCalibrator:
         self.keypoint_template_meters: Tuple[Tuple[float, float], ...] = tuple(
             (float(pt[0]), float(pt[1])) for pt in template
         )
+
+        use_refine = bool(line_refine if line_refine is not None else getattr(config, "PITCH_LINE_REFINE_ENABLED", True))
+        self.line_refiner: Optional[PitchLineRefiner] = PitchLineRefiner() if use_refine else None
 
         self.model: Optional[Any] = None
         self.is_available: bool = False
@@ -806,7 +812,62 @@ class AutoPitchCalibrator:
             return CalibrationResult(success=False, reason="no_valid_keypoints")
 
         pixel_pts, meter_pts, _indices = detected
-        return self.estimate_homography_from_keypoints(pixel_pts, meter_pts, frame.shape)
+        res = self.estimate_homography_from_keypoints(pixel_pts, meter_pts, frame.shape)
+        if self.line_refiner is None:
+            return res
+        return self._refine_with_lines(frame, res, pixel_pts, meter_pts)
+
+    def _refine_with_lines(
+        self,
+        frame: np.ndarray,
+        res: CalibrationResult,
+        pixel_pts: np.ndarray,
+        meter_pts: np.ndarray,
+    ) -> CalibrationResult:
+        """
+        Model tablosunu saha çizgilerine oturtur. Başlangıç adayları: sıkı RANSAC sonucu
+        (başarılıysa), gevşek RANSAC ve tüm noktalarla en küçük kareler — model noktaları
+        çizgilerden 20-50 px sapabildiği için sıkı RANSAC bazen yalnızca küçük bir kümeyi tutar.
+        Oturtulan tablo, aynı geometrik doğrulamalardan geçmezse model sonucu döner.
+        """
+        cands = [res.homography_matrix] if res.success and res.homography_matrix is not None else []
+        m_arr = np.asarray(meter_pts, dtype=np.float64)
+        px_arr = np.asarray(pixel_pts, dtype=np.float64)
+        if len(m_arr) >= 4:
+            loose_px = float(getattr(config, "PITCH_LINE_REFINE_LOOSE_RANSAC_PX", 25.0))
+            for method, thr in ((cv2.RANSAC, loose_px), (0, 0.0)):
+                try:
+                    G, _ = cv2.findHomography(m_arr, px_arr, method, thr)
+                    if G is not None and np.isfinite(G).all() and abs(np.linalg.det(G)) > 1e-12:
+                        cands.append(np.linalg.inv(G))
+                except (cv2.error, np.linalg.LinAlgError):
+                    pass
+        if not cands:
+            return res
+        refined = self.line_refiner.refine(frame, cands)
+        if not refined.success:
+            # Çizgiler ölçülebildi ama ne model tablosu ne oturtulmuş tablo çizgilere uyuyor:
+            # model sahayı yanlış yorumlamış (ör. yakın çekimde ceza sahasını yanlış uca koymak).
+            # Yanlış tablo yerine kalibrasyonsuz dön; hibrit yönetici önceki tabloyu korur.
+            measured = refined.reason in ("low_inlier_ratio", "shift_too_large", "no_improvement")
+            best_ratio = max(refined.inlier_ratio_before, refined.inlier_ratio_after)
+            if res.success and measured and best_ratio < self.line_refiner.min_inlier_ratio:
+                return CalibrationResult(
+                    success=False,
+                    num_keypoints=res.num_keypoints,
+                    num_inliers=res.num_inliers,
+                    line_inlier_ratio=round(best_ratio, 4),
+                    reason="line_check_failed",
+                )
+            return res
+        checked = self.estimate_homography_from_keypoints(refined.pixel_pts, refined.meter_pts, frame.shape)
+        if not checked.success:
+            return res
+        checked.num_keypoints = int(len(px_arr))
+        checked.num_inliers = res.num_inliers
+        checked.line_inlier_ratio = refined.inlier_ratio_after
+        checked.reason = "ok_line_refined"
+        return checked
 
 
 
