@@ -360,7 +360,11 @@ class PitchLineRefiner:
         if coarse_only:
             cap0 = prep.caps[0]
             score = float(np.mean(sample_maps(prep.blurred[0], _project(G1, S), bins_of(G1), cap0))) / cap0
-            H1c = np.linalg.inv(np.linalg.inv(Sc) @ G1)
+            try:
+                H1c = np.linalg.inv(np.linalg.inv(Sc) @ G1)
+            except np.linalg.LinAlgError:  # numpy 1.x NaN/tekil matriste hata fırlatır (2.x NaN döndürür)
+                return LineRefineResult(False, inlier_ratio_before=round(before, 4), num_samples=n_vis,
+                                        reason="singular_output")
             return LineRefineResult(bool(np.isfinite(H1c).all()), homography_matrix=H1c,
                                     inlier_ratio_before=round(before, 4), num_samples=n_vis,
                                     coarse_score=score, reason="coarse")
