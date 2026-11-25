@@ -160,6 +160,17 @@ def test_calibrator_rejects_model_table_when_refine_fails_unexpectedly(pitch_img
     assert res.reason == "line_check_failed"
 
 
+def test_calibrator_rejects_model_table_when_rejected_refine_fit_well(pitch_img):
+    """TV kare 1430: oturtma shift_too_large ile reddedildi (sonra 0,73) ama model tablosu çizgilerin
+    yalnızca %7'sine uyuyor; reddedilen oturtmanın oranı model tablosunu geçirmemeli."""
+    from modules.pitch_line_refiner import LineRefineResult
+    cal = _cal_with_stub_refine(LineRefineResult(False, inlier_ratio_before=0.071, inlier_ratio_after=0.732,
+                                                 reason="shift_too_large"))
+    res = cal.calibrate_frame(pitch_img)
+    assert not res.success
+    assert res.reason == "line_check_failed"
+
+
 def test_calibrator_keeps_model_table_when_no_lines_visible(pitch_img):
     """Görüntüde çizgi hiç yoksa uyum yargılanamaz; model tablosu korunur."""
     from modules.pitch_line_refiner import LineRefineResult

@@ -867,14 +867,16 @@ class AutoPitchCalibrator:
             # Yanlış tablo yerine kalibrasyonsuz dön; hibrit yönetici önceki tabloyu korur.
             # Görüntüde çizgi yoksa yargılanamaz; diğer her başarısızlıkta (tablo çizgileri görüntüye
             # hiç düşürmüyorsa da) model tablosunun kendi çizgi uyumu eşiği geçmelidir.
+            # Reddedilen oturtmanın "sonra" oranı model tablosunu temsil etmez (ör. shift_too_large'da
+            # oturtma çizgilere uymuş olabilir ama model tablosu uymuyor): yalnızca "önce" oranına bak.
             measured = refined.reason not in ("no_line_pixels", "no_candidates")
-            best_ratio = max(refined.inlier_ratio_before, refined.inlier_ratio_after)
-            if res.success and measured and best_ratio < self.line_refiner.min_inlier_ratio:
+            before_ratio = refined.inlier_ratio_before
+            if res.success and measured and before_ratio < self.line_refiner.min_inlier_ratio:
                 return CalibrationResult(
                     success=False,
                     num_keypoints=res.num_keypoints,
                     num_inliers=res.num_inliers,
-                    line_inlier_ratio=round(best_ratio, 4),
+                    line_inlier_ratio=round(before_ratio, 4),
                     reason="line_check_failed",
                 )
             return res
