@@ -180,3 +180,22 @@ def test_calibrator_rejects_model_table_when_refined_table_fails_checks(pitch_im
     res = _cal_with_stub_refine(bad).calibrate_frame(pitch_img)
     assert not res.success
     assert res.reason == "line_check_failed"
+
+
+def test_refined_table_verification_is_fast_with_many_line_samples(pitch_img):
+    """Oturtucu yüzlerce örnek döndürse de doğrulama hızlı bitmeli.
+
+    Veri: gerçek bir TV karesinde (test_match) oturtucunun döndürdüğü 716 çizgi örneği. Hepsi doğrulamaya
+    verildiğinde genel konum araması (en kötü durumda N^4) dakikalarca sürüyor ve akış takılıyordu.
+    """
+    import os
+    import time
+    from modules.pitch_line_refiner import LineRefineResult
+    d = np.load(os.path.join(os.path.dirname(__file__), "fixtures", "line_refine_verify_hang.npz"))
+    many = LineRefineResult(True, homography_matrix=H_TRUE, inlier_ratio_before=0.1, inlier_ratio_after=0.9,
+                            meter_pts=d["m"], pixel_pts=d["px"])
+    cal = _cal_with_stub_refine(many)
+    t0 = time.perf_counter()
+    res = cal.calibrate_frame(pitch_img)
+    assert time.perf_counter() - t0 < 10.0
+    assert res.reason in ("line_check_failed", "ok", "ok_line_refined")

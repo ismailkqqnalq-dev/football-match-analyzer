@@ -878,7 +878,14 @@ class AutoPitchCalibrator:
                     reason="line_check_failed",
                 )
             return res
-        checked = self.estimate_homography_from_keypoints(refined.pixel_pts, refined.meter_pts, frame.shape)
+        # Oturtucu yüzlerce çizgi örneği döndürür; genel konum kontrolü en kötü durumda N^4 olduğu için
+        # (yalnızca birkaç düz çizgi görünen karede) doğrulamaya çizgilere eşit yayılmış bir alt küme verilir.
+        r_px, r_m = refined.pixel_pts, refined.meter_pts
+        max_pts = int(getattr(config, "PITCH_LINE_REFINE_VERIFY_MAX_POINTS", 40))
+        if r_px is not None and len(r_px) > max_pts:
+            sel = np.unique(np.linspace(0, len(r_px) - 1, max_pts).round().astype(int))
+            r_px, r_m = r_px[sel], r_m[sel]
+        checked = self.estimate_homography_from_keypoints(r_px, r_m, frame.shape)
         if not checked.success:
             # Oturtulan tablo doğrulanamadı; model tablosu ancak kendisi çizgilere uyuyorsa kullanılabilir
             if res.success and refined.inlier_ratio_before < self.line_refiner.min_inlier_ratio:
