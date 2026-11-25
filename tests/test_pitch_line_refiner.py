@@ -130,3 +130,53 @@ def test_calibrator_rejects_table_that_does_not_fit_lines():
     res = cal.calibrate_frame(img)
     assert not res.success
     assert res.reason == "line_check_failed"
+
+
+def test_calibrator_does_not_refine_from_collinear_keypoints(pitch_img):
+    """Doğrusal noktalardan tablo kurulamaz; oturtucu bunlardan 'çizgiye uyan' bir tablo üretmemeli."""
+    meters = np.array([[52.5, 0.0], [52.5, 24.85], [52.5, 43.15], [52.5, 68.0]])
+    px = _project(G_TRUE, meters)
+    cal = AutoPitchCalibrator(model=object(), line_refine=True)
+    cal.detect_keypoints = lambda frame: (px, meters, np.arange(len(meters)))
+    res = cal.calibrate_frame(pitch_img)
+    assert not res.success
+    assert res.reason == "collinear_keypoints"
+
+
+def _cal_with_stub_refine(refine_result):
+    from modules.pitch_line_refiner import LineRefineResult  # noqa: F401  (tip açıklığı için)
+    cal = AutoPitchCalibrator(model=object(), line_refine=True)
+    cal.detect_keypoints = lambda frame: _noisy_keypoints()
+    cal.line_refiner.refine = lambda frame, cands, prep=None: refine_result
+    return cal
+
+
+def test_calibrator_rejects_model_table_when_refine_fails_unexpectedly(pitch_img):
+    """Oturtma 'görünür örnek yok' gibi bir sebeple başarısız olunca model tablosu sınanmadan kabul edilmemeli."""
+    from modules.pitch_line_refiner import LineRefineResult
+    cal = _cal_with_stub_refine(LineRefineResult(False, inlier_ratio_before=0.05, reason="too_few_visible_samples"))
+    res = cal.calibrate_frame(pitch_img)
+    assert not res.success
+    assert res.reason == "line_check_failed"
+
+
+def test_calibrator_keeps_model_table_when_no_lines_visible(pitch_img):
+    """Görüntüde çizgi hiç yoksa uyum yargılanamaz; model tablosu korunur."""
+    from modules.pitch_line_refiner import LineRefineResult
+    cal = _cal_with_stub_refine(LineRefineResult(False, reason="no_line_pixels"))
+    res = cal.calibrate_frame(pitch_img)
+    assert res.success
+    assert res.reason == "ok"
+
+
+def test_calibrator_rejects_model_table_when_refined_table_fails_checks(pitch_img):
+    """Oturtulan tablo doğrulamadan geçmezse, çizgilere uymayan model tablosuna geri dönülmemeli."""
+    from modules.pitch_line_refiner import LineRefineResult
+    bad = LineRefineResult(
+        True, homography_matrix=np.eye(3), inlier_ratio_before=0.1, inlier_ratio_after=0.9,
+        meter_pts=np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]]),
+        pixel_pts=np.array([[0.0, 0.0], [10.0, 0.0], [20.0, 0.0], [30.0, 0.0]]),  # doğrusal: doğrulamadan geçmez
+    )
+    res = _cal_with_stub_refine(bad).calibrate_frame(pitch_img)
+    assert not res.success
+    assert res.reason == "line_check_failed"

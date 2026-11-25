@@ -59,6 +59,18 @@ class CalibrationResult:
     line_inlier_ratio: Optional[float] = None  # çizgiye oturtma uygulandıysa: çizgiye oturan örnek oranı
 
 
+# Nokta kümesinin kendisinin tablo kurmaya elverişsiz olduğu başarısızlıklar (çizgiye oturtma denenmez)
+_DEGENERATE_KEYPOINT_REASONS = frozenset({
+    "invalid_keypoint_arrays",
+    "invalid_keypoint_shapes",
+    "non_finite_keypoints",
+    "insufficient_keypoints",
+    "duplicate_meter_keypoints",
+    "duplicate_pixel_keypoints",
+    "collinear_keypoints",
+})
+
+
 class AutoPitchCalibrator:
     """
     YOLO-Pose tabanlı 32-keypoint otomatik saha kalibrasyon sınıfı.
@@ -830,6 +842,10 @@ class AutoPitchCalibrator:
         çizgilerden 20-50 px sapabildiği için sıkı RANSAC bazen yalnızca küçük bir kümeyi tutar.
         Oturtulan tablo, aynı geometrik doğrulamalardan geçmezse model sonucu döner.
         """
+        # Nokta kümesi kendi başına bozuksa (doğrusal, yetersiz, tekrarlı) ondan aday üretme:
+        # oturtucu böyle bir kümeden çizgilere uyan ama sahanın yanlış yerine düşen tablo bulabiliyor.
+        if not res.success and res.reason in _DEGENERATE_KEYPOINT_REASONS:
+            return res
         cands = [res.homography_matrix] if res.success and res.homography_matrix is not None else []
         m_arr = np.asarray(meter_pts, dtype=np.float64)
         px_arr = np.asarray(pixel_pts, dtype=np.float64)
@@ -849,7 +865,9 @@ class AutoPitchCalibrator:
             # Çizgiler ölçülebildi ama ne model tablosu ne oturtulmuş tablo çizgilere uyuyor:
             # model sahayı yanlış yorumlamış (ör. yakın çekimde ceza sahasını yanlış uca koymak).
             # Yanlış tablo yerine kalibrasyonsuz dön; hibrit yönetici önceki tabloyu korur.
-            measured = refined.reason in ("low_inlier_ratio", "shift_too_large", "no_improvement")
+            # Görüntüde çizgi yoksa yargılanamaz; diğer her başarısızlıkta (tablo çizgileri görüntüye
+            # hiç düşürmüyorsa da) model tablosunun kendi çizgi uyumu eşiği geçmelidir.
+            measured = refined.reason not in ("no_line_pixels", "no_candidates")
             best_ratio = max(refined.inlier_ratio_before, refined.inlier_ratio_after)
             if res.success and measured and best_ratio < self.line_refiner.min_inlier_ratio:
                 return CalibrationResult(
@@ -862,6 +880,15 @@ class AutoPitchCalibrator:
             return res
         checked = self.estimate_homography_from_keypoints(refined.pixel_pts, refined.meter_pts, frame.shape)
         if not checked.success:
+            # Oturtulan tablo doğrulanamadı; model tablosu ancak kendisi çizgilere uyuyorsa kullanılabilir
+            if res.success and refined.inlier_ratio_before < self.line_refiner.min_inlier_ratio:
+                return CalibrationResult(
+                    success=False,
+                    num_keypoints=res.num_keypoints,
+                    num_inliers=res.num_inliers,
+                    line_inlier_ratio=round(refined.inlier_ratio_before, 4),
+                    reason="line_check_failed",
+                )
             return res
         checked.num_keypoints = int(len(px_arr))
         checked.num_inliers = res.num_inliers
