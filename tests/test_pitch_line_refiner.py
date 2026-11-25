@@ -160,6 +160,17 @@ def test_calibrator_rejects_model_table_when_refine_fails_unexpectedly(pitch_img
     assert res.reason == "line_check_failed"
 
 
+def test_calibrator_rejects_model_table_when_rejected_refine_fit_well(pitch_img):
+    """TV kare 1430: oturtma shift_too_large ile reddedildi (sonra 0,73) ama model tablosu çizgilerin
+    yalnızca %7'sine uyuyor; reddedilen oturtmanın oranı model tablosunu geçirmemeli."""
+    from modules.pitch_line_refiner import LineRefineResult
+    cal = _cal_with_stub_refine(LineRefineResult(False, inlier_ratio_before=0.071, inlier_ratio_after=0.732,
+                                                 reason="shift_too_large"))
+    res = cal.calibrate_frame(pitch_img)
+    assert not res.success
+    assert res.reason == "line_check_failed"
+
+
 def test_calibrator_keeps_model_table_when_no_lines_visible(pitch_img):
     """Görüntüde çizgi hiç yoksa uyum yargılanamaz; model tablosu korunur."""
     from modules.pitch_line_refiner import LineRefineResult
@@ -180,3 +191,45 @@ def test_calibrator_rejects_model_table_when_refined_table_fails_checks(pitch_im
     res = _cal_with_stub_refine(bad).calibrate_frame(pitch_img)
     assert not res.success
     assert res.reason == "line_check_failed"
+
+
+def test_refined_table_verification_is_fast_with_many_line_samples(pitch_img):
+    """Oturtucu yüzlerce örnek döndürse de doğrulama hızlı bitmeli.
+
+    Veri: gerçek bir TV karesinde (test_match) oturtucunun döndürdüğü 716 çizgi örneği. Hepsi doğrulamaya
+    verildiğinde genel konum araması (en kötü durumda N^4) dakikalarca sürüyor ve akış takılıyordu.
+    """
+    import os
+    import time
+    from modules.pitch_line_refiner import LineRefineResult
+    d = np.load(os.path.join(os.path.dirname(__file__), "fixtures", "line_refine_verify_hang.npz"))
+    many = LineRefineResult(True, homography_matrix=H_TRUE, inlier_ratio_before=0.1, inlier_ratio_after=0.9,
+                            meter_pts=d["m"], pixel_pts=d["px"])
+    cal = _cal_with_stub_refine(many)
+    t0 = time.perf_counter()
+    res = cal.calibrate_frame(pitch_img)
+    assert time.perf_counter() - t0 < 10.0
+    assert res.reason in ("line_check_failed", "ok", "ok_line_refined")
+
+
+def test_refine_rejects_table_whose_inliers_collapse_onto_one_line(monkeypatch):
+    """Çizgiye oturan örnekler tek bir görüntü çizgisine yığılırsa tablo reddedilmeli.
+
+    Veri: gerçek bir TV karesi (ceza yayını orta yuvarlak sanan model). Oturtucu sahanın birçok çizgisini
+    uzak taç çizgisi / reklam panosu hattına yığıp yüksek oran buluyordu; tablo ~28 m yanlıştı.
+    Fikstür: 960x540 karenin çizgi maskesi (bit paketli) ve oturtucuya giden aday tablolar.
+    """
+    import os
+    d = np.load(os.path.join(os.path.dirname(__file__), "fixtures", "line_refine_collapse_tv4475.npz"))
+    mask = np.unpackbits(d["line_mask_bits"])[:540 * 960].reshape(540, 960)
+    img = np.full((540, 960, 3), (40, 140, 40), np.uint8)
+    img[mask > 0] = 255
+    cands = list(d["candidates"])
+
+    res = PitchLineRefiner().refine(img, cands)
+    assert not res.success
+    assert res.reason == "inliers_collinear"
+    assert res.inlier_ratio_after >= PitchLineRefiner().min_inlier_ratio  # oran tek başına yakalamıyor
+
+    monkeypatch.setattr(config, "PITCH_LINE_REFINE_MIN_INLIER_SPREAD", 0.0)
+    assert PitchLineRefiner().refine(img, cands).success  # reddeden yalnızca yayılım koruması

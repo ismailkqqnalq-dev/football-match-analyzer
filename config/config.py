@@ -458,6 +458,8 @@ PITCH_LINE_REFINE_TOPHAT_THRESHOLD = 18      # çizgi maskesi parlaklık eşiği
 PITCH_LINE_REFINE_INLIER_PX = 3.0            # çizgiye "oturdu" sayılma mesafesi (1080p pikseli)
 PITCH_LINE_REFINE_MIN_INLIER_RATIO = 0.50    # kabul için çizgiye oturan örnek oranı alt sınırı (yanlış tablolar <= 0,47 ölçüldü)
 PITCH_LINE_REFINE_MAX_SHIFT_FRAC = 0.10      # örneklerin ortanca yer değiştirmesi <= kare köşegeni x bu oran
+PITCH_LINE_REFINE_MIN_INLIER_SPREAD = 0.03   # çizgiye oturan noktaların baskın doğrultuya dik yayılımı >= kare yüksekliği x bu oran (tek çizgiye yığılma: 0,005; iyi tablolar >= 0,078 ölçüldü)
+PITCH_LINE_REFINE_VERIFY_MAX_POINTS = 40      # oturtulan tabloyu doğrularken kullanılan en fazla çizgi örneği (hız)
 
 # A2-3: Model–optical flow uyuşmazlığına göre kademeli kabul (metre, 3x3 referans ızgarasının ortancası)
 PITCH_CAL_DEADBAND_M = 0.5          # bu farkın altında tablo değiştirilmez (gürültü titremesini önler)
@@ -465,6 +467,10 @@ PITCH_CAL_SOFT_M = 1.0              # bu farka kadar yumuşak geçişle hemen ka
 PITCH_CAL_HARD_M = 3.0              # bunun üstü doğrulandıktan sonra sert geçiş + calib_reset
 PITCH_CAL_CONFIRM_REFRESHES = 2     # SOFT üstü farkta kabul için gereken ek tutarlı yenileme sayısı
 PITCH_CAL_BLEND_MAX_STEP_M = 0.05   # yumuşak geçişte referans noktaların kare başına en fazla kayması
+# Yumuşak geçişin saniyedeki en fazla kayması (video hızından bağımsız). Geçiş sırasında bütün saha bu
+# hızla kayar ve duran oyuncu bu kadar hızlı koşuyormuş gibi görünür: A2 kabul ölçütü (< 1 km/sa ≈ 0.28 m/sn)
+# altında tutulur. Kare başına adım = min(PITCH_CAL_BLEND_MAX_STEP_M, bu değer / fps).
+PITCH_CAL_BLEND_MAX_SPEED_MPS = 0.25
 
 # A2-5: Görüntü profili ("auto" | "fixed" | "broadcast")
 FOOTAGE_PROFILE = "auto"

@@ -650,7 +650,7 @@ def test_r2_hybrid_calibrator_lifecycle_cut_opposite_half_and_smooth_blend():
     assert hybrid.last_calibration_frame == 7
 
     # Kare 12: ~4 px (DEADBAND < fark <= SOFT) -> hemen kabul, referans noktaları
-    # üzerinden yumuşak geçiş; süre farkın PITCH_CAL_BLEND_MAX_STEP_M'ye bölümü kadar
+    # üzerinden yumuşak geçiş; süre farkın kare başına geçiş adımına (blend_step_m) bölümü kadar
     for idx in range(8, 12):
         cal.current_idx = idx
         hybrid.process_frame(idx, f_left_2)
@@ -662,7 +662,7 @@ def test_r2_hybrid_calibrator_lifecycle_cut_opposite_half_and_smooth_blend():
     assert np.allclose(m12, np.eye(3))
     assert hybrid.last_calibration_reason == "periodic_refresh"
     assert hybrid.frame_info["source"] == "blend"
-    expected_total = max(4, int(np.ceil(d12 / config.PITCH_CAL_BLEND_MAX_STEP_M)))
+    expected_total = max(4, int(np.ceil(d12 / hybrid.blend_step_m)))
     assert hybrid._blend_total == expected_total
     assert hybrid._blend_step == 1
 

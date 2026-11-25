@@ -867,18 +867,27 @@ class AutoPitchCalibrator:
             # Yanlış tablo yerine kalibrasyonsuz dön; hibrit yönetici önceki tabloyu korur.
             # Görüntüde çizgi yoksa yargılanamaz; diğer her başarısızlıkta (tablo çizgileri görüntüye
             # hiç düşürmüyorsa da) model tablosunun kendi çizgi uyumu eşiği geçmelidir.
+            # Reddedilen oturtmanın "sonra" oranı model tablosunu temsil etmez (ör. shift_too_large'da
+            # oturtma çizgilere uymuş olabilir ama model tablosu uymuyor): yalnızca "önce" oranına bak.
             measured = refined.reason not in ("no_line_pixels", "no_candidates")
-            best_ratio = max(refined.inlier_ratio_before, refined.inlier_ratio_after)
-            if res.success and measured and best_ratio < self.line_refiner.min_inlier_ratio:
+            before_ratio = refined.inlier_ratio_before
+            if res.success and measured and before_ratio < self.line_refiner.min_inlier_ratio:
                 return CalibrationResult(
                     success=False,
                     num_keypoints=res.num_keypoints,
                     num_inliers=res.num_inliers,
-                    line_inlier_ratio=round(best_ratio, 4),
+                    line_inlier_ratio=round(before_ratio, 4),
                     reason="line_check_failed",
                 )
             return res
-        checked = self.estimate_homography_from_keypoints(refined.pixel_pts, refined.meter_pts, frame.shape)
+        # Oturtucu yüzlerce çizgi örneği döndürür; genel konum kontrolü en kötü durumda N^4 olduğu için
+        # (yalnızca birkaç düz çizgi görünen karede) doğrulamaya çizgilere eşit yayılmış bir alt küme verilir.
+        r_px, r_m = refined.pixel_pts, refined.meter_pts
+        max_pts = int(getattr(config, "PITCH_LINE_REFINE_VERIFY_MAX_POINTS", 40))
+        if r_px is not None and len(r_px) > max_pts:
+            sel = np.unique(np.linspace(0, len(r_px) - 1, max_pts).round().astype(int))
+            r_px, r_m = r_px[sel], r_m[sel]
+        checked = self.estimate_homography_from_keypoints(r_px, r_m, frame.shape)
         if not checked.success:
             # Oturtulan tablo doğrulanamadı; model tablosu ancak kendisi çizgilere uyuyorsa kullanılabilir
             if res.success and refined.inlier_ratio_before < self.line_refiner.min_inlier_ratio:
@@ -956,6 +965,7 @@ class HybridPitchCalibrator:
         self.hard_m = float(getattr(config, "PITCH_CAL_HARD_M", 3.0))
         self.confirm_refreshes = max(0, int(getattr(config, "PITCH_CAL_CONFIRM_REFRESHES", 2)))
         self.blend_max_step_m = max(1e-3, float(getattr(config, "PITCH_CAL_BLEND_MAX_STEP_M", 0.05)))
+        self.blend_max_speed_mps = float(getattr(config, "PITCH_CAL_BLEND_MAX_SPEED_MPS", 0.25))
 
         requested = str(profile if profile is not None else getattr(config, "FOOTAGE_PROFILE", "auto")).lower()
         if requested not in _VALID_PROFILES:
@@ -1015,6 +1025,14 @@ class HybridPitchCalibrator:
     def set_fps(self, fps: Optional[float]) -> None:
         if fps and fps > 0:
             self.fps = float(fps)
+
+    @property
+    def blend_step_m(self) -> float:
+        """Yumuşak geçişte kare başına en fazla kayma: saniyelik sınırın fps'e bölümü, kare sınırıyla kırpılmış."""
+        step = self.blend_max_step_m
+        if self.blend_max_speed_mps > 0:
+            step = min(step, self.blend_max_speed_mps / self.fps)
+        return max(1e-4, step)
 
     def _new_frame_info(self) -> Dict[str, Any]:
         return {
@@ -1198,7 +1216,15 @@ class HybridPitchCalibrator:
     # ----------------------------------------------------------------
     def _calibrate(self, frame: np.ndarray) -> Any:
         self.stats["model_calls"] += 1
-        res = self.calibrator.calibrate_frame(frame)
+        try:
+            res = self.calibrator.calibrate_frame(frame)
+        except Exception as exc:  # noqa: BLE001
+            # Tek karedeki beklenmedik bir hata (ör. numpy sürümüne bağlı tekil matris) uzun bir maç
+            # analizini durdurmamalı: kare kalibrasyonsuz sayılır, önceki tablo korunur.
+            self.stats["model_errors"] = self.stats.get("model_errors", 0) + 1
+            if self.stats["model_errors"] <= 3:
+                print(f"[Kalibrasyon] UYARI: kalibrasyon hatası, kare atlandı: {type(exc).__name__}: {exc}")
+            res = CalibrationResult(success=False, reason="calibration_error")
         self.frame_info["num_keypoints"] = getattr(res, "num_keypoints", None)
         self.frame_info["num_inliers"] = getattr(res, "num_inliers", None)
         self.frame_info["reproj_error_m"] = getattr(res, "reproj_error_m", None)
@@ -1269,7 +1295,7 @@ class HybridPitchCalibrator:
         self._blend_p1 = p1
         self._blend_step = 0
         self._blend_total = max(
-            self.smooth_frames, int(math.ceil(float(disagreement) / self.blend_max_step_m))
+            self.smooth_frames, int(math.ceil(float(disagreement) / self.blend_step_m))
         )
         self.calibration_count += 1
         self.last_calibration_reason = reason

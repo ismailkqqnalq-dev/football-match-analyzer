@@ -333,9 +333,11 @@ class PitchLineRefiner:
                 r[ok] = _bilinear(maps, q)
             return r
 
+        def inlier_mask(G):
+            return sample_maps(prep.dt, _project(G, S), bins_of(G), np.inf) <= thr
+
         def inlier_ratio(G):
-            d = sample_maps(prep.dt, _project(G, S), bins_of(G), np.inf)
-            return float(np.mean(d <= thr))
+            return float(np.mean(inlier_mask(G)))
 
         before = inlier_ratio(G0)
         c = c0.copy()
@@ -358,7 +360,11 @@ class PitchLineRefiner:
         if coarse_only:
             cap0 = prep.caps[0]
             score = float(np.mean(sample_maps(prep.blurred[0], _project(G1, S), bins_of(G1), cap0))) / cap0
-            H1c = np.linalg.inv(np.linalg.inv(Sc) @ G1)
+            try:
+                H1c = np.linalg.inv(np.linalg.inv(Sc) @ G1)
+            except np.linalg.LinAlgError:  # numpy 1.x NaN/tekil matriste hata fırlatır (2.x NaN döndürür)
+                return LineRefineResult(False, inlier_ratio_before=round(before, 4), num_samples=n_vis,
+                                        reason="singular_output")
             return LineRefineResult(bool(np.isfinite(H1c).all()), homography_matrix=H1c,
                                     inlier_ratio_before=round(before, 4), num_samples=n_vis,
                                     coarse_score=score, reason="coarse")
@@ -373,6 +379,14 @@ class PitchLineRefiner:
             return res
         if after < self.min_inlier_ratio:
             res.reason = "low_inlier_ratio"
+            return res
+        # Çizgiye oturan örnekler görüntüde tek bir doğru boyunca diziliyorsa tablo belirsizdir: oturtucu
+        # sahanın birçok çizgisini tek bir görüntü çizgisine (ör. uzak taç çizgisi / reklam panosu) yığmış
+        # olabilir. Oturan noktaların baskın doğrultuya dik yayılımı (küçük ana eksen std) yeterli olmalı.
+        Q = _project(G1, S)[inlier_mask(G1)]
+        min_spread = float(getattr(config, "PITCH_LINE_REFINE_MIN_INLIER_SPREAD", 0.03))
+        if len(Q) < 3 or np.sqrt(max(float(np.linalg.eigvalsh(np.cov(Q.T))[0]), 0.0)) < min_spread * h:
+            res.reason = "inliers_collinear"
             return res
         G1_full = np.linalg.inv(Sc) @ G1  # metre -> tam çözünürlük pikseli
         try:
