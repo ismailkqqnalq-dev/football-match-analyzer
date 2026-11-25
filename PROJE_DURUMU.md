@@ -54,8 +54,8 @@ tarafından, sistem çıktısına bakılmadan, saniyede 2 kare (pas anlarında 0
 
 Toleransı 2 sn'ye çıkarmak sonucu az değiştiriyor (pas F1 0,34), yani sorun zamanlama
 değil: sistem pasların çoğunu kaçırıyor ve fazladan top kaybı yazıyor. Geniş kamerada
-top 2-3 piksel; top tespiti kopunca pas zinciri kırılıp sahiplik el değiştirmiş
-görünüyor. **Pas ve top kaybı sayıları şu an güvenilir değil**; top sahipliği kabaca
+top 2-3 piksel; olası sebep (henüz incelenmedi) top tespiti kopunca pas zincirinin
+kırılıp sahipliğin el değiştirmiş sayılması. **Pas ve top kaybı sayıları şu an güvenilir değil**; top sahipliği kabaca
 yön gösteriyor. Ölçüm README'deki komutla tekrarlanabilir.
 
 ## Dar C: Takım metrikleri
