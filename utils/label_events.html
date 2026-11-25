@@ -83,7 +83,7 @@ try { marks = JSON.parse(localStorage.getItem(KEY) || '[]'); } catch (e) { marks
 const persist = () => { try { localStorage.setItem(KEY, JSON.stringify(marks)); } catch (e) {} };
 
 const startSec = () => +$('start').value || 0;
-const endSec = () => +$('end').value || v.duration || 0;
+const endSec = () => { const e = Math.min(+$('end').value || Infinity, v.duration || Infinity); return isFinite(e) ? e : 0; };
 const fps = () => +$('fps').value || 25;
 
 function teamAt(t) {
@@ -129,11 +129,12 @@ $('file').addEventListener('change', e => {
   if (!f) return;
   if (marks.length && confirm('Önceki işaretler silinsin mi? (İptal: kalsın)')) { marks = []; persist(); }
   v.src = URL.createObjectURL(f);
+  e.target.blur();  // odak dosya kutusunda kalırsa tuşlar işlemez, boşluk dosya penceresini açar
   renderList();
 });
 
 document.addEventListener('keydown', e => {
-  if (e.target.tagName === 'INPUT') return;
+  if (e.target.tagName === 'INPUT' && e.target.type === 'number') return;  // yalnızca sayı kutularına yazarken
   const k = e.key.toLowerCase();
   const t = Math.round(v.currentTime * 1000) / 1000;
   const step = s => { v.pause(); v.currentTime = Math.max(startSec(), Math.min(endSec(), v.currentTime + s)); };
