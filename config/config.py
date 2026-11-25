@@ -458,6 +458,7 @@ PITCH_LINE_REFINE_TOPHAT_THRESHOLD = 18      # çizgi maskesi parlaklık eşiği
 PITCH_LINE_REFINE_INLIER_PX = 3.0            # çizgiye "oturdu" sayılma mesafesi (1080p pikseli)
 PITCH_LINE_REFINE_MIN_INLIER_RATIO = 0.50    # kabul için çizgiye oturan örnek oranı alt sınırı (yanlış tablolar <= 0,47 ölçüldü)
 PITCH_LINE_REFINE_MAX_SHIFT_FRAC = 0.10
+PITCH_LINE_REFINE_MIN_INLIER_SPREAD = 0.03   # çizgiye oturan noktaların baskın doğrultuya dik yayılımı >= kare yüksekliği x bu oran (tek çizgiye yığılma: 0,005; iyi tablolar >= 0,078 ölçüldü)
 PITCH_LINE_REFINE_VERIFY_MAX_POINTS = 40  # oturtulan tabloyu doğrularken kullanılan en fazla çizgi örneği (hız)      # örneklerin ortanca yer değiştirmesi <= kare köşegeni x bu oran
 
 # A2-3: Model–optical flow uyuşmazlığına göre kademeli kabul (metre, 3x3 referans ızgarasının ortancası)

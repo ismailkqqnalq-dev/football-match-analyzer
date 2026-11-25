@@ -210,3 +210,26 @@ def test_refined_table_verification_is_fast_with_many_line_samples(pitch_img):
     res = cal.calibrate_frame(pitch_img)
     assert time.perf_counter() - t0 < 10.0
     assert res.reason in ("line_check_failed", "ok", "ok_line_refined")
+
+
+def test_refine_rejects_table_whose_inliers_collapse_onto_one_line(monkeypatch):
+    """Çizgiye oturan örnekler tek bir görüntü çizgisine yığılırsa tablo reddedilmeli.
+
+    Veri: gerçek bir TV karesi (ceza yayını orta yuvarlak sanan model). Oturtucu sahanın birçok çizgisini
+    uzak taç çizgisi / reklam panosu hattına yığıp yüksek oran buluyordu; tablo ~28 m yanlıştı.
+    Fikstür: 960x540 karenin çizgi maskesi (bit paketli) ve oturtucuya giden aday tablolar.
+    """
+    import os
+    d = np.load(os.path.join(os.path.dirname(__file__), "fixtures", "line_refine_collapse_tv4475.npz"))
+    mask = np.unpackbits(d["line_mask_bits"])[:540 * 960].reshape(540, 960)
+    img = np.full((540, 960, 3), (40, 140, 40), np.uint8)
+    img[mask > 0] = 255
+    cands = list(d["candidates"])
+
+    res = PitchLineRefiner().refine(img, cands)
+    assert not res.success
+    assert res.reason == "inliers_collinear"
+    assert res.inlier_ratio_after >= PitchLineRefiner().min_inlier_ratio  # oran tek başına yakalamıyor
+
+    monkeypatch.setattr(config, "PITCH_LINE_REFINE_MIN_INLIER_SPREAD", 0.0)
+    assert PitchLineRefiner().refine(img, cands).success  # reddeden yalnızca yayılım koruması

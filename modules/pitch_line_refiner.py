@@ -333,9 +333,11 @@ class PitchLineRefiner:
                 r[ok] = _bilinear(maps, q)
             return r
 
+        def inlier_mask(G):
+            return sample_maps(prep.dt, _project(G, S), bins_of(G), np.inf) <= thr
+
         def inlier_ratio(G):
-            d = sample_maps(prep.dt, _project(G, S), bins_of(G), np.inf)
-            return float(np.mean(d <= thr))
+            return float(np.mean(inlier_mask(G)))
 
         before = inlier_ratio(G0)
         c = c0.copy()
@@ -373,6 +375,14 @@ class PitchLineRefiner:
             return res
         if after < self.min_inlier_ratio:
             res.reason = "low_inlier_ratio"
+            return res
+        # Çizgiye oturan örnekler görüntüde tek bir doğru boyunca diziliyorsa tablo belirsizdir: oturtucu
+        # sahanın birçok çizgisini tek bir görüntü çizgisine (ör. uzak taç çizgisi / reklam panosu) yığmış
+        # olabilir. Oturan noktaların baskın doğrultuya dik yayılımı (küçük ana eksen std) yeterli olmalı.
+        Q = _project(G1, S)[inlier_mask(G1)]
+        min_spread = float(getattr(config, "PITCH_LINE_REFINE_MIN_INLIER_SPREAD", 0.03))
+        if len(Q) < 3 or np.sqrt(max(float(np.linalg.eigvalsh(np.cov(Q.T))[0]), 0.0)) < min_spread * h:
+            res.reason = "inliers_collinear"
             return res
         G1_full = np.linalg.inv(Sc) @ G1  # metre -> tam çözünürlük pikseli
         try:
