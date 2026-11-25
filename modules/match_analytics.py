@@ -125,6 +125,31 @@ def _compact_analytics_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _team_coverage(subset_frames: np.ndarray, team_frames: np.ndarray) -> Dict[str, Any]:
+    """Takımın karede kaç oyuncusunun göründüğünü özetler ve kapsama düzeyi verir.
+
+    subset_frames: kapsamdaki tüm oyuncu satırlarının kare numaraları (paydadaki kareler),
+    team_frames: bu takımın oyuncu satırlarının kare numaraları. Takımın hiç görünmediği
+    kareler 0 oyuncu sayılır.
+    """
+    frames = np.unique(subset_frames)
+    counts = np.zeros(len(frames), dtype=np.int64)
+    if len(team_frames):
+        uniq, c = np.unique(team_frames, return_counts=True)
+        counts[np.searchsorted(frames, uniq)] = c
+    high = int(getattr(config, "TEAM_COVERAGE_HIGH_MIN_PLAYERS", 9))
+    medium = int(getattr(config, "TEAM_COVERAGE_MEDIUM_MIN_PLAYERS", 5))
+    median = float(np.median(counts)) if len(counts) else 0.0
+    level = "high" if median >= high else ("medium" if median >= medium else "low")
+    return {
+        "level": level,
+        "frames": int(len(frames)),
+        "median_visible_players": round(median, 1),
+        "mean_visible_players": round(float(counts.mean()), 2) if len(counts) else 0.0,
+        "frames_with_high_coverage_pct": round(float(np.mean(counts >= high)) * 100, 1) if len(counts) else 0.0,
+    }
+
+
 def _majority_code(keys: np.ndarray, values: np.ndarray, n_keys: int, n_values: int) -> np.ndarray:
     """
     Her anahtar (ör. track kodu) için en sık görülen değer kodunu (ör. takım) döndürür;
@@ -953,6 +978,7 @@ class MatchAnalyzer:
                 att_line = float(xs.max()) if adir >= 0 else float(xs.min())
 
                 teams_out[tname] = {
+                    "coverage": _team_coverage(fids_all[sub_mask], fids_all[t_mask]),
                     "player_count": len(player_positions),
                     "attack_direction": "+x" if adir >= 0 else "-x",
                     "centroid_x": round(float(xs_t.mean()), 2),

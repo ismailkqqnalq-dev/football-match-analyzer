@@ -603,6 +603,10 @@ POSSESSION_SMOOTHING_FRAMES = 5
 POSSESSION_MIN_CONTROL_SEC = 0.08
 POSSESSION_MIN_CONTROL_FRAMES = 2
 POSSESSION_MAX_BALL_CONTROL_SPEED_MPS = 15.0
+# Kapsama etiketi: takım metriği, o takımdan karede ortanca kaç oyuncu göründüğüyle etiketlenir.
+# TV yakın çekiminde 3-4 oyuncuyla hesaplanan "takım genişliği" tüm takımı temsil etmez.
+TEAM_COVERAGE_HIGH_MIN_PLAYERS = 9     # ortanca >= 9 görünür oyuncu: "high"
+TEAM_COVERAGE_MEDIUM_MIN_PLAYERS = 5   # ortanca >= 5: "medium", altı "low"
 BALL_AERIAL_DIRECTION_CHANGE_MIN_DEG = 25.0
 BALL_AERIAL_DECEL_MIN_RATIO = 0.35
 PASS_MIN_DURATION_SEC = 0.08
