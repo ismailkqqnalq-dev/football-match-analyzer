@@ -42,10 +42,21 @@ Araçlar hazır: tarayıcıda çalışan etiketleme aracı (`utils/label_events.
 karşılaştırma aracı (`utils/validate_events.py`, ±1 sn tolerans; kesinlik,
 duyarlılık, F1 ve saniye bazında sahiplik uyumu). Kullanımı README'de.
 
-**Durum:** Ölçüm henüz yapılmadı. Karşılaştırma için elle etiketlenmiş gerçek olaylar
-gerekiyor (taktik kamera klibinin ilk 5 dakikası); sistem çıktısı hazır. Etiketler
-gelince README'deki tek komutla (`--start-sec 0 --end-sec 300`) ölçülür. O zamana
-kadar pas ve top sahipliği sayıları **doğrulanmamış** kabul edilmeli.
+**İlk ölçüm (geniş/taktik kamera, ilk 120 sn):** Etiketler insan değil Claude
+tarafından, sistem çıktısına bakılmadan, saniyede 2 kare (pas anlarında 0,1 sn) izlenerek
+çıkarıldı: 22 pas, 5 top kaybı, 115 sn sahiplik. Kaba bir göstergedir.
+
+| Ölçüt | Sonuç |
+|---|---|
+| Pas (±1 sn) | sistem 7, gerçek 22, eşleşen 4 → kesinlik %57, duyarlılık %18, F1 0,28 |
+| Top kaybı (±1 sn) | sistem 9, gerçek 5, eşleşen 1 → kesinlik %11, duyarlılık %20, F1 0,14 |
+| Sahiplik (saniye bazında) | sistemin takım verdiği saniyelerde uyum %62; etiketli saniyelerin %70'inde sistem bir takım veriyor |
+
+Toleransı 2 sn'ye çıkarmak sonucu az değiştiriyor (pas F1 0,34), yani sorun zamanlama
+değil: sistem pasların çoğunu kaçırıyor ve fazladan top kaybı yazıyor. Geniş kamerada
+top 2-3 piksel; olası sebep (henüz incelenmedi) top tespiti kopunca pas zincirinin
+kırılıp sahipliğin el değiştirmiş sayılması. **Pas ve top kaybı sayıları şu an güvenilir değil**; top sahipliği kabaca
+yön gösteriyor. Ölçüm README'deki komutla tekrarlanabilir.
 
 ## Dar C: Takım metrikleri
 Takım biçimi metrikleri artık bir **kapsama etiketi** taşıyor: o takımdan karede
@@ -56,7 +67,9 @@ bunu açıkça söyler. Gerçek veride geniş kamera "high" (ortanca 11 oyuncu),
 
 ## Sırada ne var
 1. TV için daha çok eğitim verisi ve model ince ayarı (A2'nin TV hedefi için).
-2. Faz V ölçümünü iki klipte tamamlamak (bir TV, bir geniş kamera).
+2. Pas/top kaybı tespiti: geniş kamerada top takibini güçlendirmek (kısa kopmalarda
+   topu ara değerle sürdürmek), sonra Faz V'yi insan etiketiyle ve bir TV klibinde
+   tekrarlamak.
 3. Takip iyileştirmesi: geniş kamerada 10 dakikada 439 iz, ortanca iz süresi 1,5 sn;
    oyuncu kimliği (Faz B: takım + forma numarası) bunun üzerine kurulacak.
 4. Ofsayt sonrası iptal edilen şutların istatistikten düşülmesi (tasarımı hazır).
