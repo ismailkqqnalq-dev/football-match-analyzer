@@ -370,6 +370,68 @@ def reject_ball_outlier_segments(
     return keep
 
 
+def filter_ball_outliers(
+    ball_fids: np.ndarray,
+    ball_xs: np.ndarray,
+    ball_ys: np.ndarray,
+    ball_is_pred: Optional[np.ndarray],
+    fps: float,
+    is_calibrated: bool,
+    bounds: Tuple[float, float, float, float],
+) -> np.ndarray:
+    """
+    reject_ball_outlier_segments'i config eşikleriyle çağırır (piksel modunda ölçekler).
+    MatchAnalyzer ve MLAnalyzer aynı eşikleri kullansın diye tek yerde tutulur.
+    """
+    scale = 1.0 if is_calibrated else compute_pixel_scale_px_per_m(bounds)
+    return reject_ball_outlier_segments(
+        ball_fids, ball_xs, ball_ys, ball_is_pred, fps,
+        max_speed=float(getattr(config, "PASS_MAX_SPEED_MPS", 42.0)) * scale,
+        max_outlier_sec=float(getattr(config, "BALL_OUTLIER_MAX_SEC", 1.0)),
+        min_jump=float(getattr(config, "BALL_OUTLIER_MIN_JUMP_M", 8.0)) * scale,
+    )
+
+
+def sandwich_spell_keep_indices(
+    start_frames: List[int],
+    end_frames: List[int],
+    start_teams: List[Optional[str]],
+    end_teams: List[Optional[str]],
+    fps: float,
+) -> List[int]:
+    """
+    Aynı takımın iki kontrol periyodu arasına sıkışmış kısa tek rakip periyodunu eler
+    (pas sırasında top rakibin dibinden geçiyor); aksi halde bir pas "kayıp + geri
+    kazanım" diye iki sahte top kaybına dönüşür. Yalnızca önceki ile sonraki periyot
+    arası bir pas süresini (PASS_MAX_GAP_SEC) aşmıyorsa uygulanır.
+    Tutulacak periyotların indekslerini döndürür.
+    """
+    n = len(start_frames)
+    sandwich_max = float(getattr(config, "PASS_SANDWICH_MAX_SEC", 0.6))
+    if sandwich_max <= 0 or n < 3:
+        return list(range(n))
+    fps_safe = max(float(fps), 1e-6)
+    max_gap = float(config.PASS_MAX_GAP_SEC)
+    kept = [0]
+    for i in range(1, n - 1):
+        p, nx = kept[-1], i + 1
+        prev_team = end_teams[p]
+        short = (end_frames[i] - start_frames[i]) / fps_safe <= sandwich_max
+        within_pass = (start_frames[nx] - end_frames[p]) / fps_safe <= max_gap
+        if (
+            short
+            and within_pass
+            and prev_team in ("Team A", "Team B")
+            and prev_team == start_teams[nx]
+            and start_teams[i] != prev_team
+            and end_teams[i] != prev_team
+        ):
+            continue
+        kept.append(i)
+    kept.append(n - 1)
+    return kept
+
+
 def smooth_possession_codes(
     raw_tid_codes: np.ndarray,
     raw_team_codes: np.ndarray,
