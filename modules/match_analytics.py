@@ -799,6 +799,26 @@ class MatchAnalyzer:
                 "end_y": float(c_by[en_i]),
             })
 
+        # Aynı takımın iki periyodu arasına sıkışmış kısa tek rakip periyodu: pas sırasında
+        # topun rakibin yanından geçmesi / yanlış takım ataması. Atlanır; aksi halde bir
+        # pas "kayıp + geri kazanım" diye iki sahte top kaybına dönüşür.
+        sandwich_max = float(getattr(config, "PASS_SANDWICH_MAX_SEC", 0.6))
+        if sandwich_max > 0 and len(spells) >= 3:
+            kept = [spells[0]]
+            for i in range(1, len(spells) - 1):
+                prev, cur, nxt = kept[-1], spells[i], spells[i + 1]
+                short = (cur["end_frame"] - cur["start_frame"]) / self.fps <= sandwich_max
+                if (
+                    short
+                    and prev["team"] in ("Team A", "Team B")
+                    and prev["team"] == nxt["team"]
+                    and cur["team"] != prev["team"]
+                ):
+                    continue
+                kept.append(cur)
+            kept.append(spells[-1])
+            spells = kept
+
         min_move = (
             float(config.PASS_MIN_BALL_MOVE_M)
             if self.is_calibrated

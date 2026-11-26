@@ -407,6 +407,29 @@ def test_ball_outlier_segment_rejected_but_real_flight_kept():
     assert keep2.all()
 
 
+def test_short_opponent_spell_inside_pass_is_not_two_turnovers():
+    # A1 topu A2'ye pasladı; top yoldaki B oyuncusunun dibinden 0.2 sn geçti.
+    fps = 25.0
+    rows = []
+    for f in range(80):
+        if f < 20:
+            bx = 30.0
+        elif f < 60:
+            bx = 30.0 + (f - 19) * 0.5  # 12.5 m/sn, B'nin (x=40) yanından geçiyor
+        else:
+            bx = 50.0
+        rows.append(_row(f, "ball", "ball", None, bx, 34.0, fps=fps))
+        rows.append(_row(f, 1, "player", "Team A", 30.0, 34.0, fps=fps))
+        rows.append(_row(f, 9, "player", "Team B", 40.0, 34.0, fps=fps))
+        rows.append(_row(f, 2, "player", "Team A", 50.0, 34.0, fps=fps))
+
+    ma = MatchAnalyzer(pd.DataFrame(rows), fps=fps)
+    tl, _ = ma.compute_possession()
+    passes = ma.detect_passes(tl)
+    assert passes["total_turnovers"] == 0
+    assert passes["total_completed_passes"] == 1
+
+
 def test_off_pitch_ball_detection_ignored_for_possession():
     # Kale ağındaki yedek top (saha dışı, on_pitch=False) sahiplik zaman çizelgesine girmemeli.
     rows = []
