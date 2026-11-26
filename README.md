@@ -9,6 +9,7 @@ kesmesi ve tekrar dönüşü telafili saha (metre) koordinatları → görsel ç
 taktik analiz ve makine öğrenmesi raporları.
 
 Ölçülen isabet, hedefler ve bilinen sınırlar için: [PROJE_DURUMU.md](PROJE_DURUMU.md).
+Elle doğrulama için test senaryoları: [TEST_SENARYOLARI.md](TEST_SENARYOLARI.md).
 
 ## Kurulum
 ```bash
