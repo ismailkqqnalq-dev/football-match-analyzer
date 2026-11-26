@@ -73,6 +73,15 @@ Bulunan ve düzeltilen hatalar:
   rakip periyodu (top pas sırasında rakibin dibinden geçiyor) artık "kayıp + geri
   kazanım" diye iki sahte top kaybı üretmiyor. **Bu desen 120-240 sn'deki olaylara da
   bakılarak bulundu; #18 için 120-240 sn temiz kontrol aralığı değildir.**
+- **#19:** #18'in kuralı, sonraki periyot saniyeler sonra gelse de rakip periyodunu
+  siliyordu (gerçek bir kayıp + geri kazanımı yutuyordu). Artık yalnızca önceki ve sonraki
+  periyot arası bir pas süresini (`PASS_MAX_GAP_SEC`, 4 sn) aşmıyorsa uygulanıyor.
+  120-240 sn'de pas F1 0,69 → 0,71, top kaybı F1 0,25 → 0,20 (sistem 5 → 7 kayıp, doğru
+  1); 0-120 sn değişmedi. Aynı PR'da düzeltmeler ML analizörüne (`ml_analyzer.py`) de
+  taşındı: saha dışı top, sahte top sıçraması ve kısa rakip periyodu. #15 ortak
+  fonksiyonda olduğu için zaten geçerliydi; #16'ya gerek yok, çünkü ML takımı izin ömür
+  boyu çoğunluğundan değil, her karenin kendisinden alıyor. ML'nin vekil pas olaylarında
+  pas F1 0-120 sn'de 0,41 → 0,71, 120-240 sn'de 0,33 → 0,64.
 
 Son durumda (iki aralık birlikte, 4 dk) sistemin dediği pasların ~%77'si doğru, gerçek
 pasların ~%64'ü yakalanıyor; top sahipliği ~%84 uyumlu; top kaybında sistem 8 gerçek
@@ -91,8 +100,7 @@ bunu açıkça söyler. Gerçek veride geniş kamera "high" (ortanca 11 oyuncu),
 ## Sırada ne var
 1. TV için daha çok eğitim verisi ve model ince ayarı (A2'nin TV hedefi için).
 2. Faz V'yi insan etiketiyle, bu klibin görülmemiş bir bölümünde ve bir TV klibinde
-   tekrarlamak (#18'in gerçek etkisi için). ML analizöründe (`ml_analyzer.py`) #15-#18
-   düzeltmeleri yok.
+   tekrarlamak (#18'in gerçek etkisi için).
 3. Takip iyileştirmesi: geniş kamerada 10 dakikada 439 iz, ortanca iz süresi 1,5 sn;
    oyuncu kimliği (Faz B: takım + forma numarası) bunun üzerine kurulacak.
 4. Ofsayt sonrası iptal edilen şutların istatistikten düşülmesi (tasarımı hazır).

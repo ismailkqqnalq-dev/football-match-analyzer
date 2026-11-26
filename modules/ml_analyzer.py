@@ -77,8 +77,10 @@ from modules.analytics_common import (
 )
 from modules.pitch_orientation import (
     compute_ball_kinematic_filter,
+    compute_pixel_scale_px_per_m,
     has_discontinuity_between,
     lookup_attack_directions,
+    reject_ball_outlier_segments,
     resolve_goalkeeper_teams,
     smooth_possession_codes,
 )
@@ -1313,6 +1315,9 @@ class MLAnalyzer:
 
         # Top verisi (aynı karede varsa is_predicted=False tercih edilir)
         b_mask = (cls_s == config.BALL_CLASS_NAME).fillna(False).to_numpy(dtype=bool) & xy_notna & f_notna
+        # Saha dışındaki top tespitleri (ör. kale ağının arkasındaki sabit sahte noktalar) atılır
+        if self.is_calibrated and "on_pitch" in self.df.columns:
+            b_mask &= _bool_mask(self.df["on_pitch"], na_value=True)
         b_idx = np.flatnonzero(b_mask)
         if len(b_idx) == 0:
             return pd.DataFrame(columns=event_cols)
@@ -1345,7 +1350,23 @@ class MLAnalyzer:
         ball_ys = b_ys[b_first]
         ball_ts = b_ts[b_first]
         ball_is_pred = b_pred[b_first]
+
+        # Dedektörün sahte bir noktaya kısa süreli sıçramalarını ve bunları örten ara değerleri at
+        out_scale = 1.0 if self.is_calibrated else compute_pixel_scale_px_per_m(self.bounds)
+        out_keep = reject_ball_outlier_segments(
+            ball_fids, ball_xs, ball_ys, ball_is_pred, self.fps,
+            max_speed=float(getattr(config, "PASS_MAX_SPEED_MPS", 42.0)) * out_scale,
+            max_outlier_sec=float(getattr(config, "BALL_OUTLIER_MAX_SEC", 1.0)),
+            min_jump=float(getattr(config, "BALL_OUTLIER_MIN_JUMP_M", 8.0)) * out_scale,
+        )
+        ball_fids = ball_fids[out_keep]
+        ball_xs = ball_xs[out_keep]
+        ball_ys = ball_ys[out_keep]
+        ball_ts = ball_ts[out_keep]
+        ball_is_pred = ball_is_pred[out_keep]
         n_ball = len(ball_fids)
+        if n_ball == 0:
+            return pd.DataFrame(columns=event_cols)
 
         kin = compute_ball_kinematic_filter(
             ball_fids=ball_fids,
@@ -1734,6 +1755,33 @@ class MLAnalyzer:
                 "start": _build_snap(bi_s, tid_c, int(sm_teams[bi_s]), fb_s),
                 "end": _build_snap(bi_e, tid_c, int(sm_teams[bi_e]), fb_e),
             })
+
+        # Aynı takımın iki periyodu arasına sıkışmış kısa tek rakip periyodu atlanır
+        # (MatchAnalyzer.detect_passes ile aynı kural); aksi halde bir pas iki sahte top kaybı olur.
+        sandwich_max = float(getattr(config, "PASS_SANDWICH_MAX_SEC", 0.6))
+        if sandwich_max > 0 and len(spells) >= 3:
+            kept_sp = [spells[0]]
+            for i in range(1, len(spells) - 1):
+                prev_sp, cur_sp, nxt_sp = kept_sp[-1], spells[i], spells[i + 1]
+                prev_team = prev_sp["end"]["team"]
+                cur_team = cur_sp["start"]["team"]
+                short = (cur_sp["end"]["frame_idx"] - cur_sp["start"]["frame_idx"]) / self.fps <= sandwich_max
+                # Ancak tek bir pasın içindeyse: önceki ile sonraki periyot arası bir pas süresini aşmamalı
+                within_pass = (
+                    nxt_sp["start"]["frame_idx"] - prev_sp["end"]["frame_idx"]
+                ) / self.fps <= config.PASS_MAX_GAP_SEC
+                if (
+                    short
+                    and within_pass
+                    and prev_team in ("Team A", "Team B")
+                    and prev_team == nxt_sp["start"]["team"]
+                    and cur_team != prev_team
+                    and cur_sp["end"]["team"] != prev_team
+                ):
+                    continue
+                kept_sp.append(cur_sp)
+            kept_sp.append(spells[-1])
+            spells = kept_sp
 
         if len(spells) < 2:
             return pd.DataFrame(columns=event_cols)
