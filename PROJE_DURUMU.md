@@ -47,11 +47,12 @@ tarafından, sistem çıktısına bakılmadan, saniyede 2 kare (pas anlarında 0
 çıkarıldı. Kaba bir göstergedir. İlk 120 sn sorunu bulmak ve düzeltmek için kullanıldı;
 120-240 sn düzeltme sırasında hiç bakılmamış **kontrol aralığıdır** (dürüst sonuç budur).
 
-| Ölçüt (±1 sn) | 0-120 sn: ilk → #15 → #16 | 120-240 sn kontrol: ilk → #15 → #16 |
+| Ölçüt (±1 sn) | 0-120 sn: ilk → #15 → #16 → #17 | 120-240 sn kontrol: ilk → #15 → #16 → #17 |
 |---|---|---|
-| Pas F1 | 0,28 → 0,53 → 0,56 (gerçek 22; yakalanan 4 → 9 → 11) | 0,30 → 0,36 → 0,39 (gerçek 34; yakalanan 6 → 8 → 9) |
-| Top kaybı F1 | 0,14 → 0,12 → 0,17 (gerçek 5) | 0 → 0 → 0,17 (gerçek 3) |
-| Sahiplik uyumu | %62 → %62 → %81 | %72 → %72 → %81 |
+| Pas F1 | 0,28 → 0,53 → 0,56 → 0,65 (gerçek 22; yakalanan 4 → 9 → 11 → 13) | 0,30 → 0,36 → 0,39 → 0,68 (gerçek 34; yakalanan 6 → 8 → 9 → 19) |
+| Pas kesinliği (#17) | %72 | %86 |
+| Top kaybı F1 | 0,14 → 0,12 → 0,17 → 0,24 (gerçek 5) | 0 → 0 → 0,17 → 0,13 (gerçek 3, sistem 13) |
+| Sahiplik uyumu | %62 → %62 → %81 → %82 | %72 → %72 → %81 → %86 |
 
 Bulunan ve düzeltilen hatalar:
 - **#15:** Top pas sırasında görünmez olunca Kalman tahmini pasörün yanında donuyordu;
@@ -63,11 +64,17 @@ Bulunan ve düzeltilen hatalar:
   periyodunun kendi karelerinin çoğunluk takımı kullanılıyor. #16'da kontrol aralığının
   yalnız sayısal özetine bakıldı (kaçırma sınıfları), düzeltme 0-120 sn'den türetildi.
 
-Top sahipliği artık iki aralıkta da ~%81 uyumlu. Pas tespiti hâlâ zayıf: kontrol
-aralığında gerçek pasların ~3/4'ü kaçırılıyor. Kalan kaçırmalar: top hızının "çok hızlı"
-eşiğini aşması (top izinin yine zıplaması), süreksizlik ve pas anında hiç kontrol
-periyodu olmaması (top görünmüyor). **Pas ve top kaybı sayıları güvenilir değil.**
-Ölçüm README'deki komutla tekrarlanabilir.
+- **#17:** Top dedektörü gerçek topla 10-25 m ötedeki sahte bir nokta arasında gidip
+  geliyordu (ör. 0,22 sn'de 21 m = 96 m/sn); takipçi de aradaki boşluğu ara değerle
+  dolduruyordu. Artık iki uyumlu top izi parçası arasına 8 m'den büyük sıçramayla
+  girilen, en fazla 1 sn süren parça sahte sayılıp atılıyor; imkânsız sıçramayı örten
+  ara değer kareleri de atılıyor. Bu karar sadece 0-120 sn'ye bakılarak verildi.
+
+Kontrol aralığında artık sistemin dediği pasların %86'sı doğru ve gerçek pasların
+yarısından fazlası (%56) yakalanıyor; top sahipliği %86 uyumlu. **Top kaybı hâlâ
+güvenilir değil**: sistem 4 dakikada 3 gerçek kayba karşı 13 kayıp yazıyor. Bu sayılar
+Claude etiketiyle 4 dakikalık tek bir klipte ölçüldü; insan etiketiyle ve başka bir
+maçta doğrulanmadan kesin kabul edilmemeli. Ölçüm README'deki komutla tekrarlanabilir.
 
 ## Dar C: Takım metrikleri
 Takım biçimi metrikleri artık bir **kapsama etiketi** taşıyor: o takımdan karede
@@ -78,10 +85,9 @@ bunu açıkça söyler. Gerçek veride geniş kamera "high" (ortanca 11 oyuncu),
 
 ## Sırada ne var
 1. TV için daha çok eğitim verisi ve model ince ayarı (A2'nin TV hedefi için).
-2. Pas tespiti: kalan "çok hızlı" elemelerinde top izinin neden zıpladığını incelemek
-   (kenar çizgisi dışındaki sabit sahte noktalar, oyuncu ayağına yakın yanlış tespitler);
-   ML analizöründe (`ml_analyzer.py`) aynı saha dışı top ve periyot takımı düzeltmeleri
-   yok. Sonra Faz V'yi insan etiketiyle ve bir TV klibinde tekrarlamak.
+2. Top kaybı: fazladan yazılan kayıpların sebebini incelemek (aday: markajdaki rakibin
+   topa en yakın oyuncu sayılması). ML analizöründe (`ml_analyzer.py`) #15-#17
+   düzeltmeleri yok. Sonra Faz V'yi insan etiketiyle ve bir TV klibinde tekrarlamak.
 3. Takip iyileştirmesi: geniş kamerada 10 dakikada 439 iz, ortanca iz süresi 1,5 sn;
    oyuncu kimliği (Faz B: takım + forma numarası) bunun üzerine kurulacak.
 4. Ofsayt sonrası iptal edilen şutların istatistikten düşülmesi (tasarımı hazır).

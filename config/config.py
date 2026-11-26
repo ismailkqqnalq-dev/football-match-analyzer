@@ -615,6 +615,10 @@ TEAM_COVERAGE_HIGH_MIN_PLAYERS = 9     # ortanca >= 9 görünür oyuncu: "high"
 TEAM_COVERAGE_MEDIUM_MIN_PLAYERS = 5   # ortanca >= 5: "medium", altı "low"
 BALL_AERIAL_DIRECTION_CHANGE_MIN_DEG = 25.0
 BALL_AERIAL_DECEL_MIN_RATIO = 0.35
+# Dedektörün sahte bir noktaya kısa sıçraması: iki uyumlu parça arasındaki, en fazla bu
+# kadar süren ve bu mesafeden büyük sıçramayla girilen parça sahte top sayılıp atılır.
+BALL_OUTLIER_MAX_SEC = 1.0
+BALL_OUTLIER_MIN_JUMP_M = 8.0
 PASS_MIN_DURATION_SEC = 0.08
 PASS_MAX_GAP_SEC = 4.0
 PASS_MAX_SPEED_MPS = 42.0

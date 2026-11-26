@@ -41,6 +41,7 @@ from modules.pitch_orientation import (
     compute_ball_kinematic_filter,
     compute_pixel_scale_px_per_m,
     has_discontinuity_between,
+    reject_ball_outlier_segments,
     resolve_goalkeeper_teams,
     smooth_possession_codes,
 )
@@ -505,9 +506,22 @@ class MatchAnalyzer:
         ball_ys = b_ys[b_first]
         ball_ts = b_ts[b_first]
         ball_is_pred = b_pred[b_first]
-        n = len(ball_fids)
 
         bounds = self._compute_bounds()
+        # Dedektörün sahte bir noktaya kısa süreli sıçramalarını ve bunları örten ara değerleri at
+        out_scale = 1.0 if self.is_calibrated else compute_pixel_scale_px_per_m(bounds)
+        out_keep = reject_ball_outlier_segments(
+            ball_fids, ball_xs, ball_ys, ball_is_pred, self.fps,
+            max_speed=float(getattr(config, "PASS_MAX_SPEED_MPS", 42.0)) * out_scale,
+            max_outlier_sec=float(getattr(config, "BALL_OUTLIER_MAX_SEC", 1.0)),
+            min_jump=float(getattr(config, "BALL_OUTLIER_MIN_JUMP_M", 8.0)) * out_scale,
+        )
+        ball_fids = ball_fids[out_keep]
+        ball_xs = ball_xs[out_keep]
+        ball_ys = ball_ys[out_keep]
+        ball_ts = ball_ts[out_keep]
+        ball_is_pred = ball_is_pred[out_keep]
+        n = len(ball_fids)
         kin = compute_ball_kinematic_filter(
             ball_fids=ball_fids,
             ball_xs=ball_xs,
@@ -691,7 +705,8 @@ class MatchAnalyzer:
             "mode": coord_space,
             "max_distance_threshold": max_dist,
             "total_frames": total_frames,
-            "ball_detected_frames": int(n),
+            "ball_detected_frames": int(len(out_keep)),
+            "ball_outlier_frames": int((~out_keep).sum()),
             "controlled_frames": controlled_frames,
             "team_a_frames": team_a_frames,
             "team_b_frames": team_b_frames,
