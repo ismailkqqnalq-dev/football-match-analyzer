@@ -358,13 +358,19 @@ def reject_ball_outlier_segments(
     kept_real = np.flatnonzero(~pred & keep)
     if len(kept_real) == 0:
         return keep
-    # Tahmin karelerini en yakın tutulan gerçek komşularına göre denetle
+    dropped_starts = (
+        np.sort(np.fromiter((s for s, _ in dropped), dtype=np.int64, count=len(dropped)))
+        if dropped
+        else np.empty(0, dtype=np.int64)
+    )
+    # Tahmin karelerini en yakın tutulan gerçek komşularına göre O(log D) denetle
     for p in np.flatnonzero(pred):
         pos = int(np.searchsorted(kept_real, p))
         if pos == 0 or pos >= len(kept_real):
             continue
         a, b = int(kept_real[pos - 1]), int(kept_real[pos])
-        between_dropped = any(s > a and e < b for s, e in dropped)
+        idx_d = int(np.searchsorted(dropped_starts, a, side="right"))
+        between_dropped = idx_d < len(dropped_starts) and int(dropped_starts[idx_d]) < b
         if between_dropped or speed(a, b) > max_speed:
             keep[p] = False
     return keep

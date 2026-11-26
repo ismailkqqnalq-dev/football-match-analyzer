@@ -45,10 +45,38 @@ def is_url(value) -> bool:
     return isinstance(value, str) and value.strip().lower().startswith(("http://", "https://"))
 
 
-def cache_path_for(url: str, cache_dir: str = None) -> str:
+_TEMP_SUFFIXES = (".part", ".ytdl", ".tmp")
+
+
+def _url_digest(url: str) -> str:
+    return hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:16]
+
+
+def cache_path_for(url: str, cache_dir: str = None, ext: str = "mp4") -> str:
     """Link için önbellekteki video dosyasının yolunu döner (aynı link -> aynı dosya)."""
-    digest = hashlib.sha256(url.strip().encode("utf-8")).hexdigest()[:16]
-    return os.path.join(cache_dir or DEFAULT_CACHE_DIR, f"{digest}.mp4")
+    digest = _url_digest(url)
+    clean_ext = str(ext or "mp4").lstrip(".")
+    return os.path.join(cache_dir or DEFAULT_CACHE_DIR, f"{digest}.{clean_ext}")
+
+
+def _find_cached_file(url: str, cache_dir: str = None):
+    """Aynı link için önbellekteki (mp4/webm/mkv vb.) hazır video dosyasını bulur."""
+    base_dir = cache_dir or DEFAULT_CACHE_DIR
+    mp4_path = cache_path_for(url, base_dir, ext="mp4")
+    if os.path.isfile(mp4_path) and os.path.getsize(mp4_path) > 0:
+        return mp4_path
+    if not os.path.isdir(base_dir):
+        return None
+    prefix = f"{_url_digest(url)}."
+    for name in sorted(os.listdir(base_dir)):
+        if not name.startswith(prefix):
+            continue
+        if any(name.lower().endswith(suf) for suf in _TEMP_SUFFIXES):
+            continue
+        candidate = os.path.join(base_dir, name)
+        if os.path.isfile(candidate) and os.path.getsize(candidate) > 0:
+            return candidate
+    return None
 
 
 def _load_yt_dlp():
@@ -93,16 +121,18 @@ def resolve_input(input_arg: str, cache_dir: str = None) -> str:
         return input_arg
 
     url = input_arg.strip()
-    path = cache_path_for(url, cache_dir)
-    if os.path.isfile(path) and os.path.getsize(path) > 0:
-        print(f"[URL] Önbellekteki video kullanılıyor: {path}")
-        return path
+    base_dir = cache_dir or DEFAULT_CACHE_DIR
+    cached = _find_cached_file(url, base_dir)
+    if cached is not None:
+        print(f"[URL] Önbellekteki video kullanılıyor: {cached}")
+        return cached
 
     yt_dlp = _load_yt_dlp()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(base_dir, exist_ok=True)
+    outtmpl = os.path.join(base_dir, f"{_url_digest(url)}.%(ext)s")
     options = {
         "format": YTDLP_FORMAT,
-        "outtmpl": path,
+        "outtmpl": outtmpl,
         "noplaylist": True,
         # Sayfada birden çok gömülü video varsa yalnızca ilki alınır.
         "playlist_items": "1",
@@ -116,7 +146,8 @@ def resolve_input(input_arg: str, cache_dir: str = None) -> str:
     except yt_dlp.utils.DownloadError as exc:
         raise VideoUrlError(_download_error_message(exc)) from exc
 
-    if not os.path.isfile(path):
-        raise VideoUrlError(f"İndirme tamamlandı ama video dosyası bulunamadı: {path}")
-    print(f"[URL] Video önbelleğe kaydedildi: {path}")
-    return path
+    downloaded = _find_cached_file(url, base_dir)
+    if downloaded is None:
+        raise VideoUrlError(f"İndirme tamamlandı ama video dosyası bulunamadı: {outtmpl}")
+    print(f"[URL] Video önbelleğe kaydedildi: {downloaded}")
+    return downloaded

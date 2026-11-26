@@ -32,6 +32,7 @@ COPY --chown=analyzer:analyzer modules /app/modules
 COPY --chown=analyzer:analyzer utils /app/utils
 COPY --chown=analyzer:analyzer main.py /app/main.py
 COPY --chown=analyzer:analyzer models /app/models
+COPY --chown=analyzer:analyzer data/reference /app/data/reference
 
 RUN mkdir -p /app/data/jobs/_tmp /app/data/exports && chown -R analyzer:analyzer /app/data
 

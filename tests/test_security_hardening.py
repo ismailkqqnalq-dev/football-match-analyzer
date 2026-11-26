@@ -806,3 +806,12 @@ def test_job_queue_purges_expired_jobs_and_orphan_dirs(tmp_path):
     assert new_id in q._jobs and (tmp_path / new_id).exists()
     assert run_id in q._jobs and (tmp_path / run_id).exists()
     assert not orphan.exists() and other.exists()
+
+
+def test_dockerfile_copies_reference_xt_grid_and_api_allows_a2_artifacts():
+    from api.app import _is_allowed_artifact_name
+
+    dockerfile_text = (Path(config.BASE_DIR) / "Dockerfile").read_text(encoding="utf-8")
+    assert "data/reference" in dockerfile_text
+    assert _is_allowed_artifact_name("homography_log.csv") is True
+    assert _is_allowed_artifact_name("calibration_summary.json") is True

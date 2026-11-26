@@ -256,3 +256,21 @@ def test_field_mask_adapts_to_dark_and_pale_grass():
         hsv = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2HSV)
         assert _cv2.inRange(hsv, _GREEN_LO, _GREEN_HI).mean() == 0
         assert (field_mask(bgr) > 0).mean() > 0.7
+
+
+def test_prepare_blurs_each_orientation_bin_independently(pitch_img):
+    """Yön kutuları ayrı bulanıklaştırılmalı; kutu sınırında komşu kutudan sızma olmamalı."""
+    import cv2
+    from modules.pitch_line_refiner import _N_BINS, _STAGES_PX
+
+    prep = PitchLineRefiner().prepare(pitch_img)
+    assert prep is not None
+    hh = prep.h
+    sigma_px, cap_px = _STAGES_PX[1]
+    px_unit = pitch_img.shape[0] / 1080.0 * prep.scale
+    expected_bin1 = np.minimum(
+        cv2.GaussianBlur(prep.dt[hh:2 * hh], (0, 0), sigma_px * px_unit),
+        cap_px * px_unit,
+    )
+    assert prep.blurred[1].shape == (_N_BINS * hh, prep.w)
+    np.testing.assert_allclose(prep.blurred[1][hh:2 * hh], expected_bin1, atol=1e-5)
