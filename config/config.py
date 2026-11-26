@@ -619,6 +619,9 @@ BALL_AERIAL_DECEL_MIN_RATIO = 0.35
 # kadar süren ve bu mesafeden büyük sıçramayla girilen parça sahte top sayılıp atılır.
 BALL_OUTLIER_MAX_SEC = 1.0
 BALL_OUTLIER_MIN_JUMP_M = 8.0
+# Aynı takımın iki periyodu arasındaki en fazla bu kadar süren tek rakip periyodu pas
+# sırasındaki gürültü sayılır (0 = kapalı).
+PASS_SANDWICH_MAX_SEC = 0.6
 PASS_MIN_DURATION_SEC = 0.08
 PASS_MAX_GAP_SEC = 4.0
 PASS_MAX_SPEED_MPS = 42.0
