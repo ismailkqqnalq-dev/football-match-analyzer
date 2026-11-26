@@ -112,13 +112,36 @@ def pitch_line_samples(step: float = 0.5, with_tangents: bool = False):
     return (arr[:, :2], arr[:, 2:]) if with_tangents else arr[:, :2]
 
 
+_GREEN_LO = (30, 40, 30)
+_GREEN_HI = (90, 255, 255)
+
+
+def _green_hsv_range(hsv: np.ndarray) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """
+    Çim rengi aralığı. Varsayılan (30,40,30)-(90,255,255); karede gece gölgesi (koyu) ya
+    da soluk/kış çimi (düşük doygunluk) baskınsa doygunluk/parlaklık alt sınırları,
+    baskın ton aralık kenarındaysa ton sınırları kareye göre gevşetilir. Aralık yalnızca
+    genişler: normal çimde sonuç varsayılanla aynıdır.
+    """
+    h, sat, val = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    cand = (h >= 20) & (h <= 100) & (sat >= 15) & (val >= 15)
+    if cand.mean() < 0.15:  # karede çim baskın değil (yakın çekim vb.): varsayılan
+        return _GREEN_LO, _GREEN_HI
+    hue_peak = int(np.argmax(np.bincount(h[cand].ravel(), minlength=181)))
+    s_lo = int(min(_GREEN_LO[1], max(15, 0.4 * float(np.median(sat[cand])))))
+    v_lo = int(min(_GREEN_LO[2], max(15, 0.4 * float(np.median(val[cand])))))
+    h_lo = int(max(20, min(_GREEN_LO[0], hue_peak - 10)))
+    h_hi = int(min(100, max(_GREEN_HI[0], hue_peak + 10)))
+    return (h_lo, s_lo, v_lo), (h_hi, 255, 255)
+
+
 def field_mask(frame: np.ndarray) -> np.ndarray:
     """Oyun alanı maskesi: en büyük yeşil bölgenin dışbükey örtüsü (tribün/reklam dışarıda)."""
     H, W = frame.shape[:2]
     s = min(1.0, 180.0 / H)  # örtü kaba ölçekte bulunur, sonra büyütülür (hız)
     small = cv2.resize(frame, (max(1, int(W * s)), max(1, int(H * s))), interpolation=cv2.INTER_AREA)
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
-    green = cv2.inRange(hsv, (30, 40, 30), (90, 255, 255))
+    green = cv2.inRange(hsv, *_green_hsv_range(hsv))
     green = cv2.morphologyEx(green, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     green = cv2.morphologyEx(green, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
     out = np.zeros((H, W), np.uint8)
