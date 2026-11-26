@@ -93,6 +93,24 @@ def test_evaluate_possession_agreement_and_coverage():
     assert res["agreement"] == 0.5
 
 
+def test_evaluate_possession_uses_majority_overlap_within_each_second():
+    # Saniye 5: 0.8 sn Team A + 0.2 sn Team B -> çoğunluk Team A (sonraki kısa parça ezmemeli)
+    # Saniye 6: 0.2 sn Team A + 0.8 sn boş (kimsede değil) -> çoğunluk boş (sayılmamalı)
+    timeline = pd.DataFrame({
+        "timestamp_sec": [5.5, 6.5],
+        "smoothed_team": ["Team A", "Team A"],
+    })
+    gt_pos = pd.DataFrame({
+        "start_sec": [5.0, 5.8, 6.0, 6.2],
+        "end_sec": [5.8, 6.0, 6.2, 7.0],
+        "team": ["Team A", "Team B", "Team A", ""],
+    })
+    res = evaluate_possession(timeline, gt_pos)
+    assert res["gt_seconds"] == 1
+    assert res["covered_seconds"] == 1
+    assert res["agreement"] == 1.0
+
+
 def test_main_swaps_team_names_when_labeller_used_opposite_letters(tmp_path):
     summary = tmp_path / "s.json"
     summary.write_text(json.dumps(_summary([_ev("completed_pass", 100, "Team A")])), encoding="utf-8")

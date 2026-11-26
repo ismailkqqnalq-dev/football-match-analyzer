@@ -218,6 +218,7 @@ class PitchLineRefiner:
             sel = (b0 == b) | (b1 == b)
             nonline[ys[sel], xs[sel]] = 0
             dts.append(cv2.distanceTransform(nonline, cv2.DIST_L2, 5))
+        dt_stack = np.vstack(dts)
         px_unit = H / 1080.0 * s  # 1080p pikselinin iş ölçeğindeki karşılığı
         blurred, caps = [], []
         for i, (sigma, cap) in enumerate(_STAGES_PX):
@@ -227,12 +228,15 @@ class PitchLineRefiner:
                 dt_all = cv2.distanceTransform((mask == 0).astype(np.uint8), cv2.DIST_L2, 5)
                 blurred.append(np.minimum(cv2.GaussianBlur(dt_all, (0, 0), sigma * px_unit), c))
             else:
-                stack = np.vstack(dts)
-                f = cv2.GaussianBlur(stack, (0, 0), sigma * px_unit) if sigma > 0 else stack
+                # Her yön kutusu ayrı bulanıklaştırılır; alt-üst yapıştırılmış kutular arası sızma önlenir
+                if sigma > 0:
+                    f = np.vstack([cv2.GaussianBlur(d, (0, 0), sigma * px_unit) for d in dts])
+                else:
+                    f = dt_stack
                 blurred.append(np.minimum(f, c))
             caps.append(c)
         # Kutular alt alta tek görüntüde: örnekleme tek remap çağrısıyla yapılır (hız)
-        return _Prepared(np.vstack(dts), tuple(blurred), tuple(caps), s, small.shape[1], small.shape[0])
+        return _Prepared(dt_stack, tuple(blurred), tuple(caps), s, small.shape[1], small.shape[0])
 
     # ----------------------------------------------------------------
     def refine(

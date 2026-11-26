@@ -88,7 +88,7 @@ def test_default_cache_dir_is_under_temp():
 
 def test_url_is_downloaded_to_cache_with_expected_options(tmp_path, monkeypatch):
     def _write_file(options, urls):
-        with open(options["outtmpl"], "wb") as f:
+        with open(options["outtmpl"].replace("%(ext)s", "mp4"), "wb") as f:
             f.write(b"video")
 
     fake, calls = _fake_yt_dlp(_write_file)
@@ -102,6 +102,7 @@ def test_url_is_downloaded_to_cache_with_expected_options(tmp_path, monkeypatch)
     assert len(calls) == 1
     options, urls = calls[0]
     assert urls == [url]
+    assert "%(ext)s" in options["outtmpl"]
     assert options["noplaylist"] is True
     assert "height<=1080" in options["format"]
     assert "avc1" in options["format"]
@@ -119,7 +120,7 @@ def test_url_is_downloaded_to_cache_with_expected_options(tmp_path, monkeypatch)
 )
 def test_any_http_link_type_is_passed_to_yt_dlp(url, tmp_path, monkeypatch):
     def _write_file(options, urls):
-        with open(options["outtmpl"], "wb") as f:
+        with open(options["outtmpl"].replace("%(ext)s", "mp4"), "wb") as f:
             f.write(b"video")
 
     fake, calls = _fake_yt_dlp(_write_file)
@@ -131,6 +132,33 @@ def test_any_http_link_type_is_passed_to_yt_dlp(url, tmp_path, monkeypatch):
     options, urls = calls[0]
     assert urls == [url]
     assert options["playlist_items"] == "1"
+
+
+def test_non_mp4_fallback_extension_is_returned_and_cached(tmp_path, monkeypatch):
+    url = "https://cdn.ornek.com/videolar/mac.webm"
+    # Yarım kalmış .part dosyası önbellek isabeti sayılmamalı
+    part_file = cache_path_for(url, str(tmp_path), ext="webm.part")
+    with open(part_file, "wb") as f:
+        f.write(b"partial")
+
+    def _write_webm(options, urls):
+        with open(options["outtmpl"].replace("%(ext)s", "webm"), "wb") as f:
+            f.write(b"webm-video")
+
+    fake, calls = _fake_yt_dlp(_write_webm)
+    monkeypatch.setattr(url_input, "_load_yt_dlp", lambda: fake)
+
+    path = resolve_input(url, cache_dir=str(tmp_path))
+    assert path == cache_path_for(url, str(tmp_path), ext="webm")
+    assert os.path.isfile(path)
+    assert len(calls) == 1
+
+    # İkinci çağrıda .webm önbellekten dönmeli, yeniden indirilmemeli
+    def _must_not_load():
+        raise AssertionError("Önbellekteki .webm varken yeniden indirilmemeli")
+
+    monkeypatch.setattr(url_input, "_load_yt_dlp", _must_not_load)
+    assert resolve_input(url, cache_dir=str(tmp_path)) == path
 
 
 def test_cached_url_is_not_downloaded_again(tmp_path, monkeypatch):

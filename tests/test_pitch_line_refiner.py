@@ -233,3 +233,21 @@ def test_refine_rejects_table_whose_inliers_collapse_onto_one_line(monkeypatch):
 
     monkeypatch.setattr(config, "PITCH_LINE_REFINE_MIN_INLIER_SPREAD", 0.0)
     assert PitchLineRefiner().refine(img, cands).success  # reddeden yalnızca yayılım koruması
+
+
+def test_prepare_blurs_each_orientation_bin_independently(pitch_img):
+    """Yön kutuları ayrı bulanıklaştırılmalı; kutu sınırında komşu kutudan sızma olmamalı."""
+    import cv2
+    from modules.pitch_line_refiner import _N_BINS, _STAGES_PX
+
+    prep = PitchLineRefiner().prepare(pitch_img)
+    assert prep is not None
+    hh = prep.h
+    sigma_px, cap_px = _STAGES_PX[1]
+    px_unit = pitch_img.shape[0] / 1080.0 * prep.scale
+    expected_bin1 = np.minimum(
+        cv2.GaussianBlur(prep.dt[hh:2 * hh], (0, 0), sigma_px * px_unit),
+        cap_px * px_unit,
+    )
+    assert prep.blurred[1].shape == (_N_BINS * hh, prep.w)
+    np.testing.assert_allclose(prep.blurred[1][hh:2 * hh], expected_bin1, atol=1e-5)
