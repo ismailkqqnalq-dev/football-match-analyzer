@@ -390,6 +390,23 @@ def test_reused_track_id_takes_team_of_current_spell():
     assert passes["total_completed_passes"] == 1
 
 
+def test_ball_outlier_segment_rejected_but_real_flight_kept():
+    from modules.pitch_orientation import reject_ball_outlier_segments
+
+    fps = 50.0
+    # Top x=50'de; 0.4 sn boyunca dedektör 25 m ötedeki sahte noktaya (x=75) sıçrıyor; sonra geri.
+    xs = np.r_[np.full(50, 50.0), np.full(20, 75.0), np.full(50, 50.5)]
+    fids = np.arange(len(xs))
+    keep = reject_ball_outlier_segments(fids, xs, np.full(len(xs), 34.0), None, fps, max_speed=42.0)
+    assert keep[:50].all() and keep[70:].all()
+    assert not keep[50:70].any()
+
+    # Gerçek pas: top 20 m'yi 1 sn'de düzgünce gidiyor; hiçbir kare atılmamalı.
+    xs2 = np.r_[np.full(30, 40.0), np.linspace(40.0, 60.0, 50), np.full(30, 60.0)]
+    keep2 = reject_ball_outlier_segments(np.arange(len(xs2)), xs2, np.full(len(xs2), 34.0), None, fps, 42.0)
+    assert keep2.all()
+
+
 def test_off_pitch_ball_detection_ignored_for_possession():
     # Kale ağındaki yedek top (saha dışı, on_pitch=False) sahiplik zaman çizelgesine girmemeli.
     rows = []

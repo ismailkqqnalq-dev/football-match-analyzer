@@ -293,6 +293,83 @@ def has_discontinuity_between(
     return False
 
 
+def reject_ball_outlier_segments(
+    ball_fids: np.ndarray,
+    ball_xs: np.ndarray,
+    ball_ys: np.ndarray,
+    ball_is_pred: Optional[np.ndarray],
+    fps: float,
+    max_speed: float,
+    max_outlier_sec: float = 1.0,
+    min_jump: float = 8.0,
+) -> np.ndarray:
+    """
+    Top dedektörü iki nesne (gerçek top ve sahte bir nokta) arasında gidip gelebiliyor.
+    Gerçek tespitler, ardışık adımın hem max_speed'i hem min_jump mesafesini aşmadığı
+    parçalara ayrılır (küçük top-ayak titremeleri parça kesmez). İki komşu parça
+    arasında fiziksel olarak geçilebiliyorsa aradaki kısa (<= max_outlier_sec) parça sahte
+    sayılır. Atılan ya da imkânsız bir sıçramayı örten tahmin/ara değer kareleri de atılır.
+    Döndürür: tutulacak satırlar için bool maske.
+    """
+    n = len(ball_fids)
+    keep = np.ones(n, dtype=bool)
+    if n < 3:
+        return keep
+    fps_safe = float(fps) if fps and fps > 0 else 25.0
+    pred = (
+        np.asarray(ball_is_pred, dtype=bool)
+        if ball_is_pred is not None and len(ball_is_pred) == n
+        else np.zeros(n, dtype=bool)
+    )
+    real = np.flatnonzero(~pred)
+    if len(real) < 3:
+        return keep
+
+    def speed(i: int, j: int) -> float:
+        dt = max((ball_fids[j] - ball_fids[i]) / fps_safe, 1.0 / fps_safe)
+        return math.hypot(ball_xs[j] - ball_xs[i], ball_ys[j] - ball_ys[i]) / dt
+
+    segs: List[List[int]] = [[int(real[0]), int(real[0])]]
+    for a, b in zip(real[:-1], real[1:]):
+        a, b = int(a), int(b)
+        if speed(a, b) > max_speed and math.hypot(ball_xs[b] - ball_xs[a], ball_ys[b] - ball_ys[a]) > min_jump:
+            segs.append([int(b), int(b)])
+        else:
+            segs[-1][1] = int(b)
+
+    dropped: List[Tuple[int, int]] = []
+    changed = True
+    while changed and len(segs) >= 3:
+        changed = False
+        k = 1
+        while k < len(segs) - 1:
+            s, e = segs[k]
+            short = (ball_fids[e] - ball_fids[s]) / fps_safe <= max_outlier_sec
+            if short and speed(segs[k - 1][1], segs[k + 1][0]) <= max_speed:
+                dropped.append((s, e))
+                segs[k - 1][1] = segs[k + 1][1]
+                del segs[k:k + 2]
+                changed = True
+            else:
+                k += 1
+
+    for s, e in dropped:
+        keep[s:e + 1] &= pred[s:e + 1]  # parçanın gerçek tespitleri
+    kept_real = np.flatnonzero(~pred & keep)
+    if len(kept_real) == 0:
+        return keep
+    # Tahmin karelerini en yakın tutulan gerçek komşularına göre denetle
+    for p in np.flatnonzero(pred):
+        pos = int(np.searchsorted(kept_real, p))
+        if pos == 0 or pos >= len(kept_real):
+            continue
+        a, b = int(kept_real[pos - 1]), int(kept_real[pos])
+        between_dropped = any(s > a and e < b for s, e in dropped)
+        if between_dropped or speed(a, b) > max_speed:
+            keep[p] = False
+    return keep
+
+
 def smooth_possession_codes(
     raw_tid_codes: np.ndarray,
     raw_team_codes: np.ndarray,
