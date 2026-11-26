@@ -369,6 +369,27 @@ def test_pass_detected_when_kalman_froze_during_flight():
     assert passes["events"][0]["to_track_id"] == "2"
 
 
+def test_reused_track_id_takes_team_of_current_spell():
+    # Takipçi 1 numaralı kimliği önce uzun süre Team B'li bir oyuncuya, sonra Team A'lı
+    # bir oyuncuya vermiş. İzin ömür boyu çoğunluğu B; ama top A'lı oyuncudayken
+    # A takım arkadaşına giden pas top kaybı değil, tamamlanan pas sayılmalı.
+    rows = []
+    for f in range(200):  # kimlik 1 = Team B oyuncusu, top uzakta
+        rows.append(_row(f, 1, "player", "Team B", 10.0, 10.0))
+        rows.append(_row(f, "ball", "ball", None, 80.0, 60.0))
+    for f in range(200, 260):  # kimlik 1 artık Team A oyuncusu, topa sahip, sonra pas
+        bx = 40.0 if f < 220 else (40.0 + (f - 219) * 0.5 if f < 240 else 50.0)
+        rows.append(_row(f, "ball", "ball", None, bx, 34.0))
+        rows.append(_row(f, 1, "player", "Team A", 40.0, 34.0))
+        rows.append(_row(f, 2, "player", "Team A", 50.0, 34.0))
+
+    ma = MatchAnalyzer(pd.DataFrame(rows), fps=25.0)
+    tl, _ = ma.compute_possession()
+    passes = ma.detect_passes(tl)
+    assert passes["total_turnovers"] == 0
+    assert passes["total_completed_passes"] == 1
+
+
 def test_off_pitch_ball_detection_ignored_for_possession():
     # Kale ağındaki yedek top (saha dışı, on_pitch=False) sahiplik zaman çizelgesine girmemeli.
     rows = []

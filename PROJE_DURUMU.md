@@ -47,19 +47,27 @@ tarafından, sistem çıktısına bakılmadan, saniyede 2 kare (pas anlarında 0
 çıkarıldı. Kaba bir göstergedir. İlk 120 sn sorunu bulmak ve düzeltmek için kullanıldı;
 120-240 sn düzeltme sırasında hiç bakılmamış **kontrol aralığıdır** (dürüst sonuç budur).
 
-| Ölçüt (±1 sn) | 0-120 sn: önce → sonra | 120-240 sn kontrol: önce → sonra |
+| Ölçüt (±1 sn) | 0-120 sn: ilk → #15 → #16 | 120-240 sn kontrol: ilk → #15 → #16 |
 |---|---|---|
-| Pas | F1 0,28 → 0,53 (gerçek 22; yakalanan 4 → 9) | F1 0,30 → 0,36 (gerçek 34; yakalanan 6 → 8) |
-| Pas kesinliği | %57 → %75 | %100 → %73 |
-| Top kaybı | F1 0,14 → 0,12 (gerçek 5) | F1 0 → 0 (gerçek 3, sistem 10) |
-| Sahiplik uyumu | %62 → %62 | %72 → %72 |
+| Pas F1 | 0,28 → 0,53 → 0,56 (gerçek 22; yakalanan 4 → 9 → 11) | 0,30 → 0,36 → 0,39 (gerçek 34; yakalanan 6 → 8 → 9) |
+| Top kaybı F1 | 0,14 → 0,12 → 0,17 (gerçek 5) | 0 → 0 → 0,17 (gerçek 3) |
+| Sahiplik uyumu | %62 → %62 → %81 | %72 → %72 → %81 |
 
-Bulunan ve düzeltilen hata: top pas sırasında görünmez olunca Kalman tahmini pasörün
-yanında donuyor, top yeniden görününce bu "imkânsız sıçrama" sayılıp pas eleniyordu;
-ayrıca top satırlarının %21'i kale ağının arkasındaki iki sabit noktada sahte tespitti.
-Düzeltme gerçek ama kontrol aralığında mütevazı: sistem pasların hâlâ ~3/4'ünü kaçırıyor
-ve top kaybını fazla yazıyor. **Pas ve top kaybı sayıları güvenilir değil**; top
-sahipliği kabaca yön gösteriyor. Ölçüm README'deki komutla tekrarlanabilir.
+Bulunan ve düzeltilen hatalar:
+- **#15:** Top pas sırasında görünmez olunca Kalman tahmini pasörün yanında donuyordu;
+  top yeniden görününce bu "imkânsız sıçrama" sayılıp pas eleniyordu. Ayrıca top
+  satırlarının %21'i kale ağının arkasındaki iki sabit noktada sahte tespitti.
+- **#16:** Takipçi aynı kimliği zamanla farklı oyunculara veriyor (ör. bir kimlik 10
+  dakikanın yarısında A, yarısında B). Sahiplik takımı izin ömür boyu çoğunluğundan
+  alındığı için City pasları "Tottenham'a top kaybı" sayılıyordu; artık her kontrol
+  periyodunun kendi karelerinin çoğunluk takımı kullanılıyor. #16'da kontrol aralığının
+  yalnız sayısal özetine bakıldı (kaçırma sınıfları), düzeltme 0-120 sn'den türetildi.
+
+Top sahipliği artık iki aralıkta da ~%81 uyumlu. Pas tespiti hâlâ zayıf: kontrol
+aralığında gerçek pasların ~3/4'ü kaçırılıyor. Kalan kaçırmalar: top hızının "çok hızlı"
+eşiğini aşması (top izinin yine zıplaması), süreksizlik ve pas anında hiç kontrol
+periyodu olmaması (top görünmüyor). **Pas ve top kaybı sayıları güvenilir değil.**
+Ölçüm README'deki komutla tekrarlanabilir.
 
 ## Dar C: Takım metrikleri
 Takım biçimi metrikleri artık bir **kapsama etiketi** taşıyor: o takımdan karede
@@ -70,9 +78,10 @@ bunu açıkça söyler. Gerçek veride geniş kamera "high" (ortanca 11 oyuncu),
 
 ## Sırada ne var
 1. TV için daha çok eğitim verisi ve model ince ayarı (A2'nin TV hedefi için).
-2. Pas/top kaybı tespiti: kalan kaçırmaların sebebi incelenmedi (aday: sahiplik
-   ataması topa en yakın oyuncuya 2,5 m eşiğiyle yapılıyor, takip kimlikleri 1,5 sn'de
-   değişiyor). Sonra Faz V'yi insan etiketiyle ve bir TV klibinde tekrarlamak.
+2. Pas tespiti: kalan "çok hızlı" elemelerinde top izinin neden zıpladığını incelemek
+   (kenar çizgisi dışındaki sabit sahte noktalar, oyuncu ayağına yakın yanlış tespitler);
+   ML analizöründe (`ml_analyzer.py`) aynı saha dışı top ve periyot takımı düzeltmeleri
+   yok. Sonra Faz V'yi insan etiketiyle ve bir TV klibinde tekrarlamak.
 3. Takip iyileştirmesi: geniş kamerada 10 dakikada 439 iz, ortanca iz süresi 1,5 sn;
    oyuncu kimliği (Faz B: takım + forma numarası) bunun üzerine kurulacak.
 4. Ofsayt sonrası iptal edilen şutların istatistikten düşülmesi (tasarımı hazır).
