@@ -429,6 +429,28 @@ def test_short_opponent_spell_inside_pass_is_not_two_turnovers():
     assert passes["total_turnovers"] == 0
     assert passes["total_completed_passes"] == 1
 
+    ev = MLAnalyzer(pd.DataFrame(rows), fps=fps).extract_proxy_pass_events()
+    assert len(ev) == 1
+    assert ev.iloc[0]["from_track_id"] == "1" and ev.iloc[0]["to_track_id"] == "2"
+    assert ev.iloc[0]["pass_outcome"] == 1
+
+
+def test_ml_off_pitch_ball_detection_not_a_turnover():
+    # Kale ağındaki yedek top B oyuncusunun yanında (saha dışı); gerçek top A oyuncusunda.
+    # ML analizörü bunu B'den A'ya top kaybı saymamalı.
+    rows = []
+    for f in range(30):
+        ball = _row(f, "ball", "ball", None, 108.0, 34.6)
+        ball["on_pitch"] = False
+        rows.append(ball)
+    for f in range(45, 75):
+        rows.append(_row(f, "ball", "ball", None, 95.0, 34.0))
+    for f in range(75):
+        rows.append(_row(f, 1, "player", "Team B", 106.0, 34.6))
+        rows.append(_row(f, 2, "player", "Team A", 95.5, 34.0))
+
+    assert len(MLAnalyzer(pd.DataFrame(rows), fps=25.0).extract_proxy_pass_events()) == 0
+
 
 def test_off_pitch_ball_detection_ignored_for_possession():
     # Kale ağındaki yedek top (saha dışı, on_pitch=False) sahiplik zaman çizelgesine girmemeli.

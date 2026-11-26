@@ -808,8 +808,11 @@ class MatchAnalyzer:
             for i in range(1, len(spells) - 1):
                 prev, cur, nxt = kept[-1], spells[i], spells[i + 1]
                 short = (cur["end_frame"] - cur["start_frame"]) / self.fps <= sandwich_max
+                # Ancak tek bir pasın içindeyse: önceki ile sonraki periyot arası bir pas süresini aşmamalı
+                within_pass = (nxt["start_frame"] - prev["end_frame"]) / self.fps <= config.PASS_MAX_GAP_SEC
                 if (
                     short
+                    and within_pass
                     and prev["team"] in ("Team A", "Team B")
                     and prev["team"] == nxt["team"]
                     and cur["team"] != prev["team"]
