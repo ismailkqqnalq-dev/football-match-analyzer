@@ -42,21 +42,24 @@ Araçlar hazır: tarayıcıda çalışan etiketleme aracı (`utils/label_events.
 karşılaştırma aracı (`utils/validate_events.py`, ±1 sn tolerans; kesinlik,
 duyarlılık, F1 ve saniye bazında sahiplik uyumu). Kullanımı README'de.
 
-**İlk ölçüm (geniş/taktik kamera, ilk 120 sn):** Etiketler insan değil Claude
+**Ölçüm (geniş/taktik kamera, ilk 4 dakika):** Etiketler insan değil Claude
 tarafından, sistem çıktısına bakılmadan, saniyede 2 kare (pas anlarında 0,1 sn) izlenerek
-çıkarıldı: 22 pas, 5 top kaybı, 115 sn sahiplik. Kaba bir göstergedir.
+çıkarıldı. Kaba bir göstergedir. İlk 120 sn sorunu bulmak ve düzeltmek için kullanıldı;
+120-240 sn düzeltme sırasında hiç bakılmamış **kontrol aralığıdır** (dürüst sonuç budur).
 
-| Ölçüt | Sonuç |
-|---|---|
-| Pas (±1 sn) | sistem 7, gerçek 22, eşleşen 4 → kesinlik %57, duyarlılık %18, F1 0,28 |
-| Top kaybı (±1 sn) | sistem 9, gerçek 5, eşleşen 1 → kesinlik %11, duyarlılık %20, F1 0,14 |
-| Sahiplik (saniye bazında) | sistemin takım verdiği saniyelerde uyum %62; etiketli saniyelerin %70'inde sistem bir takım veriyor |
+| Ölçüt (±1 sn) | 0-120 sn: önce → sonra | 120-240 sn kontrol: önce → sonra |
+|---|---|---|
+| Pas | F1 0,28 → 0,53 (gerçek 22; yakalanan 4 → 9) | F1 0,30 → 0,36 (gerçek 34; yakalanan 6 → 8) |
+| Pas kesinliği | %57 → %75 | %100 → %73 |
+| Top kaybı | F1 0,14 → 0,12 (gerçek 5) | F1 0 → 0 (gerçek 3, sistem 10) |
+| Sahiplik uyumu | %62 → %62 | %72 → %72 |
 
-Toleransı 2 sn'ye çıkarmak sonucu az değiştiriyor (pas F1 0,34), yani sorun zamanlama
-değil: sistem pasların çoğunu kaçırıyor ve fazladan top kaybı yazıyor. Geniş kamerada
-top 2-3 piksel; olası sebep (henüz incelenmedi) top tespiti kopunca pas zincirinin
-kırılıp sahipliğin el değiştirmiş sayılması. **Pas ve top kaybı sayıları şu an güvenilir değil**; top sahipliği kabaca
-yön gösteriyor. Ölçüm README'deki komutla tekrarlanabilir.
+Bulunan ve düzeltilen hata: top pas sırasında görünmez olunca Kalman tahmini pasörün
+yanında donuyor, top yeniden görününce bu "imkânsız sıçrama" sayılıp pas eleniyordu;
+ayrıca top satırlarının %21'i kale ağının arkasındaki iki sabit noktada sahte tespitti.
+Düzeltme gerçek ama kontrol aralığında mütevazı: sistem pasların hâlâ ~3/4'ünü kaçırıyor
+ve top kaybını fazla yazıyor. **Pas ve top kaybı sayıları güvenilir değil**; top
+sahipliği kabaca yön gösteriyor. Ölçüm README'deki komutla tekrarlanabilir.
 
 ## Dar C: Takım metrikleri
 Takım biçimi metrikleri artık bir **kapsama etiketi** taşıyor: o takımdan karede
@@ -67,9 +70,9 @@ bunu açıkça söyler. Gerçek veride geniş kamera "high" (ortanca 11 oyuncu),
 
 ## Sırada ne var
 1. TV için daha çok eğitim verisi ve model ince ayarı (A2'nin TV hedefi için).
-2. Pas/top kaybı tespiti: geniş kamerada top takibini güçlendirmek (kısa kopmalarda
-   topu ara değerle sürdürmek), sonra Faz V'yi insan etiketiyle ve bir TV klibinde
-   tekrarlamak.
+2. Pas/top kaybı tespiti: kalan kaçırmaların sebebi incelenmedi (aday: sahiplik
+   ataması topa en yakın oyuncuya 2,5 m eşiğiyle yapılıyor, takip kimlikleri 1,5 sn'de
+   değişiyor). Sonra Faz V'yi insan etiketiyle ve bir TV klibinde tekrarlamak.
 3. Takip iyileştirmesi: geniş kamerada 10 dakikada 439 iz, ortanca iz süresi 1,5 sn;
    oyuncu kimliği (Faz B: takım + forma numarası) bunun üzerine kurulacak.
 4. Ofsayt sonrası iptal edilen şutların istatistikten düşülmesi (tasarımı hazır).

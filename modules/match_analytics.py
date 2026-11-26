@@ -456,6 +456,10 @@ class MatchAnalyzer:
         xy_notna = (self.df[x_col].notna() & self.df[y_col].notna()).to_numpy(dtype=bool)
 
         b_mask = (cls_s == config.BALL_CLASS_NAME).fillna(False).to_numpy(dtype=bool) & xy_notna & f_notna
+        # Saha dışındaki "top" tespitleri (kale ağındaki yedek top, top toplayıcı vb.) sahiplik
+        # için anlamsız; tutulursa top izi gerçek topla bu nokta arasında zıplayıp pasları bozar.
+        if self.is_calibrated and "on_pitch" in self.df.columns:
+            b_mask &= _bool_mask(self.df["on_pitch"], na_value=True)
         b_idx = np.flatnonzero(b_mask)
 
         if len(b_idx) == 0:
