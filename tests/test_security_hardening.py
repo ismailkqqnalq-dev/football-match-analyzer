@@ -772,3 +772,12 @@ def test_train_pitch_keypoints_env_only_secret_and_temp_path_hygiene(monkeypatch
     assert runs_dir.is_relative_to(root)
     assert not dataset_dir.is_relative_to(repo_root)
     assert not runs_dir.is_relative_to(repo_root)
+
+
+def test_dockerfile_copies_reference_xt_grid_and_api_allows_a2_artifacts():
+    from api.app import _is_allowed_artifact_name
+
+    dockerfile_text = (Path(config.BASE_DIR) / "Dockerfile").read_text(encoding="utf-8")
+    assert "data/reference" in dockerfile_text
+    assert _is_allowed_artifact_name("homography_log.csv") is True
+    assert _is_allowed_artifact_name("calibration_summary.json") is True

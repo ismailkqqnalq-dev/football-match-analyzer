@@ -122,12 +122,24 @@ def evaluate_possession(timeline: pd.DataFrame, gt_pos: pd.DataFrame) -> Dict[st
     tl["sec"] = np.floor(tl.timestamp_sec.astype(float)).astype(int)
     sys_team = tl.groupby("sec").smoothed_team.agg(lambda x: x.value_counts().idxmax())
 
-    gt_sec: Dict[int, str] = {}
+    sec_durations: Dict[int, Dict[Optional[str], float]] = {}
     for row in gt_pos.itertuples():
-        if pd.isna(row.team) or str(row.team).strip() == "":
+        start = float(row.start_sec)
+        end = float(row.end_sec)
+        if not (np.isfinite(start) and np.isfinite(end)) or end <= start:
             continue
-        for sec in range(int(np.floor(row.start_sec)), int(np.ceil(row.end_sec))):
-            gt_sec[sec] = str(row.team)
+        team_val = None if (pd.isna(row.team) or str(row.team).strip() == "") else str(row.team).strip()
+        for sec in range(int(np.floor(start)), int(np.ceil(end))):
+            overlap = min(end, float(sec + 1)) - max(start, float(sec))
+            if overlap > 0.0:
+                bucket = sec_durations.setdefault(sec, {})
+                bucket[team_val] = bucket.get(team_val, 0.0) + overlap
+
+    gt_sec: Dict[int, str] = {}
+    for sec, bucket in sec_durations.items():
+        best_team = max(bucket.items(), key=lambda kv: kv[1])[0]
+        if best_team is not None:
+            gt_sec[sec] = best_team
 
     both = [s for s in gt_sec if s in sys_team.index]
     agree = sum(1 for s in both if str(sys_team[s]) == gt_sec[s])

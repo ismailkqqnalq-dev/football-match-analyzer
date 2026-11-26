@@ -55,6 +55,8 @@ _ALLOWED_TOP_LEVEL_ARTIFACTS = {
     "player_distance_summary.csv",
     "tracking_data.csv",
     "tracking_data.db",
+    "homography_log.csv",
+    "calibration_summary.json",
 }
 _ALLOWED_ML_ARTIFACTS = {
     "ml_analysis_summary.json",
