@@ -435,6 +435,25 @@ def smooth_possession_codes(
                 sm_tids[starts[r_i]:ends[r_i] + 1] = -1
                 sm_teams[starts[r_i]:ends[r_i] + 1] = -1
 
+    # Takipçi aynı kimliği zamanla farklı oyunculara verebiliyor; izin tüm ömrü boyunca
+    # çoğunluk takımı o anki oyuncuyu temsil etmeyebilir. Her kontrol periyodunun takımı,
+    # periyot içindeki karelerin çoğunluk takımıdır (yoksa önceki değer korunur).
+    if not preserve_frame_team and n > 0:
+        change = np.empty(n, dtype=bool)
+        change[0] = True
+        change[1:] = sm_tids[1:] != sm_tids[:-1]
+        starts = np.flatnonzero(change)
+        ends = np.r_[starts[1:], n]
+        for s, e in zip(starts, ends):
+            tc = int(sm_tids[s])
+            if tc < 0:
+                continue
+            seg_tid = raw_tid_codes[s:e]
+            seg_team = raw_team_codes[s:e]
+            votes = seg_team[(seg_tid == tc) & (seg_team >= 0)]
+            if len(votes) > 0:
+                sm_teams[s:e] = int(np.bincount(votes).argmax())
+
     return sm_tids, sm_teams
 
 
