@@ -774,6 +774,40 @@ def test_train_pitch_keypoints_env_only_secret_and_temp_path_hygiene(monkeypatch
     assert not runs_dir.is_relative_to(repo_root)
 
 
+def test_job_queue_purges_expired_jobs_and_orphan_dirs(tmp_path):
+    import os as _os
+    import time as _time
+    import uuid as _uuid
+
+    from api.app import BoundedJobQueue
+
+    q = BoundedJobQueue(jobs_dir=tmp_path, executor=lambda *a: None, job_ttl_sec=60)
+    old_id, new_id, run_id = (str(_uuid.uuid4()) for _ in range(3))
+    now = _time.time()
+    for jid, status, done in (
+        (old_id, "completed", now - 120),
+        (new_id, "failed", now - 10),
+        (run_id, "running", None),
+    ):
+        (tmp_path / jid / "exports").mkdir(parents=True)
+        q._jobs[jid] = {"job_id": jid, "status": status, "completed_at": done, "_export_dir": tmp_path / jid / "exports"}
+
+    # Önceki çalıştırmadan kalan eski klasör + UUID olmayan klasör (dokunulmamalı)
+    orphan = tmp_path / str(_uuid.uuid4())
+    orphan.mkdir()
+    _os.utime(orphan, (now - 300, now - 300))
+    other = tmp_path / "keep_me"
+    other.mkdir()
+    _os.utime(other, (now - 300, now - 300))
+
+    removed = q.purge_expired(now=now)
+    assert set(removed) == {old_id, orphan.name}
+    assert old_id not in q._jobs and not (tmp_path / old_id).exists()
+    assert new_id in q._jobs and (tmp_path / new_id).exists()
+    assert run_id in q._jobs and (tmp_path / run_id).exists()
+    assert not orphan.exists() and other.exists()
+
+
 def test_dockerfile_copies_reference_xt_grid_and_api_allows_a2_artifacts():
     from api.app import _is_allowed_artifact_name
 

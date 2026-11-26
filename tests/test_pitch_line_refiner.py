@@ -235,6 +235,29 @@ def test_refine_rejects_table_whose_inliers_collapse_onto_one_line(monkeypatch):
     assert PitchLineRefiner().refine(img, cands).success  # reddeden yalnızca yayılım koruması
 
 
+def test_field_mask_adapts_to_dark_and_pale_grass():
+    import cv2 as _cv2
+    import numpy as _np
+
+    from modules.pitch_line_refiner import _GREEN_HI, _GREEN_LO, _green_hsv_range, field_mask
+
+    def frame_hsv(h, s, v):
+        hsv = _np.zeros((180, 320, 3), _np.uint8)
+        hsv[30:, :] = (h, s, v)  # üstte koyu tribün şeridi, altta çim
+        return _cv2.cvtColor(hsv, _cv2.COLOR_HSV2BGR)
+
+    # Normal çim: varsayılan aralık aynen kalır
+    normal = _cv2.cvtColor(frame_hsv(55, 140, 130), _cv2.COLOR_BGR2HSV)
+    assert _green_hsv_range(normal) == (_GREEN_LO, _GREEN_HI)
+
+    # Gece gölgesi (V=24) ve soluk kış çimi (S=28): sabit aralık hiçbir şey bulamazdı
+    for h, s, v in ((55, 140, 24), (50, 28, 150)):
+        bgr = frame_hsv(h, s, v)
+        hsv = _cv2.cvtColor(bgr, _cv2.COLOR_BGR2HSV)
+        assert _cv2.inRange(hsv, _GREEN_LO, _GREEN_HI).mean() == 0
+        assert (field_mask(bgr) > 0).mean() > 0.7
+
+
 def test_prepare_blurs_each_orientation_bin_independently(pitch_img):
     """Yön kutuları ayrı bulanıklaştırılmalı; kutu sınırında komşu kutudan sızma olmamalı."""
     import cv2

@@ -41,7 +41,8 @@ from modules.pitch_orientation import (
     compute_ball_kinematic_filter,
     compute_pixel_scale_px_per_m,
     has_discontinuity_between,
-    reject_ball_outlier_segments,
+    filter_ball_outliers,
+    sandwich_spell_keep_indices,
     resolve_goalkeeper_teams,
     smooth_possession_codes,
 )
@@ -509,12 +510,8 @@ class MatchAnalyzer:
 
         bounds = self._compute_bounds()
         # Dedektörün sahte bir noktaya kısa süreli sıçramalarını ve bunları örten ara değerleri at
-        out_scale = 1.0 if self.is_calibrated else compute_pixel_scale_px_per_m(bounds)
-        out_keep = reject_ball_outlier_segments(
-            ball_fids, ball_xs, ball_ys, ball_is_pred, self.fps,
-            max_speed=float(getattr(config, "PASS_MAX_SPEED_MPS", 42.0)) * out_scale,
-            max_outlier_sec=float(getattr(config, "BALL_OUTLIER_MAX_SEC", 1.0)),
-            min_jump=float(getattr(config, "BALL_OUTLIER_MIN_JUMP_M", 8.0)) * out_scale,
+        out_keep = filter_ball_outliers(
+            ball_fids, ball_xs, ball_ys, ball_is_pred, self.fps, self.is_calibrated, bounds
         )
         ball_fids = ball_fids[out_keep]
         ball_xs = ball_xs[out_keep]
@@ -799,28 +796,15 @@ class MatchAnalyzer:
                 "end_y": float(c_by[en_i]),
             })
 
-        # Aynı takımın iki periyodu arasına sıkışmış kısa tek rakip periyodu: pas sırasında
-        # topun rakibin yanından geçmesi / yanlış takım ataması. Atlanır; aksi halde bir
-        # pas "kayıp + geri kazanım" diye iki sahte top kaybına dönüşür.
-        sandwich_max = float(getattr(config, "PASS_SANDWICH_MAX_SEC", 0.6))
-        if sandwich_max > 0 and len(spells) >= 3:
-            kept = [spells[0]]
-            for i in range(1, len(spells) - 1):
-                prev, cur, nxt = kept[-1], spells[i], spells[i + 1]
-                short = (cur["end_frame"] - cur["start_frame"]) / self.fps <= sandwich_max
-                # Ancak tek bir pasın içindeyse: önceki ile sonraki periyot arası bir pas süresini aşmamalı
-                within_pass = (nxt["start_frame"] - prev["end_frame"]) / self.fps <= config.PASS_MAX_GAP_SEC
-                if (
-                    short
-                    and within_pass
-                    and prev["team"] in ("Team A", "Team B")
-                    and prev["team"] == nxt["team"]
-                    and cur["team"] != prev["team"]
-                ):
-                    continue
-                kept.append(cur)
-            kept.append(spells[-1])
-            spells = kept
+        # Aynı takımın iki periyodu arasına sıkışmış kısa tek rakip periyodu atlanır
+        keep_idx = sandwich_spell_keep_indices(
+            [sp["start_frame"] for sp in spells],
+            [sp["end_frame"] for sp in spells],
+            [sp["team"] for sp in spells],
+            [sp["team"] for sp in spells],
+            self.fps,
+        )
+        spells = [spells[k] for k in keep_idx]
 
         min_move = (
             float(config.PASS_MIN_BALL_MOVE_M)

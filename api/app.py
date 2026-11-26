@@ -163,8 +163,10 @@ class BoundedJobQueue:
         max_queued_jobs: int = 16,
         max_workers: int = 1,
         executor: Optional[Callable[[Path, Path, str, int], None]] = None,
+        job_ttl_sec: float = 24 * 3600,
     ):
         self.jobs_dir = Path(jobs_dir).resolve()
+        self.job_ttl_sec = max(0.0, float(job_ttl_sec))
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
         self.max_queued_jobs = max(1, int(max_queued_jobs))
         self.max_workers = max(1, int(max_workers))
@@ -192,6 +194,7 @@ class BoundedJobQueue:
                 t.start()
                 self._workers.append(t)
             self._started = True
+        self.purge_expired()
 
     def shutdown(self, timeout_sec: float = 2.0) -> None:
         with self._lock:
@@ -249,6 +252,47 @@ class BoundedJobQueue:
             finally:
                 self._queue.task_done()
 
+    def purge_expired(self, now: Optional[float] = None) -> List[str]:
+        """
+        Süresi (job_ttl_sec) dolmuş biten işlerin kaydını ve iş klasörünü siler.
+        Bellekte kaydı olmayan (ör. önceki çalıştırmadan kalan) eski UUID klasörleri de
+        silinir. Kuyrukta bekleyen veya çalışan işlere dokunulmaz.
+        """
+        if self.job_ttl_sec <= 0:
+            return []
+        now = time.time() if now is None else float(now)
+        cutoff = now - self.job_ttl_sec
+        with self._lock:
+            expired = [
+                jid for jid, rec in self._jobs.items()
+                if rec["status"] in ("completed", "failed")
+                and rec.get("completed_at") is not None
+                and rec["completed_at"] < cutoff
+            ]
+            for jid in expired:
+                self._jobs.pop(jid, None)
+            known = set(self._jobs)
+
+        removed = list(expired)
+        for jid in expired:
+            shutil.rmtree(self.jobs_dir / jid, ignore_errors=True)
+        try:
+            entries = list(self.jobs_dir.iterdir())
+        except OSError:
+            entries = []
+        for entry in entries:
+            if entry.name in known or entry.name in removed or not entry.is_dir():
+                continue
+            try:
+                uuid.UUID(entry.name)
+                if entry.stat().st_mtime >= cutoff:
+                    continue
+            except (ValueError, OSError):
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed.append(entry.name)
+        return removed
+
     def enqueue(
         self,
         job_id: str,
@@ -260,6 +304,7 @@ class BoundedJobQueue:
     ) -> Dict[str, Any]:
         if not self._started:
             self.start()
+        self.purge_expired()
 
         record = {
             "job_id": job_id,
@@ -342,6 +387,7 @@ def create_app(
     max_queued_jobs: Optional[int] = None,
     max_workers: Optional[int] = None,
     job_executor: Optional[Callable[[Path, Path, str, int], None]] = None,
+    job_ttl_seconds: Optional[float] = None,
 ) -> FastAPI:
     """Güvenlik sertleştirmeli FastAPI uygulamasını yapılandırır ve döndürür."""
     resolved_jobs_dir = Path(jobs_dir if jobs_dir is not None else config.API_JOBS_DIR).resolve()
@@ -385,6 +431,11 @@ def create_app(
             max_workers if max_workers is not None else config.API_MAX_CONCURRENT_GPU_JOBS
         ),
         executor=job_executor,
+        job_ttl_sec=float(
+            job_ttl_seconds
+            if job_ttl_seconds is not None
+            else getattr(config, "API_JOB_TTL_SECONDS", 24 * 3600)
+        ),
     )
 
     @asynccontextmanager

@@ -692,6 +692,8 @@ API_MAX_QUEUED_JOBS = 16
 API_RATE_LIMIT_REQUESTS_PER_MIN = 30
 API_UPLOAD_RATE_LIMIT_PER_MIN = 5
 API_JWT_TTL_SECONDS = 3600
+# Biten işlerin kaydı ve data/jobs/<uuid> klasörü bu süre sonunda silinir (0 = silme)
+API_JOB_TTL_SECONDS = 24 * 3600
 API_ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.environ.get(

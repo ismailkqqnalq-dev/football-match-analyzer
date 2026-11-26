@@ -77,11 +77,11 @@ from modules.analytics_common import (
 )
 from modules.pitch_orientation import (
     compute_ball_kinematic_filter,
-    compute_pixel_scale_px_per_m,
+    filter_ball_outliers,
     has_discontinuity_between,
     lookup_attack_directions,
-    reject_ball_outlier_segments,
     resolve_goalkeeper_teams,
+    sandwich_spell_keep_indices,
     smooth_possession_codes,
 )
 
@@ -1352,12 +1352,8 @@ class MLAnalyzer:
         ball_is_pred = b_pred[b_first]
 
         # Dedektörün sahte bir noktaya kısa süreli sıçramalarını ve bunları örten ara değerleri at
-        out_scale = 1.0 if self.is_calibrated else compute_pixel_scale_px_per_m(self.bounds)
-        out_keep = reject_ball_outlier_segments(
-            ball_fids, ball_xs, ball_ys, ball_is_pred, self.fps,
-            max_speed=float(getattr(config, "PASS_MAX_SPEED_MPS", 42.0)) * out_scale,
-            max_outlier_sec=float(getattr(config, "BALL_OUTLIER_MAX_SEC", 1.0)),
-            min_jump=float(getattr(config, "BALL_OUTLIER_MIN_JUMP_M", 8.0)) * out_scale,
+        out_keep = filter_ball_outliers(
+            ball_fids, ball_xs, ball_ys, ball_is_pred, self.fps, self.is_calibrated, self.bounds
         )
         ball_fids = ball_fids[out_keep]
         ball_xs = ball_xs[out_keep]
@@ -1757,31 +1753,15 @@ class MLAnalyzer:
             })
 
         # Aynı takımın iki periyodu arasına sıkışmış kısa tek rakip periyodu atlanır
-        # (MatchAnalyzer.detect_passes ile aynı kural); aksi halde bir pas iki sahte top kaybı olur.
-        sandwich_max = float(getattr(config, "PASS_SANDWICH_MAX_SEC", 0.6))
-        if sandwich_max > 0 and len(spells) >= 3:
-            kept_sp = [spells[0]]
-            for i in range(1, len(spells) - 1):
-                prev_sp, cur_sp, nxt_sp = kept_sp[-1], spells[i], spells[i + 1]
-                prev_team = prev_sp["end"]["team"]
-                cur_team = cur_sp["start"]["team"]
-                short = (cur_sp["end"]["frame_idx"] - cur_sp["start"]["frame_idx"]) / self.fps <= sandwich_max
-                # Ancak tek bir pasın içindeyse: önceki ile sonraki periyot arası bir pas süresini aşmamalı
-                within_pass = (
-                    nxt_sp["start"]["frame_idx"] - prev_sp["end"]["frame_idx"]
-                ) / self.fps <= config.PASS_MAX_GAP_SEC
-                if (
-                    short
-                    and within_pass
-                    and prev_team in ("Team A", "Team B")
-                    and prev_team == nxt_sp["start"]["team"]
-                    and cur_team != prev_team
-                    and cur_sp["end"]["team"] != prev_team
-                ):
-                    continue
-                kept_sp.append(cur_sp)
-            kept_sp.append(spells[-1])
-            spells = kept_sp
+        # (MatchAnalyzer.detect_passes ile aynı ortak kural)
+        keep_idx = sandwich_spell_keep_indices(
+            [sp["start"]["frame_idx"] for sp in spells],
+            [sp["end"]["frame_idx"] for sp in spells],
+            [sp["start"]["team"] for sp in spells],
+            [sp["end"]["team"] for sp in spells],
+            self.fps,
+        )
+        spells = [spells[k] for k in keep_idx]
 
         if len(spells) < 2:
             return pd.DataFrame(columns=event_cols)

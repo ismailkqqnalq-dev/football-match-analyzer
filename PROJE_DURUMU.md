@@ -42,7 +42,7 @@ Araçlar hazır: tarayıcıda çalışan etiketleme aracı (`utils/label_events.
 karşılaştırma aracı (`utils/validate_events.py`, ±1 sn tolerans; kesinlik,
 duyarlılık, F1 ve saniye bazında sahiplik uyumu). Kullanımı README'de.
 
-**Ölçüm (geniş/taktik kamera, ilk 4 dakika):** Etiketler insan değil Claude
+**Ölçüm (geniş/taktik kamera, ilk 4 dakika):** Etiketler insan değil bir yapay zekâ
 tarafından, sistem çıktısına bakılmadan, saniyede 2 kare (pas anlarında 0,1 sn) izlenerek
 çıkarıldı. Kaba bir göstergedir. İlk 120 sn sorunu bulmak ve düzeltmek için kullanıldı;
 120-240 sn düzeltme sırasında hiç bakılmamış **kontrol aralığıdır** (dürüst sonuç budur).
@@ -86,7 +86,7 @@ Bulunan ve düzeltilen hatalar:
 Son durumda (iki aralık birlikte, 4 dk) sistemin dediği pasların ~%77'si doğru, gerçek
 pasların ~%64'ü yakalanıyor; top sahipliği ~%84 uyumlu; top kaybında sistem 8 gerçek
 kayba karşı 10 kayıp yazıyor, 3'ü doğru (hâlâ zayıf). Temiz kontrol sonucu #17'ye kadar
-olan sütundur. Bu sayılar Claude etiketiyle tek bir klipte ölçüldü; insan etiketiyle ve
+olan sütundur. Bu sayılar yapay zekâ etiketiyle tek bir klipte ölçüldü; insan etiketiyle ve
 başka bir maçta doğrulanmadan kesin kabul edilmemeli. Ölçüm README'deki komutla
 tekrarlanabilir.
 
