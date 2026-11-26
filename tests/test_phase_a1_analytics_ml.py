@@ -337,6 +337,55 @@ def test_r3_fps_scaling_min_control_frames_and_deflection_control():
     assert passes["total_completed_passes"] == 1
 
 
+def test_pass_detected_when_kalman_froze_during_flight():
+    # Gerçek veride görülen desen (50 fps): top pasörün ayağından çıkınca tespit kopar,
+    # Kalman tahmini pasörün yanında donar (15 kare), top uçuşta yeniden görünür.
+    # Donmuş tahminden yeni konuma adım 4 m / 0.08 sn = 50 m/sn "sıçrama" gibi görünür;
+    # ama son gerçek tespitten (kare 19) hız 4 m / 0.38 sn ~ 10.5 m/sn: gerçek pas.
+    fps = 50.0
+    rows = []
+    for f in range(101):
+        is_p = False
+        if f < 20:
+            bx = 60.0
+        elif f < 35:
+            bx, is_p = 60.0, True
+        elif f < 38:
+            continue  # top hiç görünmüyor
+        elif f < 70:
+            bx = 64.0 + (f - 38) * 0.25  # ~12.5 m/sn uçuş
+        else:
+            bx = 72.0
+        rows.append(_row(f, "ball", "ball", None, bx, 34.0, fps=fps, is_pred=is_p))
+    for f in range(101):
+        rows.append(_row(f, 1, "player", "Team A", 60.0, 34.0, fps=fps))
+        rows.append(_row(f, 2, "player", "Team A", 72.0, 34.0, fps=fps))
+
+    ma = MatchAnalyzer(pd.DataFrame(rows), fps=fps)
+    tl, _ = ma.compute_possession()
+    passes = ma.detect_passes(tl)
+    assert passes["total_completed_passes"] == 1
+    assert passes["events"][0]["from_track_id"] == "1"
+    assert passes["events"][0]["to_track_id"] == "2"
+
+
+def test_off_pitch_ball_detection_ignored_for_possession():
+    # Kale ağındaki yedek top (saha dışı, on_pitch=False) sahiplik zaman çizelgesine girmemeli.
+    rows = []
+    for f in range(20):
+        ball = _row(f, "ball", "ball", None, 108.0, 34.6)
+        ball["on_pitch"] = False
+        rows.append(ball)
+        rows.append(_row(f, 1, "player", "Team A", 104.5, 34.6))
+    for f in range(20, 40):
+        rows.append(_row(f, "ball", "ball", None, 50.0, 34.0))
+        rows.append(_row(f, 1, "player", "Team A", 50.5, 34.0))
+
+    ma = MatchAnalyzer(pd.DataFrame(rows), fps=25.0)
+    tl, _ = ma.compute_possession()
+    assert tl["frame_idx"].min() == 20
+
+
 def test_r3_rejects_medium_pred_snap_12m_after_freeze():
     # Challenger Bug 1 regresyonu: >=0.3sn donmuş is_predicted=True tutuşundan sonra
     # 12m (300 m/sn @ 25fps) is_predicted=True -> False sıçraması her iki analizörde de 0 pas üretmeli.

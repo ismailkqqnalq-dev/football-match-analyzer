@@ -205,14 +205,27 @@ def compute_ball_kinematic_filter(
         )
         valid_step &= ~reset_step
 
-        # Donmuş Kalman tahmininden (is_predicted=1 -> 0) imkânsız hızlı sıçrama süreksizlikleri
+        # Donmuş Kalman tahmininden (is_predicted=1 -> 0) imkânsız hızlı sıçrama süreksizlikleri.
+        # Tahmin pas sırasında pasörün yanında donup kaldığı için hız, donmuş tahminden değil
+        # tahmin öncesindeki son GERÇEK tespitten ölçülür; aksi halde her gerçek pas sıçrama sayılır.
         min_snap_dist = float(getattr(config, "PASS_MIN_BALL_MOVE_M", 2.0)) * scale
+        pos = np.arange(n)
+        last_real = np.maximum.accumulate(np.where(pred_arr == 0, pos, -1))[:-1]
+        has_real = last_real >= 0
+        lr = np.where(has_real, last_real, 0)
+        real_dt = np.maximum((ball_fids[1:] - ball_fids[lr]).astype(np.float64) / fps_safe, 1.0 / fps_safe)
+        real_speed = np.where(
+            has_real,
+            np.hypot(ball_xs[1:] - ball_xs[lr], ball_ys[1:] - ball_ys[lr]) / real_dt,
+            speed_step,
+        )
         pred_snap_mask = (
             (df_step >= 1)
             & (df_step <= max(4, int(round(0.20 * fps_safe))))
             & (pred_arr[:-1] == 1)
             & (pred_arr[1:] == 0)
             & (speed_step > max_pass_speed)
+            & (real_speed > max_pass_speed)
             & (dist_step > min_snap_dist)
             & ~reset_step
         )
