@@ -217,6 +217,60 @@ class DataExporter:
         self._pre_flushed_backfill_count: int = 0
         self._pre_flushed_ball_interp_count: int = 0
         self._last_completed_real_ball_frame: Optional[int] = None
+        self._frame_blend_shifts: Dict[int, Tuple[float, float]] = {}
+
+    def set_frame_blend_shift(self, frame_idx: int, dx_m: float, dy_m: float) -> None:
+        """Yumuşak kalibrasyon geçişinin bu karedeki saha kaymasını (metre) kaydeder."""
+        if not (math.isfinite(dx_m) and math.isfinite(dy_m)):
+            return
+        if abs(dx_m) > 1e-9 or abs(dy_m) > 1e-9:
+            self._frame_blend_shifts[int(frame_idx)] = (float(dx_m), float(dy_m))
+
+    @staticmethod
+    def _compile_blend_shifts(
+        blend_shifts: Optional[Dict[int, Tuple[float, float]]],
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        if not blend_shifts:
+            return None
+        items = sorted(
+            (int(k), float(v[0]), float(v[1]))
+            for k, v in blend_shifts.items()
+            if math.isfinite(v[0]) and math.isfinite(v[1]) and (abs(v[0]) > 1e-9 or abs(v[1]) > 1e-9)
+        )
+        if not items:
+            return None
+        frames = np.array([it[0] for it in items], dtype=np.int64)
+        cum_dx = np.concatenate(([0.0], np.cumsum([it[1] for it in items], dtype=np.float64)))
+        cum_dy = np.concatenate(([0.0], np.cumsum([it[2] for it in items], dtype=np.float64)))
+        return frames, cum_dx, cum_dy
+
+    def _resolve_blend_shifts(self) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        if self._frame_blend_shifts:
+            return self._compile_blend_shifts(self._frame_blend_shifts)
+        candidates = []
+        for p in (self._active_sql_path, self._active_csv_path):
+            if p:
+                candidates.append(os.path.join(os.path.dirname(p), config.EXPORT_HOMOGRAPHY_LOG_FILENAME))
+        candidates.append(os.path.join(self._base_export_dir(), config.EXPORT_HOMOGRAPHY_LOG_FILENAME))
+        for log_path in candidates:
+            if not log_path or not os.path.isfile(log_path):
+                continue
+            try:
+                cols = set(pd.read_csv(log_path, nrows=0).columns)
+                if not {"frame_idx", "blend_dx_m", "blend_dy_m"}.issubset(cols):
+                    continue
+                bdf = pd.read_csv(log_path, usecols=["frame_idx", "blend_dx_m", "blend_dy_m"])
+                bdf = bdf.dropna(subset=["frame_idx", "blend_dx_m", "blend_dy_m"])
+                bdf = bdf[(bdf["blend_dx_m"].abs() > 1e-9) | (bdf["blend_dy_m"].abs() > 1e-9)]
+                shifts = {
+                    int(r.frame_idx): (float(r.blend_dx_m), float(r.blend_dy_m))
+                    for r in bdf.itertuples(index=False)
+                }
+                if shifts:
+                    return self._compile_blend_shifts(shifts)
+            except Exception:
+                continue
+        return None
 
     # ----------------------------------------------------------------
     def _base_export_dir(self) -> str:
@@ -1110,6 +1164,7 @@ class DataExporter:
         max_frame_gap: int,
         max_realistic_speed_kmh: float,
         reset_frames: Optional[np.ndarray] = None,
+        blend_shifts_compiled: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     ) -> Optional[Dict]:
         f_arr = np.asarray(frame_idxs, dtype=np.int64)
         if f_arr.size == 0:
@@ -1171,6 +1226,12 @@ class DataExporter:
                 seg_f = f_arr[s_start:s_end]
                 seg_px = px_arr[s_start:s_end]
                 seg_py = py_arr[s_start:s_end]
+
+                if blend_shifts_compiled is not None:
+                    bf, c_dx, c_dy = blend_shifts_compiled
+                    pos = np.searchsorted(bf, seg_f, side="right")
+                    seg_px = seg_px - (c_dx[pos] - c_dx[pos[0]])
+                    seg_py = seg_py - (c_dy[pos] - c_dy[pos[0]])
 
                 if smooth_win > 1:
                     sx = (
@@ -1292,6 +1353,7 @@ class DataExporter:
         human_classes: Set[str],
         smooth_win: int,
         min_sprint_frames: int,
+        blend_shifts_compiled: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     ) -> List[Dict]:
         sorted_classes = sorted(human_classes)
         placeholders = ",".join(["?"] * len(sorted_classes))
@@ -1349,6 +1411,7 @@ class DataExporter:
                     max_frame_gap=config.DISTANCE_CALC_MAX_FRAME_GAP,
                     max_realistic_speed_kmh=config.MAX_REALISTIC_PLAYER_SPEED_KMH,
                     reset_frames=reset_frames,
+                    blend_shifts_compiled=blend_shifts_compiled,
                 )
                 if row is not None:
                     summary_rows.append(row)
@@ -1385,6 +1448,7 @@ class DataExporter:
         human_classes: Set[str],
         smooth_win: int,
         min_sprint_frames: int,
+        blend_shifts_compiled: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]] = None,
     ) -> List[Dict]:
         usecols = [
             "track_id",
@@ -1454,6 +1518,7 @@ class DataExporter:
                 max_frame_gap=config.DISTANCE_CALC_MAX_FRAME_GAP,
                 max_realistic_speed_kmh=config.MAX_REALISTIC_PLAYER_SPEED_KMH,
                 reset_frames=reset_frames,
+                blend_shifts_compiled=blend_shifts_compiled,
             )
             if row is not None:
                 summary_rows.append(row)
@@ -1478,6 +1543,7 @@ class DataExporter:
         )
 
         summary_rows: List[Dict] = []
+        blend_compiled = self._resolve_blend_shifts()
 
         if self._has_flushed_any or self.flush_interval > 0:
             if not self._stream_finalized and (self.records or self._sql_conn is not None):
@@ -1491,6 +1557,7 @@ class DataExporter:
                     human_classes=human_classes,
                     smooth_win=smooth_win,
                     min_sprint_frames=min_sprint_frames,
+                    blend_shifts_compiled=blend_compiled,
                 )
             elif self.enable_csv and self._active_csv_path and os.path.exists(self._active_csv_path):
                 summary_rows = self._summarize_from_csv_chunks(
@@ -1498,6 +1565,7 @@ class DataExporter:
                     human_classes=human_classes,
                     smooth_win=smooth_win,
                     min_sprint_frames=min_sprint_frames,
+                    blend_shifts_compiled=blend_compiled,
                 )
             elif self.records:
                 # Akış modunda henüz hiç flush olmadıysa bellek içi yoldan hesapla
@@ -1545,6 +1613,7 @@ class DataExporter:
                     max_frame_gap=config.DISTANCE_CALC_MAX_FRAME_GAP,
                     max_realistic_speed_kmh=config.MAX_REALISTIC_PLAYER_SPEED_KMH,
                     reset_frames=reset_frames,
+                    blend_shifts_compiled=blend_compiled,
                 )
                 if row is not None:
                     summary_rows.append(row)

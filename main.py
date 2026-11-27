@@ -297,6 +297,11 @@ def main():
                     hybrid_calibrator is not None
                     and hybrid_calibrator.frame_info.get("calib_reset")
                 )
+                if hybrid_calibrator is not None:
+                    bdx = float(hybrid_calibrator.frame_info.get("blend_dx_m") or 0.0)
+                    bdy = float(hybrid_calibrator.frame_info.get("blend_dy_m") or 0.0)
+                    if (abs(bdx) > 1e-9 or abs(bdy) > 1e-9) and hasattr(exporter, "set_frame_blend_shift"):
+                        exporter.set_frame_blend_shift(frame_idx, bdx, bdy)
                 for det in all_tracked:
                     det["calib_reset"] = calib_reset
 
@@ -375,16 +380,20 @@ def main():
                 return MatchAnalyzer(exporter.to_dataframe(), fps=vp.fps)
 
             def _load_ml_analyzer(analytics_sum) -> MLAnalyzer:
+                blend_map = getattr(exporter, "_frame_blend_shifts", None) or None
                 if sql_out_path and os.path.isfile(sql_out_path):
                     return MLAnalyzer.from_sql(
-                        sql_out_path, fps=vp.fps, analytics_summary=analytics_sum
+                        sql_out_path, fps=vp.fps, analytics_summary=analytics_sum,
+                        blend_shifts=blend_map,
                     )
                 if csv_out_path and os.path.isfile(csv_out_path):
                     return MLAnalyzer.from_csv(
-                        csv_out_path, fps=vp.fps, analytics_summary=analytics_sum
+                        csv_out_path, fps=vp.fps, analytics_summary=analytics_sum,
+                        blend_shifts=blend_map,
                     )
                 return MLAnalyzer(
-                    exporter.to_dataframe(), fps=vp.fps, analytics_summary=analytics_sum
+                    exporter.to_dataframe(), fps=vp.fps, analytics_summary=analytics_sum,
+                    blend_shifts=blend_map,
                 )
 
             analytics_summary = None

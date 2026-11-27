@@ -966,6 +966,7 @@ class HybridPitchCalibrator:
         self.confirm_refreshes = max(0, int(getattr(config, "PITCH_CAL_CONFIRM_REFRESHES", 2)))
         self.blend_max_step_m = max(1e-3, float(getattr(config, "PITCH_CAL_BLEND_MAX_STEP_M", 0.05)))
         self.blend_max_speed_mps = float(getattr(config, "PITCH_CAL_BLEND_MAX_SPEED_MPS", 0.25))
+        self.blend_max_sec = max(0.0, float(getattr(config, "PITCH_CAL_BLEND_MAX_SEC", 1.0)))
 
         requested = str(profile if profile is not None else getattr(config, "FOOTAGE_PROFILE", "auto")).lower()
         if requested not in _VALID_PROFILES:
@@ -1000,6 +1001,7 @@ class HybridPitchCalibrator:
         self._blend_quad_img: Optional[np.ndarray] = None
         self._blend_p0: Optional[np.ndarray] = None
         self._blend_p1: Optional[np.ndarray] = None
+        self._blend_frame_shape: Optional[Tuple[int, ...]] = None
         self._blend_step = 0
         self._blend_total = 0
 
@@ -1043,6 +1045,8 @@ class HybridPitchCalibrator:
             "disagreement_m": None,
             "calib_reset": False,
             "profile": self.profile,
+            "blend_dx_m": 0.0,
+            "blend_dy_m": 0.0,
         }
 
     # ----------------------------------------------------------------
@@ -1175,11 +1179,31 @@ class HybridPitchCalibrator:
         self._blend_quad_img = None
         self._blend_p0 = None
         self._blend_p1 = None
+        self._blend_frame_shape = None
         self._blend_step = 0
         self._blend_total = 0
 
     def _blend_active(self) -> bool:
         return self._blend_total > 0 and self._blend_p0 is not None
+
+    @classmethod
+    def _median_grid_shift(
+        cls,
+        h_prev: np.ndarray,
+        h_next: np.ndarray,
+        frame_shape: Tuple[int, ...],
+    ) -> Tuple[float, float]:
+        """İki piksel->metre tablosu arasındaki 3x3 referans ızgarasının ortanca (dx, dy) kaymasını döndürür."""
+        a = cls._canonical_sign(np.asarray(h_prev, dtype=np.float64), frame_shape)
+        b = cls._canonical_sign(np.asarray(h_next, dtype=np.float64), frame_shape)
+        grid = cls.reference_grid(frame_shape)
+        pa = cls._project(a, grid)
+        pb = cls._project(b, grid)
+        valid = np.isfinite(pa).all(axis=1) & np.isfinite(pb).all(axis=1)
+        if not valid.any():
+            return 0.0, 0.0
+        delta = pb[valid] - pa[valid]
+        return float(np.median(delta[:, 0])), float(np.median(delta[:, 1]))
 
     def blend_matrix(self, alpha: float) -> Optional[np.ndarray]:
         if self._blend_quad_img is None or self._blend_p0 is None or self._blend_p1 is None:
@@ -1195,6 +1219,8 @@ class HybridPitchCalibrator:
         """Aktif geçişi bir adım ilerletir; bu karede geçiş tablosu kullanıldıysa True."""
         if not self._blend_active():
             return False
+        alpha_prev = float(self._blend_step) / float(self._blend_total)
+        h_prev = self.blend_matrix(alpha_prev)
         self._blend_step += 1
         alpha = min(1.0, float(self._blend_step) / float(self._blend_total))
         h_blend = self.blend_matrix(alpha)
@@ -1202,9 +1228,17 @@ class HybridPitchCalibrator:
             target = self.blend_matrix(1.0)
             if target is not None:
                 self.transformer.set_homography(target)
+                if h_prev is not None and self._blend_frame_shape is not None:
+                    dx_m, dy_m = self._median_grid_shift(h_prev, target, self._blend_frame_shape)
+                    self.frame_info["blend_dx_m"] = round(dx_m, 6)
+                    self.frame_info["blend_dy_m"] = round(dy_m, 6)
             self._cancel_blend()
             self.frame_info["source"] = "keypoint_refresh"
             return True
+        if h_prev is not None and self._blend_frame_shape is not None:
+            dx_m, dy_m = self._median_grid_shift(h_prev, h_blend, self._blend_frame_shape)
+            self.frame_info["blend_dx_m"] = round(dx_m, 6)
+            self.frame_info["blend_dy_m"] = round(dy_m, 6)
         finished = self._blend_step >= self._blend_total
         self.frame_info["source"] = "keypoint_refresh" if finished else "blend"
         if finished:
@@ -1293,10 +1327,15 @@ class HybridPitchCalibrator:
         self._blend_quad_img = quad
         self._blend_p0 = p0
         self._blend_p1 = p1
+        self._blend_frame_shape = frame.shape
         self._blend_step = 0
-        self._blend_total = max(
+        total_by_step = max(
             self.smooth_frames, int(math.ceil(float(disagreement) / self.blend_step_m))
         )
+        if self.blend_max_sec > 0.0:
+            max_blend_frames = max(self.smooth_frames, int(round(self.blend_max_sec * self.fps)))
+            total_by_step = min(total_by_step, max_blend_frames)
+        self._blend_total = total_by_step
         self.calibration_count += 1
         self.last_calibration_reason = reason
         self._advance_active_blend()
@@ -1665,7 +1704,7 @@ class HomographyLogWriter:
     COLUMNS: Tuple[str, ...] = (
         ("frame_idx", "source")
         + tuple(f"h{r}{c}" for r in range(3) for c in range(3))
-        + ("num_keypoints", "num_inliers", "reproj_error_m", "disagreement_m", "profile")
+        + ("num_keypoints", "num_inliers", "reproj_error_m", "disagreement_m", "profile", "blend_dx_m", "blend_dy_m")
     )
 
     def __init__(self, path: Union[str, os.PathLike], flush_every: int = 500):
@@ -1701,6 +1740,8 @@ class HomographyLogWriter:
                 self._cell(info.get("reproj_error_m")),
                 self._cell(info.get("disagreement_m")),
                 info.get("profile") or "",
+                self._cell(info.get("blend_dx_m", 0.0)),
+                self._cell(info.get("blend_dy_m", 0.0)),
             ]
         )
         self._writer.writerow(row)

@@ -224,8 +224,9 @@ def test_benchmark_labels_present_and_table_marks_target(tmp_path):
     # Çıktısı olmayan dizin: çökmeden boş sonuç
     assert bv.run_benchmark(str(tmp_path)) == {"run_dir": str(tmp_path.resolve())}
 
-    good = {"a2": {"median_error_m": 0.28, "p90_error_m": 0.65, "valid_table_ratio": 1.0}}
-    bad = {"a2": {"median_error_m": 0.60, "p90_error_m": 2.31, "valid_table_ratio": 1.0}}
+    good = {"a2": {"median_error_m": 0.28, "p90_error_m": 0.65, "valid_table_ratio": 1.0, "stationary_speed_kmh": 0.94}}
+    bad = {"a2": {"median_error_m": 0.60, "p90_error_m": 2.31, "valid_table_ratio": 1.0, "stationary_speed_kmh": 1.33}}
     assert "GEÇTİ" in bv.format_table(good)
     table = bv.format_table(bad, good)
     assert "KALDI" in table and "| A2 ortanca hata (m) | 0.60 | 0.28 |" in table
+    assert "| A2 duran nokta hızı (km/sa) | 1.33 | 0.94 |" in table

@@ -467,10 +467,11 @@ PITCH_CAL_SOFT_M = 1.0              # bu farka kadar yumuşak geçişle hemen ka
 PITCH_CAL_HARD_M = 3.0              # bunun üstü doğrulandıktan sonra sert geçiş + calib_reset
 PITCH_CAL_CONFIRM_REFRESHES = 2     # SOFT üstü farkta kabul için gereken ek tutarlı yenileme sayısı
 PITCH_CAL_BLEND_MAX_STEP_M = 0.05   # yumuşak geçişte referans noktaların kare başına en fazla kayması
-# Yumuşak geçişin saniyedeki en fazla kayması (video hızından bağımsız). Geçiş sırasında bütün saha bu
-# hızla kayar ve duran oyuncu bu kadar hızlı koşuyormuş gibi görünür: A2 kabul ölçütü (< 1 km/sa ≈ 0.28 m/sn)
-# altında tutulur. Kare başına adım = min(PITCH_CAL_BLEND_MAX_STEP_M, bu değer / fps).
+# Yumuşak geçişin saniyedeki en fazla kayması (video hızından bağımsız). Küçük düzeltmelerde
+# sahanın bir anda sıçramasını önler; büyük düzeltmeler ise PITCH_CAL_BLEND_MAX_SEC içinde biter
+# ve geçişin saha kayması (blend_dx_m, blend_dy_m) hız/mesafe hesabından düşülür.
 PITCH_CAL_BLEND_MAX_SPEED_MPS = 0.25
+PITCH_CAL_BLEND_MAX_SEC = 1.0       # büyük düzeltmeler en fazla bu sürede biter (0 = süre sınırı yok)
 
 # A2-5: Görüntü profili ("auto" | "fixed" | "broadcast")
 FOOTAGE_PROFILE = "auto"
