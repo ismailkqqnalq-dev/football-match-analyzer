@@ -28,6 +28,8 @@ ya da doğrulanamayan tablo reddedilir ve önceki tablo korunur.
 oranı ve duran nesne hızı için oturum betikleri (sahadaki sabit çim/çizgi noktaları
 1 sn boyunca izlenip hızları ölçüldü).
 
+**Kamera profili notu:** `tactical_10min.mp4` klibinde (50 fps) optik akış ölçümü 46. karede `67,1 px` (`0,035w`, anlık kayma `0,050`), ilk 6 saniyede kare genişliğinin `%32,3`'ü kadar net kayma (`619,3 px`) ve `%17,2` ölçek değişimi gösterdi (`PROFILE_FIXED_MAX_PAN_RATIO = 0,05` ve `PROFILE_FIXED_MAX_SCALE_CHANGE = 0,03` eşiklerini aştığı için 46. karede `broadcast` profiline geçilmesi doğrudur; `fixed` yalnızca pan/zoom yapmayan sabit kameralar içindir).
+
 **Bilinen sınır (TV):** Geniş kamerada hedefler tutuyor, TV yayınında tutmuyor. İki
 sebep var: (1) model TV yakın çekimlerinde doğru tabloyu seyrek buluyor, aradaki uzun
 kamera hareketlerinde optik akış zamanla kayıyor; (2) model bazen ceza sahasını yanlış
