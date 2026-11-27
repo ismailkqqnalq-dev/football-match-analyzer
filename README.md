@@ -95,6 +95,13 @@ Sistemin bulduğu pasların ve top kayıplarının gerçeğe ne kadar uyduğunu 
    duyarlılık (gerçek olayların kaçı yakalandı) ve F1, ayrıca saniye bazında sahiplik
    uyumunu verir. Etiketlerdeki Takım A/B sistemle ters düştüyse otomatik çevrilir.
 
+### Tek komutla karşılaştırma (model / algoritma değişikliklerinde)
+Repodaki sabit etiketlerle (`data/validation/tactical_10min/`) A2 isabetini ve Faz V
+sonuçlarını birlikte ölçer; `--baseline` ile önceki çalıştırmayla yan yana gösterir:
+```powershell
+python utils/benchmark_validation.py --run-dir $env:TEMP\run_yeni --baseline $env:TEMP\run_eski\benchmark.json
+```
+
 ## Çalıştırma
 ```bash
 python main.py --input data/input_videos/match_sample.mp4 --output data/output_videos/match_sample_annotated.mp4

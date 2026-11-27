@@ -108,5 +108,17 @@ bunu açıkça söyler. Gerçek veride geniş kamera "high" (ortanca 11 oyuncu),
 ## Lisans notu
 Tespit ve saha modelleri Ultralytics YOLO (AGPL-3.0) üzerine kurulu. Kapalı kaynak
 ticari kullanım için ya Ultralytics ticari lisansı ya da Apache-2.0 lisanslı bir
-alternatife geçiş gerekir; eğitim veri setlerinin lisansları da ayrıca kontrol
-edilmeli.
+alternatife geçiş gerekir. Repoda henüz `LICENSE` dosyası yok.
+
+Ultralytics dışındaki bağımlılıklar ticari kullanıma izin veriyor (2026-11-27 kontrolü):
+OpenCV ve python-multipart Apache-2.0; PyTorch, NumPy, pandas, SciPy, scikit-learn,
+httpx ve uvicorn BSD; deep-sort-realtime, FastAPI, PyJWT ve PyYAML MIT; tqdm MPL-2.0/MIT;
+yt-dlp Unlicense; matplotlib PSF.
+
+Eğitim verileri:
+
+| Veri | Kullanıldığı model | Lisans | Not |
+|---|---|---|---|
+| Roboflow `roboflow-jvuqo/football-players-detection-3zvbc` (v20, 372 görüntü) | Oyuncu/top tespiti | CC BY 4.0 | Ticari kullanım serbest, kaynak gösterilmeli |
+| Roboflow `roboflow-jvuqo/football-field-detection-f07vi` (v18, 317 görüntü) | Saha noktaları | CC BY 4.0 | Ticari kullanım serbest, kaynak gösterilmeli |
+| Kendi etiketlediğimiz TV kareleri (442 görüntü) | Saha noktaları (TV ince ayarı) | Etiketler bizim | Görüntüler TV yayınından; yayın hakları yayıncıda. Ticari modelde kullanmadan önce hukuki görüş alınmalı veya yerine lisanslı/kendi çekimimiz kullanılmalı |

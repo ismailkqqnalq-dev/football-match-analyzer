@@ -210,3 +210,22 @@ def test_job_ttl_zero_disables_cleanup(tmp_path):
     q = BoundedJobQueue(jobs_dir=tmp_path, executor=lambda *a: None, job_ttl_sec=0)
     assert q.purge_expired() == []
     assert stale.exists()
+
+
+# ----------------------------------------------------------------------
+# utils/benchmark_validation: repodaki etiketlerle tek komut ölçüm
+# ----------------------------------------------------------------------
+def test_benchmark_labels_present_and_table_marks_target(tmp_path):
+    from utils import benchmark_validation as bv
+
+    for fname in ["a2_labels.csv"] + [f for r in bv.EVENT_RANGES for f in r[3:]]:
+        assert os.path.exists(os.path.join(bv.DEFAULT_LABEL_DIR, fname)), fname
+
+    # Çıktısı olmayan dizin: çökmeden boş sonuç
+    assert bv.run_benchmark(str(tmp_path)) == {"run_dir": str(tmp_path.resolve())}
+
+    good = {"a2": {"median_error_m": 0.28, "p90_error_m": 0.65, "valid_table_ratio": 1.0}}
+    bad = {"a2": {"median_error_m": 0.60, "p90_error_m": 2.31, "valid_table_ratio": 1.0}}
+    assert "GEÇTİ" in bv.format_table(good)
+    table = bv.format_table(bad, good)
+    assert "KALDI" in table and "| A2 ortanca hata (m) | 0.60 | 0.28 |" in table
