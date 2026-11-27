@@ -474,3 +474,30 @@ def test_p3_1_blend_shift_compensated_in_player_speed(tmp_path):
     )._compute_player_step_speeds()
     assert float(ml_speeds["speed"].max()) < 1.0
     assert len(ml_spikes) == 0
+
+
+def test_p3_4_raw_jump_not_smeared_by_smoothing(tmp_path):
+    """50 fps'te tek karelik ID-switch/titreme sıçraması sürdürülen azami hızı 37-38 km/sa sınırına yapıştırmamalı."""
+    exp = DataExporter(fps=50.0, output_dir=str(tmp_path), flush_interval=0)
+    # Oyuncu 60 kare boyunca 14.4 km/sa (0.08 m/kare @ 50 fps) koşuyor;
+    # 30. karede 0.72 m tek karelik titreme sıçraması var (5 karelik yumuşatma ile
+    # tek adım ~37.4 km/sa çıkar, ancak 0.5 sn sürdürülen hız < 25 km/sa kalır).
+    for f in range(60):
+        jump = 0.72 if f >= 30 else 0.0
+        exp.append_frame_data(
+            f,
+            [{
+                "track_id": 12,
+                "class_name": "player",
+                "team": "Team A",
+                "bbox": [100, 100, 120, 160],
+                "pitch_x": 30.0 + 0.08 * f + jump,
+                "pitch_y": 30.0,
+                "on_pitch": True,
+                "calib_reset": False,
+            }],
+        )
+    summary_path = exp.export_distance_summary(output_path=str(tmp_path / "dist_p34.csv"))
+    assert summary_path is not None
+    df = pd.read_csv(summary_path)
+    assert float(df.loc[0, "max_speed_kmh"]) < 25.0

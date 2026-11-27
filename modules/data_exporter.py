@@ -1200,12 +1200,20 @@ class DataExporter:
         active_time_sec = 0.0
         max_speed_val = 0.0
         has_valid_speed = False
+        has_sustained_peak = False
         walking_m = 0.0
         jogging_m = 0.0
         running_m = 0.0
         hsr_m = 0.0
         sprint_m = 0.0
         sprint_count = 0
+
+        peak_win_sec = float(getattr(config, "SPEED_MAX_WINDOW_SEC", 0.5))
+        peak_win_frames = (
+            max(1, int(round(float(fps) * peak_win_sec)))
+            if (fps and peak_win_sec > 0.0)
+            else 1
+        )
 
         n_frames = int(f_arr.size)
         if n_frames >= 2:
@@ -1273,10 +1281,32 @@ class DataExporter:
 
                         total_distance_m += float(np.sum(v_dists))
                         active_time_sec += float(np.sum(v_dts))
-                        seg_max_spd = float(np.max(v_spds))
-                        if not has_valid_speed or seg_max_spd > max_speed_val:
-                            max_speed_val = seg_max_spd
                         has_valid_speed = True
+                        if peak_win_frames <= 1:
+                            seg_max_spd = float(np.max(v_spds))
+                            if not has_sustained_peak or seg_max_spd > max_speed_val:
+                                max_speed_val = seg_max_spd
+                            has_sustained_peak = True
+                        else:
+                            sub_splits = np.flatnonzero(~valid_step)
+                            sub_starts = np.r_[0, sub_splits + 1]
+                            sub_ends = np.r_[sub_splits, len(valid_step)]
+                            for a, b in zip(sub_starts.tolist(), sub_ends.tolist()):
+                                if (b - a) < peak_win_frames:
+                                    continue
+                                dtw = (seg_f[a + peak_win_frames:b + 1] - seg_f[a:b + 1 - peak_win_frames]) / float(fps)
+                                dw = np.hypot(
+                                    sx[a + peak_win_frames:b + 1] - sx[a:b + 1 - peak_win_frames],
+                                    sy[a + peak_win_frames:b + 1] - sy[a:b + 1 - peak_win_frames],
+                                )
+                                with np.errstate(divide="ignore", invalid="ignore"):
+                                    spw = (dw / dtw) * 3.6
+                                okw = (dtw > 0.0) & np.isfinite(spw) & (spw <= max_realistic_speed_kmh)
+                                if np.any(okw):
+                                    cand = float(np.max(spw[okw]))
+                                    if not has_sustained_peak or cand > max_speed_val:
+                                        max_speed_val = cand
+                                    has_sustained_peak = True
 
                         walking_m += float(np.sum(v_dists[v_spds < config.SPEED_ZONE_WALKING_MAX_KMH]))
                         jogging_m += float(
@@ -1318,11 +1348,11 @@ class DataExporter:
                         total_distance_m += float(np.sum(dist_step[valid_step]))
 
         if fps and has_valid_speed:
-            max_speed_kmh = round(max_speed_val, 2)
-            avg_speed_kmh = (
-                round((total_distance_m / active_time_sec) * 3.6, 2)
-                if active_time_sec > 0.0
-                else 0.0
+            avg_speed_val = (total_distance_m / active_time_sec) * 3.6 if active_time_sec > 0.0 else 0.0
+            avg_speed_kmh = round(avg_speed_val, 2)
+            max_speed_kmh = round(
+                max_speed_val if has_sustained_peak else min(max_realistic_speed_kmh, avg_speed_val),
+                2,
             )
         else:
             max_speed_kmh = None

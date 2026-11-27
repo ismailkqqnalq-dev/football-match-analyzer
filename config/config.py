@@ -47,6 +47,9 @@ DISTANCE_CALC_EXCLUDE_PREDICTED = True
 # Mesafe ve hız hesaplamasında bbox titremesini azaltmak için yumuşatma ve fiziksel sınırlar
 SPEED_SMOOTHING_WINDOW_FRAMES = 5
 MAX_REALISTIC_PLAYER_SPEED_KMH = 38.0
+# P3-4: Azami hız hesabında tek karelik (50 fps'te 0,02 sn) kutu titremesi veya sıçramanın
+# sınır değerine (37-38 km/sa) yapışmaması için sürdürülen zaman penceresi (sn; <=0 ise adım hızı).
+SPEED_MAX_WINDOW_SEC = 0.5
 
 # FIFA hız bantları (km/saat) ve sprint süresi eşiği
 SPEED_ZONE_WALKING_MAX_KMH = 7.0
