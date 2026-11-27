@@ -90,6 +90,25 @@ def download_model(
     env_var = spec["env_var"]
     train_cmd = spec["train_cmd"]
 
+    default_output = getattr(config, path_attr)
+    target_path = Path(output_path if output_path else default_output).resolve()
+    sha_expected = (
+        expected_sha256
+        if expected_sha256 is not None
+        else (getattr(config, sha_attr, None) or "")
+    ).strip().lower()
+
+    if target_path.is_file() and not overwrite:
+        if sha_expected:
+            actual = compute_sha256(target_path).lower()
+            if not hmac.compare_digest(actual, sha_expected):
+                raise ValueError(
+                    f"Mevcut model dosyası SHA-256 eşleşmedi ({actual} != {sha_expected}). "
+                    "Yeniden indirmek için --overwrite bayrağını kullanın."
+                )
+        print(f"[download_models] Model ağırlığı zaten mevcut: {target_path}")
+        return target_path
+
     resolved_url = (url if url is not None else getattr(config, url_attr, "")).strip()
     if not resolved_url:
         raise ValueError(
@@ -106,14 +125,6 @@ def download_model(
     if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
         raise ValueError(f"Geçersiz indirme URL'si (yalnızca http/https desteklenir): {resolved_url}")
 
-    default_output = getattr(config, path_attr)
-    target_path = Path(output_path if output_path else default_output).resolve()
-    sha_expected = (
-        expected_sha256
-        if expected_sha256 is not None
-        else (getattr(config, sha_attr, None) or "")
-    ).strip().lower()
-
     if not sha_expected:
         if not insecure_skip_sha256:
             raise ValueError(
@@ -127,17 +138,6 @@ def download_model(
             "[download_models] UYARI: --insecure-skip-sha256 ETKİN – SHA-256 DOĞRULAMASI ATLANDI! "
             "DOĞRULANMAMIŞ .pt DOSYASI GÜVENLİK RİSKİ TAŞIR."
         )
-
-    if target_path.is_file() and not overwrite:
-        if sha_expected:
-            actual = compute_sha256(target_path).lower()
-            if not hmac.compare_digest(actual, sha_expected):
-                raise ValueError(
-                    f"Mevcut model dosyası SHA-256 eşleşmedi ({actual} != {sha_expected}). "
-                    "Yeniden indirmek için --overwrite bayrağını kullanın."
-                )
-        print(f"[download_models] Model ağırlığı zaten mevcut: {target_path}")
-        return target_path
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target_path.with_suffix(target_path.suffix + ".part")
