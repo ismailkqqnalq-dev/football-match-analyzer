@@ -244,7 +244,10 @@ def test_a2_3_soft_blend_uses_reference_points_and_valid_matrices():
     d = hybrid.frame_info["disagreement_m"]
     assert config.PITCH_CAL_DEADBAND_M < d <= config.PITCH_CAL_SOFT_M
     assert hybrid.frame_info["source"] == "blend"
-    assert hybrid._blend_total == max(5, math.ceil(d / hybrid.blend_step_m))
+    expected_total = max(5, math.ceil(d / hybrid.blend_step_m))
+    if hybrid.blend_max_sec > 0.0:
+        expected_total = min(expected_total, max(5, int(round(hybrid.blend_max_sec * hybrid.fps))))
+    assert hybrid._blend_total == expected_total
 
     quad = hybrid._blend_quad_img
     p0, p1 = hybrid._blend_p0.copy(), hybrid._blend_p1.copy()
@@ -258,16 +261,17 @@ def test_a2_3_soft_blend_uses_reference_points_and_valid_matrices():
         proj = HybridPitchCalibrator._project(h, quad)
         assert np.allclose(proj, (1 - a) * p0 + a * p1, atol=1e-3)
 
-    # Kare başına kayma blend_step_m (saniyelik sınır / fps) değerini aşmamalı
+    # Kare başına kayma blend_total adımına bölünen düzeltme kadar olmalı (saniyelik veya süre tavanı ile)
     prev = None
     max_step = 0.0
-    for f in range(16, 16 + hybrid._blend_total + 2):
+    for f in range(16, 16 + expected_total + 2):
         m = hybrid.process_frame(f, frame)
         p = _player_pitch(pt, m)
         if prev is not None:
             max_step = max(max_step, float(np.linalg.norm(p - prev)))
         prev = p
-    assert max_step <= hybrid.blend_step_m * 1.5
+    step_limit = max(hybrid.blend_step_m, d / float(expected_total))
+    assert max_step <= step_limit * 1.5
     assert hybrid._blend_total == 0
 
 
@@ -400,3 +404,100 @@ def test_calibration_exception_does_not_stop_the_run():
     positions, infos = _run(hybrid, pt, 30)
     assert hybrid.stats["model_errors"] >= 1
     assert np.isfinite(positions).all()
+
+
+def test_p3_1_large_blend_finishes_within_max_sec(monkeypatch):
+    """5 m'lik büyük düzeltme bile PITCH_CAL_BLEND_MAX_SEC süresinde bitmeli ve kayma kaydedilmeli."""
+    monkeypatch.setattr(config, "PITCH_CAL_HARD_M", 10.0)
+    monkeypatch.setattr(config, "PITCH_CAL_BLEND_MAX_SEC", 1.0)
+    monkeypatch.setattr(config, "PITCH_CAL_CONFIRM_REFRESHES", 0)
+
+    def offset_fn(call):
+        return (5.0, 0.0) if call >= 2 else (0.0, 0.0)
+
+    for fps_val in (25.0, 50.0):
+        cal = NoisyKeypointCalibrator(sigma_px=0.0, seed=0, meter_offset_fn=offset_fn)
+        pt = PerspectiveTransformer(source_points={}, quiet=True)
+        hybrid = HybridPitchCalibrator(
+            calibrator=cal,
+            transformer=pt,
+            motion_tracker=FakeFlow(),
+            refresh_interval=10,
+            smooth_frames=5,
+            fps=fps_val,
+            profile="broadcast",
+        )
+        hybrid.hard_m = 10.0
+        hybrid.confirm_refreshes = 0
+        positions, infos = _run(hybrid, pt, int(round(fps_val * 2.5)))
+        blend_indices = [i for i, info in enumerate(infos) if info.get("source") == "blend"]
+        assert len(blend_indices) > 0
+        assert len(blend_indices) <= int(round(1.0 * fps_val))
+        # Geçiş karelerinde 3x3 ızgara kayması kaydedilmeli (~ +5 m toplam x kayması)
+        total_dx = sum(float(info.get("blend_dx_m") or 0.0) for info in infos)
+        assert abs(total_dx - 5.0) < 0.5
+
+
+def test_p3_1_blend_shift_compensated_in_player_speed(tmp_path):
+    """Geçiş karelerindeki saha kayması hız hesabından düşülünce duran oyuncunun hızı < 1 km/sa olur."""
+    exp = DataExporter(fps=50.0, output_dir=str(tmp_path), flush_interval=0)
+    # 50 kare (1 sn) boyunca her karede saha +0.10 m/kare (5 m/sn = 18 km/sa) kayıyor;
+    # sabit oyuncu bu kaymayı tam yansıtıyor (pitch_x = 40.0 + 0.10 * f).
+    for f in range(50):
+        dx = 0.10 if 1 <= f <= 25 else 0.0
+        if dx:
+            exp.set_frame_blend_shift(f, dx, 0.0)
+        cum_shift = 0.10 * min(f, 25)
+        exp.append_frame_data(
+            f,
+            [{
+                "track_id": 7,
+                "class_name": "player",
+                "team": "Team A",
+                "bbox": [100, 100, 120, 160],
+                "pitch_x": 40.0 + cum_shift,
+                "pitch_y": 30.0,
+                "on_pitch": True,
+                "calib_reset": False,
+            }],
+        )
+    summary_path = exp.export_distance_summary(output_path=str(tmp_path / "dist.csv"))
+    assert summary_path is not None
+    df = pd.read_csv(summary_path)
+    assert float(df.loc[0, "max_speed_kmh"]) < 1.0
+    assert float(df.loc[0, "total_distance_m"]) < 0.1
+
+    # Aynı veride MLAnalyzer adım hızları da saha kaymasını düşmeli
+    from modules.ml_analyzer import MLAnalyzer
+    ml_speeds, ml_spikes = MLAnalyzer(
+        exp.to_dataframe(), fps=50.0, blend_shifts=exp._frame_blend_shifts
+    )._compute_player_step_speeds()
+    assert float(ml_speeds["speed"].max()) < 1.0
+    assert len(ml_spikes) == 0
+
+
+def test_p3_4_raw_jump_not_smeared_by_smoothing(tmp_path):
+    """50 fps'te tek karelik ID-switch/titreme sıçraması sürdürülen azami hızı 37-38 km/sa sınırına yapıştırmamalı."""
+    exp = DataExporter(fps=50.0, output_dir=str(tmp_path), flush_interval=0)
+    # Oyuncu 60 kare boyunca 14.4 km/sa (0.08 m/kare @ 50 fps) koşuyor;
+    # 30. karede 0.72 m tek karelik titreme sıçraması var (5 karelik yumuşatma ile
+    # tek adım ~37.4 km/sa çıkar, ancak 0.5 sn sürdürülen hız < 25 km/sa kalır).
+    for f in range(60):
+        jump = 0.72 if f >= 30 else 0.0
+        exp.append_frame_data(
+            f,
+            [{
+                "track_id": 12,
+                "class_name": "player",
+                "team": "Team A",
+                "bbox": [100, 100, 120, 160],
+                "pitch_x": 30.0 + 0.08 * f + jump,
+                "pitch_y": 30.0,
+                "on_pitch": True,
+                "calib_reset": False,
+            }],
+        )
+    summary_path = exp.export_distance_summary(output_path=str(tmp_path / "dist_p34.csv"))
+    assert summary_path is not None
+    df = pd.read_csv(summary_path)
+    assert float(df.loc[0, "max_speed_kmh"]) < 25.0

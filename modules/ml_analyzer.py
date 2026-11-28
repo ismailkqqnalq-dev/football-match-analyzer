@@ -468,11 +468,15 @@ class MLAnalyzer:
         copy: bool = False,
         allow_synthetic: Optional[bool] = None,
         allow_pixel_fallback: Optional[bool] = None,
+        blend_shifts: Optional[Dict[int, Tuple[float, float]]] = None,
     ):
         self.df = df.copy() if (df is not None and copy) else (df if df is not None else pd.DataFrame())
         self.fps = float(fps) if fps and fps > 0 else self._infer_fps()
         self.analytics_summary = analytics_summary
         self.random_state = int(random_state)
+        self.blend_shifts: Optional[Dict[int, Tuple[float, float]]] = (
+            dict(blend_shifts) if blend_shifts else None
+        )
         self.allow_synthetic = bool(
             getattr(config, "ML_ALLOW_SYNTHETIC_FALLBACK", False)
             if allow_synthetic is None
@@ -521,6 +525,27 @@ class MLAnalyzer:
         self._orientation_cache = (n_rows, self.is_calibrated, r_codes, r_list, halves)
         return r_codes, r_list, halves
 
+    @staticmethod
+    def _load_sibling_blend_shifts(data_path: str) -> Optional[Dict[int, Tuple[float, float]]]:
+        log_path = os.path.join(os.path.dirname(os.path.abspath(data_path)), config.EXPORT_HOMOGRAPHY_LOG_FILENAME)
+        if not os.path.isfile(log_path):
+            return None
+        try:
+            cols = set(pd.read_csv(log_path, nrows=0).columns)
+            if not {"frame_idx", "blend_dx_m", "blend_dy_m"}.issubset(cols):
+                return None
+            bdf = pd.read_csv(log_path, usecols=["frame_idx", "blend_dx_m", "blend_dy_m"])
+            bdf = bdf.dropna(subset=["frame_idx", "blend_dx_m", "blend_dy_m"])
+            bdf = bdf[(bdf["blend_dx_m"].abs() > 1e-9) | (bdf["blend_dy_m"].abs() > 1e-9)]
+            if bdf.empty:
+                return None
+            return {
+                int(r.frame_idx): (float(r.blend_dx_m), float(r.blend_dy_m))
+                for r in bdf.itertuples(index=False)
+            }
+        except Exception:
+            return None
+
     # ----------------------------------------------------------------
     @classmethod
     def from_csv(
@@ -531,6 +556,7 @@ class MLAnalyzer:
         random_state: int = config.ML_RANDOM_STATE,
         allow_synthetic: Optional[bool] = None,
         allow_pixel_fallback: Optional[bool] = None,
+        blend_shifts: Optional[Dict[int, Tuple[float, float]]] = None,
     ) -> "MLAnalyzer":
         """CSV takip dosyasından sütun budamalı ve kompakt tipli MLAnalyzer örneği oluşturur."""
         if not os.path.exists(csv_path):
@@ -579,6 +605,7 @@ class MLAnalyzer:
             copy=False,
             allow_synthetic=allow_synthetic,
             allow_pixel_fallback=allow_pixel_fallback,
+            blend_shifts=blend_shifts if blend_shifts is not None else cls._load_sibling_blend_shifts(csv_path),
         )
 
     # ----------------------------------------------------------------
@@ -592,6 +619,7 @@ class MLAnalyzer:
         random_state: int = config.ML_RANDOM_STATE,
         allow_synthetic: Optional[bool] = None,
         allow_pixel_fallback: Optional[bool] = None,
+        blend_shifts: Optional[Dict[int, Tuple[float, float]]] = None,
     ) -> "MLAnalyzer":
         """SQLite veritabanından parçalı (chunked) ve kompakt tipli MLAnalyzer örneği oluşturur."""
         if not os.path.exists(db_path):
@@ -641,6 +669,7 @@ class MLAnalyzer:
             copy=False,
             allow_synthetic=allow_synthetic,
             allow_pixel_fallback=allow_pixel_fallback,
+            blend_shifts=blend_shifts if blend_shifts is not None else cls._load_sibling_blend_shifts(db_path),
         )
 
     # ----------------------------------------------------------------
@@ -996,6 +1025,7 @@ class MLAnalyzer:
             self.is_calibrated,
             self.fps,
             self.bounds,
+            len(self.blend_shifts or ()),
         )
         cached = self._speed_cache.get(cache_key)
         if cached is not None and cached[0] == cache_sig:
@@ -1157,6 +1187,15 @@ class MLAnalyzer:
         dt_step = np.where(step_ok, df_i / self.fps, 1.0)
         dx_step = xs[1:] - xs[:-1]
         dy_step = ys[1:] - ys[:-1]
+        if self.is_calibrated and self.blend_shifts:
+            b_items = sorted(self.blend_shifts.items())
+            bf = np.array([k for k, _ in b_items], dtype=np.int64)
+            bdx = np.concatenate(([0.0], np.cumsum([v[0] for _, v in b_items], dtype=np.float64)))
+            bdy = np.concatenate(([0.0], np.cumsum([v[1] for _, v in b_items], dtype=np.float64)))
+            p0 = np.searchsorted(bf, fids[:-1], side="right")
+            p1 = np.searchsorted(bf, fids[1:], side="right")
+            dx_step = np.where(step_ok, dx_step - (bdx[p1] - bdx[p0]), dx_step)
+            dy_step = np.where(step_ok, dy_step - (bdy[p1] - bdy[p0]), dy_step)
         dist_step = np.hypot(dx_step, dy_step)
         scale_spd = 3.6 if self.is_calibrated else 1.0
         raw_spd_step = np.where(step_ok, (dist_step / dt_step) * scale_spd, 0.0)

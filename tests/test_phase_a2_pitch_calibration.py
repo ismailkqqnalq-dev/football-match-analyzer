@@ -663,6 +663,8 @@ def test_r2_hybrid_calibrator_lifecycle_cut_opposite_half_and_smooth_blend():
     assert hybrid.last_calibration_reason == "periodic_refresh"
     assert hybrid.frame_info["source"] == "blend"
     expected_total = max(4, int(np.ceil(d12 / hybrid.blend_step_m)))
+    if hybrid.blend_max_sec > 0.0:
+        expected_total = min(expected_total, max(4, int(round(hybrid.blend_max_sec * hybrid.fps))))
     assert hybrid._blend_total == expected_total
     assert hybrid._blend_step == 1
 
@@ -1238,7 +1240,8 @@ def test_r3_download_models_target_pitch_resolution_and_cli_aliases(tmp_path, mo
     with pytest.raises(SystemExit):
         dm.parse_args(["--target", "invalid_target"])
 
-    # Boş PITCH_KEYPOINT_MODEL_DOWNLOAD_URL anlamlı Türkçe hata döndürmeli
+    # Boş PITCH_KEYPOINT_MODEL_DOWNLOAD_URL anlamlı Türkçe hata döndürmeli (model yokken)
+    monkeypatch.setattr(config, "PITCH_KEYPOINT_MODEL_PATH", str(tmp_path / "missing_pitch.pt"))
     monkeypatch.setattr(config, "PITCH_KEYPOINT_MODEL_DOWNLOAD_URL", "")
     rc_empty = dm.main(["--target", "pitch"])
     assert rc_empty == 1

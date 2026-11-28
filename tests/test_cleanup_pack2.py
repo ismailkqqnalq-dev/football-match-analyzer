@@ -113,6 +113,22 @@ def test_r4_download_models_insecure_skip_sha256_warns_and_saves(tmp_path, monke
     assert "SHA-256" in out_txt
 
 
+def test_p3_3_download_models_returns_zero_when_model_already_exists_without_url(tmp_path, monkeypatch, capsys):
+    import utils.download_models as dm
+
+    existing_pt = tmp_path / "already_here.pt"
+    existing_pt.write_bytes(b"FAKE_EXISTING_WEIGHTS")
+
+    monkeypatch.setattr(config, "MODEL_DOWNLOAD_URL", "")
+    monkeypatch.setattr(config, "SECURITY_MODEL_SHA256", None)
+
+    rc = dm.main(["--output", str(existing_pt)])
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "zaten mevcut" in captured.out
+    assert captured.err == ""
+
+
 # ----------------------------------------------------------------------
 # R5 KABUL TESTİ: Geçersiz Video Yolunda Model Yüklenmeden Erken Hata
 # ----------------------------------------------------------------------
